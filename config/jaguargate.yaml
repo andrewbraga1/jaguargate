@@ -1,0 +1,210 @@
+# ==============================================================================
+# 🐆 JAGUARGATE - OFFICIAL CONFIGURATION CONTRACT (v1.0)
+# ==============================================================================
+# [EN] Minimal setup requires only the 'core' block below. All other sections
+#      automatically inherit safe defaults from your chosen 'preset'.
+# [PT] A configuração mínima exige apenas o bloco 'core' abaixo. Todas as demais
+#      seções herdam padrões seguros automaticamente a partir do seu 'preset'.
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# 1. CORE & PRESET PROFILE / NÚCLEO E PERFIL PRONTO
+# ------------------------------------------------------------------------------
+core:
+  version: "1.0"
+  # [EN] Output language for logs, CLI doctor, and warning messages ("en" | "pt-BR")
+  # [PT] Idioma dos logs, diagnóstico CLI e mensagens de aviso ("en" | "pt-BR")
+  language: "pt-BR"
+
+  # [EN] Built-in security profile for quick setup:
+  #      "permissive" -> Shadow mode (logs & warns only, blocks nothing)
+  #      "balanced"   -> Selective sanitization & warning flags (Recommended)
+  #      "strict"     -> Maximum armor, strict whitelists & hard blocking on intrusion
+  # [PT] Perfil pronto de segurança:
+  #      "permissive" -> Modo sombra (apenas avisa nos cabeçalhos/logs, não bloqueia)
+  #      "balanced"   -> Limpeza seletiva sem quebrar a requisição (Recomendado)
+  #      "strict"     -> Blindagem máxima, whitelist estrita e bloqueio seco em ataques
+  preset: "balanced"
+
+  # [EN] Global operation mode override ("shadow" | "sanitize_and_warn" | "hard_block")
+  # [PT] Modo de operação global ("shadow" | "sanitize_and_warn" | "hard_block")
+  mode: "sanitize_and_warn"
+
+# ------------------------------------------------------------------------------
+# 2. MULTI-TRANSPORT NETWORK & UPSTREAM / REDE MULTI-TRANSPORTE E DESTINO
+# ------------------------------------------------------------------------------
+network:
+  ingress:
+    http:
+      enabled: true
+      listen_addr: "127.0.0.1:4010"
+      read_timeout_ms: 30000
+      write_timeout_ms: 120000
+      max_payload_mb: 15
+    unix_socket:
+      # [EN] Enable for near-zero kernel latency when running in the same host/Pod
+      # [PT] Ative para latência quase zero via Kernel quando na mesma máquina/Pod
+      enabled: false
+      socket_path: "/tmp/jaguargate.sock"
+      socket_mode: "0600"
+    grpc:
+      enabled: false
+      listen_addr: "127.0.0.1:4011"
+
+  egress:
+    # [EN] Default target AI provider (e.g., Ollama, LiteLLM, OpenAI, vLLM)
+    # [PT] Provedor de IA de destino (ex: Ollama local, LiteLLM, OpenAI, vLLM)
+    upstream_url: "http://127.0.0.1:11434"
+    upstream_unix_socket: ""
+    keep_alive_pool_size: 128
+    idle_conn_timeout_seconds: 90
+    tls_verify: true
+
+  mcp:
+    # [EN] Guardrail settings for Model Context Protocol (stdio & HTTP/SSE)
+    # [PT] Configurações de proteção para servidores MCP (stdio e HTTP/SSE)
+    enabled: true
+    sanitize_external_resources: true
+    max_rpc_batch_size: 20
+
+# ------------------------------------------------------------------------------
+# 3. OWASP GUARDS & MULTIMODAL HYGIENE / ESCUDO OWASP E HIGIENE MULTIMODAL
+# ------------------------------------------------------------------------------
+guards:
+  deobfuscation:
+    enabled: true
+    decode_base64: true
+    decode_hex: true
+    strip_invisible_unicode: true
+    # [EN] Prevents nested encoding CPU exhaustion (Zip-bomb style attacks)
+    # [PT] Evita exaustão de CPU por codificações aninhadas (ataques estilo Zip-bomb)
+    max_decode_depth: 2
+
+  multimodal:
+    # [EN] Skips text regex on heavy Base64 media blocks & strips hidden EXIF/XMP tags
+    # [PT] Pula regex textual em imagens/PDFs Base64 e remove metadados ocultos EXIF/XMP
+    bypass_regex_on_media: true
+    verify_magic_bytes: true
+    strip_exif_xmp_metadata: true
+    allowed_mime_types:
+      - "image/jpeg"
+      - "image/png"
+      - "image/webp"
+      - "application/pdf"
+
+  spotlighting:
+    # [EN] Wraps untrusted external data (RAG, web, MCP) in dynamic per-request crypto tags
+    # [PT] Isola dados externos (RAG, web, MCP) com delimitadores criptográficos dinâmicos
+    enabled: true
+    dynamic_tag_prefix: "jg_untrusted"
+    mark_roles:
+      - "tool"
+      - "function"
+
+  canary_tokens:
+    # [EN] Detects System Prompt leakage in real time
+    # [PT] Detecta vazamento de System Prompt em tempo real
+    enabled: true
+    auto_inject_system_prompt: true
+    # [EN] Even in sanitize_and_warn mode, cuts stream immediately if system prompt leaks
+    # [PT] Mesmo no modo resiliente, corta a resposta imediatamente se o prompt do sistema vazar
+    truncate_stream_on_leak: true
+
+  pii_vault:
+    # [EN] Reversible masking vault for sensitive data & credentials
+    # [PT] Cofre de mascaramento reversível para dados sensíveis e credenciais
+    enabled: true
+    restore_on_output: true
+    ttl_seconds: 300
+    entities:
+      cpf: true
+      cnpj: true
+      credit_card: true
+      email: false
+      aws_keys: true
+      api_Secrets: true
+      jwt_tokens: true
+    custom_patterns: []
+
+  output_sanitizer:
+    block_untrusted_markdown_images: true
+    strip_executable_scripts: true
+    sliding_window_runes: 64
+
+# ------------------------------------------------------------------------------
+# 4. AGENT & MCP WHITELIST / WHITELIST DE AGENTES E MCP
+# ------------------------------------------------------------------------------
+whitelist:
+  # [EN] When true, any tool call or MCP method not in 'allowed_tools' is surgically omitted
+  # [PT] Quando true, qualquer ferramenta ou método MCP fora da lista é podado sem derrubar a rede
+  enforce_tool_whitelist: false
+  allowed_tools:
+    - "search_knowledge_base"
+    - "get_weather"
+    - "read_approved_docs"
+  allowed_mcp_servers:
+    - "filesystem-readonly"
+    - "postgres-analytics"
+  allowed_domains:
+    - "*.yourdomain.com"
+    - "api.github.com"
+
+  circuit_breaker:
+    # [EN] Stops infinite agent loops based on canonical SHA-256(tool_name + sorted_json_args)
+    # [PT] Interrompe loops infinitos com base no hash SHA-256(nome_ferramenta + args_json_ordenados)
+    max_identical_tool_calls: 3
+    window_seconds: 120
+    max_tokens_per_session: 32000
+
+# ------------------------------------------------------------------------------
+# 5. TELEMETRY, WARNING FLAGS & ZERO-TRUST LOGS / TELEMETRIA E ALERTAS
+# ------------------------------------------------------------------------------
+telemetry:
+  warning_flags:
+    emit_http_headers: true
+    emit_http_trailers_on_stream: true
+    emit_sse_warning_event: true
+    include_body_telemetry_field: false
+
+  logging:
+    level: "info"
+    format: "json"
+    # [EN] Mandatory Zero-Trust masking: secrets/payloads are never printed in plain text
+    # [PT] Mascaramento Zero-Trust obrigatório: segredos nunca são gravados em texto puro
+    zero_trust_redaction: true
+    redaction_placeholder: "***[JG-REDACTED]***"
+
+  webhooks:
+    enabled: false
+    url: "${JAGUARGATE_WEBHOOK_URL}"
+    trigger_severities:
+      - "INTRUSION_ALERT"
+    rate_limit_per_minute: 30
+    batch_window_seconds: 5
+
+  opentelemetry:
+    enabled: false
+    prometheus_Listen_addr: "127.0.0.1:9091"
+
+# ------------------------------------------------------------------------------
+# 6. DISTRIBUTED STATE & WASM EXTENSIONS / ESTADO DISTRIBUÍDO E EXPANSÃO WASM
+# ------------------------------------------------------------------------------
+extensions:
+  state_store:
+    # [EN] "memory" (single instance) | "redis" / "valkey" (L1 RAM + L2 AES-GCM cluster)
+    # [PT] "memory" (instância única) | "redis" / "valkey" (cluster L1 RAM + L2 AES-GCM)
+    driver: "memory"
+    redis_url: "${JAGUARGATE_REDIS_URL}"
+    aes_gcm_key_env: "${JAGUARGATE_STATE_AES_KEY}"
+    fail_open_to_local_memory: true
+
+  wasm_plugins:
+    enabled: false
+    directory: "./plugins/wasm"
+    max_execution_timeout_ms: 2
+    max_memory_megabytes: 16
+
+  community_signatures:
+    enabled: true
+    directory: "./plugins/signatures"
+    hot_reload: true
