@@ -1,0 +1,155 @@
+{
+  "core": {
+    "version": "1.0",
+    "language": "pt-BR",
+    "preset": "balanced",
+    "mode": "sanitize_and_warn"
+  },
+  "network": {
+    "ingress": {
+      "http": {
+        "enabled": true,
+        "listen_addr": "127.0.0.1:4010",
+        "read_timeout_ms": 30000,
+        "write_timeout_ms": 120000,
+        "max_payload_mb": 15
+      },
+      "unix_socket": {
+        "enabled": false,
+        "socket_path": "/tmp/jaguargate.sock",
+        "socket_mode": "0600"
+      },
+      "grpc": {
+        "enabled": false,
+        "listen_addr": "127.0.0.1:4011"
+      }
+    },
+    "egress": {
+      "upstream_url": "http://127.0.0.1:11434",
+      "upstream_unix_socket": "",
+      "keep_alive_pool_size": 128,
+      "idle_conn_timeout_seconds": 90,
+      "tls_verify": true
+    },
+    "mcp": {
+      "enabled": true,
+      "sanitize_external_resources": true,
+      "max_rpc_batch_size": 20
+    }
+  },
+  "guards": {
+    "deobfuscation": {
+      "enabled": true,
+      "decode_base64": true,
+      "decode_hex": true,
+      "strip_invisible_unicode": true,
+      "max_decode_depth": 2
+    },
+    "multimodal": {
+      "bypass_regex_on_media": true,
+      "verify_magic_bytes": true,
+      "strip_exif_xmp_metadata": true,
+      "allowed_mime_types": [
+        "image/jpeg",
+        "image/png",
+        "image/webp",
+        "application/pdf"
+      ]
+    },
+    "spotlighting": {
+      "enabled": true,
+      "dynamic_tag_prefix": "jg_untrusted",
+      "mark_roles": ["tool", "function"]
+    },
+    "canary_tokens": {
+      "enabled": true,
+      "auto_inject_system_prompt": true,
+      "truncate_stream_on_leak": true
+    },
+    "pii_vault": {
+      "enabled": true,
+      "restore_on_output": true,
+      "ttl_seconds": 300,
+      "entities": {
+        "cpf": true,
+        "cnpj": true,
+        "credit_card": true,
+        "email": false,
+        "aws_keys": true,
+        "api_secrets": true,
+        "jwt_tokens": true
+      },
+      "custom_patterns": []
+    },
+    "output_sanitizer": {
+      "block_untrusted_markdown_images": true,
+      "strip_executable_scripts": true,
+      "sliding_window_runes": 64
+    }
+  },
+  "whitelist": {
+    "enforce_tool_whitelist": false,
+    "allowed_tools": [
+      "search_knowledge_base",
+      "get_weather",
+      "read_approved_docs"
+    ],
+    "allowed_mcp_servers": [
+      "filesystem-readonly",
+      "postgres-analytics"
+    ],
+    "allowed_domains": [
+      "*.yourdomain.com",
+      "api.github.com"
+    ],
+    "circuit_breaker": {
+      "max_identical_tool_calls": 3,
+      "window_seconds": 120,
+      "max_tokens_per_session": 32000
+    }
+  },
+  "telemetry": {
+    "warning_flags": {
+      "emit_http_headers": true,
+      "emit_http_trailers_on_stream": true,
+      "emit_sse_warning_event": true,
+      "include_body_telemetry_field": false
+    },
+    "logging": {
+      "level": "info",
+      "format": "json",
+      "zero_trust_redaction": true,
+      "redaction_placeholder": "***[JG-REDACTED]***"
+    },
+    "webhooks": {
+      "enabled": false,
+      "url": "${JAGUARGATE_WEBHOOK_URL}",
+      "trigger_severities": ["INTRUSION_ALERT"],
+      "rate_limit_per_minute": 30,
+      "batch_window_seconds": 5
+    },
+    "opentelemetry": {
+      "enabled": false,
+      "prometheus_listen_addr": "127.0.0.1:9091"
+    }
+  },
+  "extensions": {
+    "state_store": {
+      "driver": "memory",
+      "redis_url": "${JAGUARGATE_REDIS_URL}",
+      "aes_gcm_key_env": "${JAGUARGATE_STATE_AES_KEY}",
+      "fail_open_to_local_memory": true
+    },
+    "wasm_plugins": {
+      "enabled": false,
+      "directory": "./plugins/wasm",
+      "max_execution_timeout_ms": 2,
+      "max_memory_megabytes": 16
+    },
+    "community_signatures": {
+      "enabled": true,
+      "directory": "./plugins/signatures",
+      "hot_reload": true
+    }
+  }
+}
