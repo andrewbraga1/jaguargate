@@ -43,7 +43,7 @@ func (m *Manager) Get() *Config {
 	return m.current.Load()
 }
 
-// LoadFromFile parses YAML or JSON, expands ${ENV_VAR}, applies presets, and validates.
+// LoadFromFile parses YAML or JSON, expands ${ENV_VAR}, applies 12-Factor overrides, presets, and validates.
 func LoadFromFile(filePath string) (*Config, error) {
 	rawBytes, err := os.ReadFile(filePath)
 	if err != nil {
@@ -67,12 +67,29 @@ func LoadFromFile(filePath string) (*Config, error) {
 		return nil, fmt.Errorf("unsupported config extension '%s' (use .yaml, .yml, or .json)", ext)
 	}
 
+	applyEnvOverrides(&cfg)
 	cfg.ApplyPreset()
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
 
 	return &cfg, nil
+}
+
+// applyEnvOverrides supports 12-Factor Docker and multi-host deployments without editing YAML files.
+func applyEnvOverrides(cfg *Config) {
+	if v := strings.TrimSpace(os.Getenv("JAGUARGATE_LISTEN_ADDR")); v != "" {
+		cfg.Network.Ingress.HTTP.ListenAddr = v
+	}
+	if v := strings.TrimSpace(os.Getenv("JAGUARGATE_UPSTREAM_URL")); v != "" {
+		cfg.Network.Egress.UpstreamURL = v
+	}
+	if v := strings.TrimSpace(os.Getenv("JAGUARGATE_MODE")); v != "" {
+		cfg.Core.Mode = v
+	}
+	if v := strings.TrimSpace(os.Getenv("JAGUARGATE_PRESET")); v != "" {
+		cfg.Core.Preset = v
+	}
 }
 
 func interpolateEnvVars(content string) string {

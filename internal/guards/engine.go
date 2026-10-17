@@ -30,7 +30,7 @@ var rePromptInjection = regexp.MustCompile(
 		`)`,
 )
 
-// InspectionResult summarizes all Stage 2 OWASP actions taken on an incoming request.
+// InspectionResult summarizes all OWASP & Whitelist actions taken on an incoming request.
 type InspectionResult struct {
 	ModifiedBody []byte
 	Status       string   // "CLEAN" | "SANITIZED" | "SHADOW_FLAGGED" | "BLOCKED"
@@ -38,15 +38,16 @@ type InspectionResult struct {
 	Codes        []string // Compact JG-* codes
 	CanaryToken  string   // Per-request Canary Token injected into system prompt
 	MaskedCount  int      // Number of PII/Secret entities masked
-	Blocked      bool     // True ONLY when mode == "hard_block" and a violation occurs
+	PrunedTools  int      // Number of unwhitelisted tool definitions/calls surgically omitted
+	Blocked      bool     // True ONLY when mode == "hard_block" and an intrusion occurs
 }
 
-// Engine executes Stage 2 Input Defense, Multimodal Hygiene, Spotlighting, and PII Vaulting.
+// Engine executes OWASP Input/Output Defense, Multimodal Hygiene, Spotlighting, Tool Firewall, and PII Vaulting.
 type Engine struct {
 	vault *PIIVault
 }
 
-// NewEngine creates a Stage 2 Guard Engine backed by the given PIIVault.
+// NewEngine creates a Guard Engine backed by the given PIIVault.
 func NewEngine(vault *PIIVault) *Engine {
 	if vault == nil {
 		vault = NewPIIVault()
@@ -59,7 +60,7 @@ func (e *Engine) Vault() *PIIVault {
 	return e.vault
 }
 
-// InspectJSONPayload parses an LLM JSON request, enforces OWASP guards, and returns the resilient result.
+// InspectJSONPayload parses an LLM JSON request, enforces OWASP guards & tool whitelists, and returns the resilient result.
 func (e *Engine) InspectJSONPayload(body []byte, cfg *config.Config) InspectionResult {
 	res := InspectionResult{
 		ModifiedBody: body,
@@ -73,7 +74,6 @@ func (e *Engine) InspectJSONPayload(body []byte, cfg *config.Config) InspectionR
 
 	var payload map[string]any
 	if err := json.Unmarshal(body, &payload); err != nil {
-		// Non-JSON payload: inspect as raw text
 		cleaned, codes, intruded, masked := e.inspectTextSegment(string(body), "user", cfg, &res.CanaryToken)
 		res.MaskedCount += masked
 		for _, c := range codes {
@@ -89,7 +89,24 @@ func (e *Engine) InspectJSONPayload(body []byte, cfg *config.Config) InspectionR
 	modified := false
 	isShadow := cfg.Core.Mode == "shadow"
 
-	// Inspect standard "messages" array (OpenAI / Ollama / Anthropic / LiteLLM format)
+	// 1. Selective Tool Whitelist on top-level "tools" definition array if present
+	if rawTools, ok := payload["tools"].([]any); ok && cfg.Whitelist.EnforceToolWhitelist {
+		keptTools, toolCodes, pruned := SanitizeToolCallsSlice(rawTools, cfg.Whitelist, isShadow)
+		res.PrunedTools += pruned
+		for _, c := range toolCodes {
+			res.addCode(c, false)
+		}
+		if !isShadow && pruned > 0 {
+			modified = true
+			if len(keptTools) > 0 {
+				payload["tools"] = keptTools
+			} else {
+				delete(payload, "tools")
+			}
+		}
+	}
+
+	// 2. Inspect standard "messages" array (OpenAI / Ollama / Anthropic / LiteLLM format)
 	if rawMsgs, ok := payload["messages"].([]any); ok {
 		systemFound := false
 		for i, item := range rawMsgs {
@@ -100,6 +117,23 @@ func (e *Engine) InspectJSONPayload(body []byte, cfg *config.Config) InspectionR
 			role, _ := msgMap["role"].(string)
 			if role == "system" {
 				systemFound = true
+			}
+
+			// Selective Tool Call pruning inside message history if present
+			if msgTools, ok := msgMap["tool_calls"].([]any); ok && cfg.Whitelist.EnforceToolWhitelist {
+				keptMsgTools, toolCodes, pruned := SanitizeToolCallsSlice(msgTools, cfg.Whitelist, isShadow)
+				res.PrunedTools += pruned
+				for _, c := range toolCodes {
+					res.addCode(c, false)
+				}
+				if !isShadow && pruned > 0 {
+					modified = true
+					if len(keptMsgTools) > 0 {
+						msgMap["tool_calls"] = keptMsgTools
+					} else {
+						delete(msgMap, "tool_calls")
+					}
+				}
 			}
 
 			switch content := msgMap["content"].(type) {
@@ -115,7 +149,6 @@ func (e *Engine) InspectJSONPayload(body []byte, cfg *config.Config) InspectionR
 				}
 
 			case []any:
-				// Multimodal content array (e.g., [{"type":"text","text":"..."}, {"type":"image_url","image_url":{"url":"data:..."}}])
 				for _, partItem := range content {
 					partMap, ok := partItem.(map[string]any)
 					if !ok {
@@ -161,7 +194,7 @@ func (e *Engine) InspectJSONPayload(body []byte, cfg *config.Config) InspectionR
 		}
 	}
 
-	// Also support single "prompt" field (Ollama /api/generate or completions endpoint)
+	// 3. Support single "prompt" field (Ollama /api/generate or completions endpoint)
 	if promptStr, ok := payload["prompt"].(string); ok {
 		cleaned, codes, intruded, masked := e.inspectTextSegment(promptStr, "user", cfg, &res.CanaryToken)
 		res.MaskedCount += masked
@@ -210,7 +243,6 @@ func (e *Engine) inspectTextSegment(text, role string, cfg *config.Config, canar
 		workingText = text
 	}
 
-	// Check if any hidden Base64/Hex payload contains a prompt injection
 	hiddenInjection := false
 	for _, hidden := range deob.DecodedPayloads {
 		if rePromptInjection.MatchString(hidden) {
@@ -231,7 +263,6 @@ func (e *Engine) inspectTextSegment(text, role string, cfg *config.Config, canar
 		if !isShadow {
 			workingText = rePromptInjection.ReplaceAllString(workingText, "[JG-NEUTRALIZED-INJECTION]")
 			if hiddenInjection {
-				// Neutralize the obfuscated Base64/Hex blobs that carried the injection
 				workingText = reBase64Candidate.ReplaceAllString(workingText, "[JG-NEUTRALIZED-ENCODING]")
 				workingText = reHexCandidate.ReplaceAllString(workingText, "[JG-NEUTRALIZED-ENCODING]")
 			}
@@ -310,7 +341,7 @@ func generateTokenHex(prefix string, byteLen int) string {
 }
 
 // marshalJSONUnescaped serializes a JSON object using a pooled buffer from Stage 1
-// with HTML escaping disabled so Spotlighting tags (<jg_untrusted_*>) and code operators (<, >, &) remain intact.
+// with HTML escaping disabled so Spotlighting tags and code operators (<, >, &) remain intact.
 func marshalJSONUnescaped(v any) ([]byte, error) {
 	buf := telemetry.AcquireBuffer()
 	defer telemetry.ReleaseBuffer(buf)
@@ -323,7 +354,7 @@ func marshalJSONUnescaped(v any) ([]byte, error) {
 
 	raw := buf.Bytes()
 	if len(raw) > 0 && raw[len(raw)-1] == '\n' {
-		raw = raw[:len(raw)-1] // Zero-copy trim of the trailing newline added by json.Encoder
+		raw = raw[:len(raw)-1]
 	}
 	return bytes.Clone(raw), nil
 }

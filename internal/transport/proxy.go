@@ -20,10 +20,12 @@ import (
 
 	"github.com/jaguargate/jaguargate/internal/config"
 	"github.com/jaguargate/jaguargate/internal/guards"
+	"github.com/jaguargate/jaguargate/internal/stream"
 	"github.com/jaguargate/jaguargate/internal/telemetry"
 )
 
 type ctxInspectionKey struct{}
+type ctxStartTimeKey struct{}
 
 // GatewayServer manages the multi-transport listeners and the low-latency reverse proxy.
 type GatewayServer struct {
@@ -37,7 +39,7 @@ type GatewayServer struct {
 	udsPath     string
 }
 
-// NewGatewayServer initializes the reverse proxy with pre-warmed keep-alive pools, buffer recycling, and OWASP guards.
+// NewGatewayServer initializes the reverse proxy with pre-warmed keep-alive pools, buffer recycling, and OWASP/Stream guards.
 func NewGatewayServer(cfgMgr *config.Manager, logger *slog.Logger) (*GatewayServer, error) {
 	snap := cfgMgr.Get()
 	targetURL, err := url.Parse(snap.Network.Egress.UpstreamURL)
@@ -85,34 +87,77 @@ func NewGatewayServer(cfgMgr *config.Manager, logger *slog.Logger) (*GatewayServ
 		BufferPool:    bufPool,
 		ModifyResponse: func(resp *http.Response) error {
 			activeCfg := cfgMgr.Get()
-			res, hasInspection := resp.Request.Context().Value(ctxInspectionKey{}).(guards.InspectionResult)
+			inboundRes, _ := resp.Request.Context().Value(ctxInspectionKey{}).(guards.InspectionResult)
 
-			if activeCfg.Telemetry.WarningFlags.EmitHTTPHeaders {
-				if hasInspection && len(res.Codes) > 0 {
-					resp.Header.Set("X-JaguarGate-Status", res.Status)
-					resp.Header.Set("X-JaguarGate-Severity", res.Severity)
-					resp.Header.Set("X-JaguarGate-Codes", strings.Join(res.Codes, ","))
-				} else if resp.Header.Get("X-JaguarGate-Status") == "" {
-					resp.Header.Set("X-JaguarGate-Status", "CLEAN")
-					resp.Header.Set("X-JaguarGate-Severity", "NONE")
-				}
+			// Calculate monotonic gateway latency in microseconds for DevOps/APM observability
+			if startTime, ok := resp.Request.Context().Value(ctxStartTimeKey{}).(time.Time); ok {
+				resp.Header.Set("X-JaguarGate-Latency-Us", strconv.FormatInt(time.Since(startTime).Microseconds(), 10))
 			}
 
-			// Restore reversible PII tokens on non-streaming JSON responses when enabled
 			contentType := resp.Header.Get("Content-Type")
-			if hasInspection && res.MaskedCount > 0 && activeCfg.Guards.PIIVault.RestoreOnOutput &&
-				!strings.Contains(contentType, "text/event-stream") && resp.Body != nil {
+			isSSE := strings.Contains(strings.ToLower(contentType), "text/event-stream")
+
+			if isSSE && resp.Body != nil {
+				// Enterprise SSE Anti-Buffering headers for Nginx, Traefik, Cloudflare & Docker
+				resp.Header.Set("X-Accel-Buffering", "no")
+				resp.Header.Set("Cache-Control", "no-cache, no-transform")
+				resp.Header.Del("Content-Length")
+
+				if activeCfg.Telemetry.WarningFlags.EmitHTTPHeaders {
+					status := inboundRes.Status
+					severity := inboundRes.Severity
+					if status == "" {
+						status = "CLEAN"
+						severity = "NONE"
+					}
+					resp.Header.Set("X-JaguarGate-Status", status)
+					resp.Header.Set("X-JaguarGate-Severity", severity)
+					if len(inboundRes.Codes) > 0 {
+						resp.Header.Set("X-JaguarGate-Codes", strings.Join(inboundRes.Codes, ","))
+					}
+					if inboundRes.PrunedTools > 0 {
+						resp.Header.Set("X-JaguarGate-Pruned-Count", strconv.Itoa(inboundRes.PrunedTools))
+					}
+				}
+
+				if activeCfg.Telemetry.WarningFlags.EmitHTTPTrailersOnStream {
+					resp.Header.Set("Trailer", "X-JaguarGate-Status, X-JaguarGate-Severity, X-JaguarGate-Codes, X-JaguarGate-Pruned-Count")
+					if resp.Trailer == nil {
+						resp.Trailer = make(http.Header)
+					}
+				}
+
+				resp.Body = stream.NewSSEInspector(resp.Body, activeCfg, guardEngine.Vault(), inboundRes, resp.Trailer)
+				return nil
+			}
+
+			// Non-streaming response: inspect output JSON (Tool Call Firewall + Canary Leak + Output Sanitizer + PII Restore)
+			if resp.Body != nil {
 				rawResp, err := io.ReadAll(resp.Body)
 				_ = resp.Body.Close()
 				if err == nil {
-					restored := guardEngine.Vault().RestoreText(string(rawResp))
-					restoredBytes := []byte(restored)
-					resp.Body = io.NopCloser(bytes.NewReader(restoredBytes))
-					resp.ContentLength = int64(len(restoredBytes))
-					resp.Header.Set("Content-Length", strconv.Itoa(len(restoredBytes)))
+					outRes := guardEngine.SanitizeOutputJSON(rawResp, inboundRes, activeCfg)
+					if activeCfg.Telemetry.WarningFlags.EmitHTTPHeaders {
+						resp.Header.Set("X-JaguarGate-Status", outRes.Status)
+						resp.Header.Set("X-JaguarGate-Severity", outRes.Severity)
+						if len(outRes.Codes) > 0 {
+							resp.Header.Set("X-JaguarGate-Codes", strings.Join(outRes.Codes, ","))
+						}
+						if outRes.PrunedTools > 0 {
+							resp.Header.Set("X-JaguarGate-Pruned-Count", strconv.Itoa(outRes.PrunedTools))
+						}
+					}
+					resp.Body = io.NopCloser(bytes.NewReader(outRes.ModifiedBody))
+					resp.ContentLength = int64(len(outRes.ModifiedBody))
+					resp.Header.Set("Content-Length", strconv.Itoa(len(outRes.ModifiedBody)))
+					return nil
 				}
 			}
 
+			if activeCfg.Telemetry.WarningFlags.EmitHTTPHeaders && resp.Header.Get("X-JaguarGate-Status") == "" {
+				resp.Header.Set("X-JaguarGate-Status", "CLEAN")
+				resp.Header.Set("X-JaguarGate-Severity", "NONE")
+			}
 			return nil
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
@@ -136,7 +181,7 @@ func NewGatewayServer(cfgMgr *config.Manager, logger *slog.Logger) (*GatewayServ
 	}, nil
 }
 
-// Handler wraps the reverse proxy with Stage 2 OWASP Input Guards, payload size limits, and healthcheck.
+// Handler wraps the reverse proxy with OWASP Input Guards, payload size limits, and healthcheck.
 func (s *GatewayServer) Handler() http.Handler {
 	mux := http.NewServeMux()
 
@@ -150,13 +195,17 @@ func (s *GatewayServer) Handler() http.Handler {
 	})
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		startTime := time.Now()
+		ctx := context.WithValue(r.Context(), ctxStartTimeKey{}, startTime)
+		r = r.WithContext(ctx)
+
 		cfg := s.cfgMgr.Get()
 		maxBytes := cfg.Network.Ingress.HTTP.MaxPayloadMB * 1024 * 1024
 		if maxBytes > 0 && r.Body != nil {
 			r.Body = http.MaxBytesReader(w, r.Body, maxBytes)
 		}
 
-		// Execute Stage 2 OWASP Input Inspection on requests carrying a body
+		// Execute OWASP Input Inspection on requests carrying a body
 		if r.Body != nil && (r.Method == http.MethodPost || r.Method == http.MethodPut) {
 			buf := telemetry.AcquireBuffer()
 			_, readErr := buf.ReadFrom(r.Body)
@@ -189,6 +238,7 @@ func (s *GatewayServer) Handler() http.Handler {
 					w.Header().Set("X-JaguarGate-Status", res.Status)
 					w.Header().Set("X-JaguarGate-Severity", res.Severity)
 					w.Header().Set("X-JaguarGate-Codes", strings.Join(res.Codes, ","))
+					w.Header().Set("X-JaguarGate-Latency-Us", strconv.FormatInt(time.Since(startTime).Microseconds(), 10))
 				}
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusForbidden)
