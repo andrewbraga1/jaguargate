@@ -1,10 +1,12 @@
 package transport
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -12,25 +14,30 @@ import (
 	"net/url"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/jaguargate/jaguargate/internal/config"
+	"github.com/jaguargate/jaguargate/internal/guards"
 	"github.com/jaguargate/jaguargate/internal/telemetry"
 )
 
+type ctxInspectionKey struct{}
+
 // GatewayServer manages the multi-transport listeners and the low-latency reverse proxy.
 type GatewayServer struct {
-	cfgMgr     *config.Manager
-	logger     *slog.Logger
-	bufferPool *telemetry.ByteSlicePool
-	proxy      *httputil.ReverseProxy
-	httpServer *http.Server
-	udsServer  *http.Server
-	udsPath    string
+	cfgMgr      *config.Manager
+	logger      *slog.Logger
+	bufferPool  *telemetry.ByteSlicePool
+	guardEngine *guards.Engine
+	proxy       *httputil.ReverseProxy
+	httpServer  *http.Server
+	udsServer   *http.Server
+	udsPath     string
 }
 
-// NewGatewayServer initializes the reverse proxy with pre-warmed keep-alive pools and buffer recycling.
+// NewGatewayServer initializes the reverse proxy with pre-warmed keep-alive pools, buffer recycling, and OWASP guards.
 func NewGatewayServer(cfgMgr *config.Manager, logger *slog.Logger) (*GatewayServer, error) {
 	snap := cfgMgr.Get()
 	targetURL, err := url.Parse(snap.Network.Egress.UpstreamURL)
@@ -39,13 +46,13 @@ func NewGatewayServer(cfgMgr *config.Manager, logger *slog.Logger) (*GatewayServ
 	}
 
 	bufPool := telemetry.NewByteSlicePool()
+	guardEngine := guards.NewEngine(guards.NewPIIVault())
 
 	dialer := &net.Dialer{
 		Timeout:   10 * time.Second,
 		KeepAlive: 30 * time.Second,
 	}
 
-	// Custom Transport supporting both high-concurrency TCP/HTTP2 and Kernel-level Unix Socket Egress
 	customTransport := &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
 		DialContext:           dialer.DialContext,
@@ -78,12 +85,34 @@ func NewGatewayServer(cfgMgr *config.Manager, logger *slog.Logger) (*GatewayServ
 		BufferPool:    bufPool,
 		ModifyResponse: func(resp *http.Response) error {
 			activeCfg := cfgMgr.Get()
+			res, hasInspection := resp.Request.Context().Value(ctxInspectionKey{}).(guards.InspectionResult)
+
 			if activeCfg.Telemetry.WarningFlags.EmitHTTPHeaders {
-				if resp.Header.Get("X-JaguarGate-Status") == "" {
+				if hasInspection && len(res.Codes) > 0 {
+					resp.Header.Set("X-JaguarGate-Status", res.Status)
+					resp.Header.Set("X-JaguarGate-Severity", res.Severity)
+					resp.Header.Set("X-JaguarGate-Codes", strings.Join(res.Codes, ","))
+				} else if resp.Header.Get("X-JaguarGate-Status") == "" {
 					resp.Header.Set("X-JaguarGate-Status", "CLEAN")
 					resp.Header.Set("X-JaguarGate-Severity", "NONE")
 				}
 			}
+
+			// Restore reversible PII tokens on non-streaming JSON responses when enabled
+			contentType := resp.Header.Get("Content-Type")
+			if hasInspection && res.MaskedCount > 0 && activeCfg.Guards.PIIVault.RestoreOnOutput &&
+				!strings.Contains(contentType, "text/event-stream") && resp.Body != nil {
+				rawResp, err := io.ReadAll(resp.Body)
+				_ = resp.Body.Close()
+				if err == nil {
+					restored := guardEngine.Vault().RestoreText(string(rawResp))
+					restoredBytes := []byte(restored)
+					resp.Body = io.NopCloser(bytes.NewReader(restoredBytes))
+					resp.ContentLength = int64(len(restoredBytes))
+					resp.Header.Set("Content-Length", strconv.Itoa(len(restoredBytes)))
+				}
+			}
+
 			return nil
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
@@ -99,14 +128,15 @@ func NewGatewayServer(cfgMgr *config.Manager, logger *slog.Logger) (*GatewayServ
 	}
 
 	return &GatewayServer{
-		cfgMgr:     cfgMgr,
-		logger:     logger,
-		bufferPool: bufPool,
-		proxy:      rp,
+		cfgMgr:      cfgMgr,
+		logger:      logger,
+		bufferPool:  bufPool,
+		guardEngine: guardEngine,
+		proxy:       rp,
 	}, nil
 }
 
-// Handler wraps the reverse proxy with payload size protection and healthcheck endpoint.
+// Handler wraps the reverse proxy with Stage 2 OWASP Input Guards, payload size limits, and healthcheck.
 func (s *GatewayServer) Handler() http.Handler {
 	mux := http.NewServeMux()
 
@@ -125,6 +155,53 @@ func (s *GatewayServer) Handler() http.Handler {
 		if maxBytes > 0 && r.Body != nil {
 			r.Body = http.MaxBytesReader(w, r.Body, maxBytes)
 		}
+
+		// Execute Stage 2 OWASP Input Inspection on requests carrying a body
+		if r.Body != nil && (r.Method == http.MethodPost || r.Method == http.MethodPut) {
+			buf := telemetry.AcquireBuffer()
+			_, readErr := buf.ReadFrom(r.Body)
+			_ = r.Body.Close()
+
+			if readErr != nil {
+				telemetry.ReleaseBuffer(buf)
+				w.Header().Set("Content-Type", "application/json")
+				w.Header().Set("X-JaguarGate-Status", "BLOCKED")
+				w.WriteHeader(http.StatusRequestEntityTooLarge)
+				_, _ = w.Write([]byte(`{"error":{"message":"Payload exceeds max_payload_mb limit","code":"JG-CFG-202"}}`))
+				return
+			}
+
+			rawBody := bytes.Clone(buf.Bytes())
+			telemetry.ReleaseBuffer(buf)
+
+			res := s.guardEngine.InspectJSONPayload(rawBody, cfg)
+			if len(res.Codes) > 0 {
+				s.logger.Warn("JaguarGate input guard triggered",
+					slog.String("status", res.Status),
+					slog.String("severity", res.Severity),
+					slog.String("codes", strings.Join(res.Codes, ",")),
+					slog.String("path", r.URL.Path),
+				)
+			}
+
+			if res.Blocked {
+				if cfg.Telemetry.WarningFlags.EmitHTTPHeaders {
+					w.Header().Set("X-JaguarGate-Status", res.Status)
+					w.Header().Set("X-JaguarGate-Severity", res.Severity)
+					w.Header().Set("X-JaguarGate-Codes", strings.Join(res.Codes, ","))
+				}
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusForbidden)
+				_, _ = fmt.Fprintf(w, `{"error":{"message":"Request blocked by JaguarGate strict policy","codes":%q}}`, strings.Join(res.Codes, ","))
+				return
+			}
+
+			r.Body = io.NopCloser(bytes.NewReader(res.ModifiedBody))
+			r.ContentLength = int64(len(res.ModifiedBody))
+			r.Header.Set("Content-Length", strconv.Itoa(len(res.ModifiedBody)))
+			r = r.WithContext(context.WithValue(r.Context(), ctxInspectionKey{}, res))
+		}
+
 		s.proxy.ServeHTTP(w, r)
 	})
 

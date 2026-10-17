@@ -1,96 +1,51 @@
-# ⚡ JaguarGate — Empirical Performance & Concurrency Benchmarks
+# ⚡ JaguarGate — Consolidated Performance Evolution & Benchmark Index
 
-> **[EN]** Real-world microbenchmarks and concurrency audit results for **JaguarGate (`jgate`)**, proving sub-microsecond overhead and zero-allocation hot paths.  
-> **[PT-BR]** Resultados empíricos reais de microbenchmarks e auditoria de concorrência do **JaguarGate (`jgate`)**, comprovando latência em nanossegundos e zero alocação de memória no caminho crítico.
+> **[EN]** Master benchmark index tracking the empirical latency, memory footprint, and concurrency verification of **JaguarGate (`jgate`)** across every engineering stage up to `v1.0.0`.  
+> **[PT-BR]** Índice mestre de benchmarks acompanhando a evolução empírica de latência, consumo de memória e auditoria de concorrência do **JaguarGate (`jgate`)** em cada etapa até a `v1.0.0`.
 
 ---
 
-## 🖥️ Reference Hardware & Environment / Ambiente de Referência
+## 🖥️ Baseline Reference Hardware / Hardware de Referência
 
-All benchmarks below are reproducible via standard Go toolchain commands (`go test -bench=. -benchmem`) and were captured on baseline consumer hardware to demonstrate efficiency even on modest CPU footprints:
+To prove that JaguarGate delivers sub-millisecond protection without requiring expensive server-grade CPUs, all baseline benchmarks are captured on consumer dual-core/quad-thread hardware:
 
-* **CPU:** `Intel(R) Core(TM) i7-7500U CPU @ 2.70GHz` (4 Hardware Threads / `GOMAXPROCS=4`)
+* **CPU:** `Intel(R) Core(TM) i7-7500U CPU @ 2.70GHz` (4 Threads / `GOMAXPROCS=4`)
 * **OS / Arch:** `linux / amd64`
-* **Compiler:** `Go 1.23+` (`CGO_ENABLED=0` for production binaries)
+* **Toolchain:** `Go 1.23+` (`CGO_ENABLED=0` static binary)
+* **Target SLA Budget:** `< 1.0 ms` (`1,000,000 ns`) total proxy inspection overhead per request.
 
 ---
 
-## 📊 Stage 1 (`v0.2.0-core`) — Core Engine Results
+## 🗺️ Stage-by-Stage Benchmark History (Detailed Reports)
 
-### 1. Executive Summary Table (Production vs. ThreadSanitizer Audit)
+Click on any completed stage below to inspect the raw `go test -bench`, `-race`, and `-fuzz` terminal logs:
 
-| Benchmark Suite | Operation Tested | Production Mode (Native) | Audit Mode (`-race` Active) | Memory Allocations (Prod) | Speedup vs. Audit |
-| :--- | :--- | :--- | :--- | :--- | :--- |
-| **`BenchmarkAtomicConfigRead-4`** | Lock-free config snapshot read (`atomic.Pointer[Config]`) across 4 cores | **`0.5185 ns/op`** *(1 Billion ops in 0.59s)* | `245.1 ns/op` *(5.5M ops — zero data races)* | **`0 B/op` (`0 allocs/op`)** | **472x faster** |
-| **`BenchmarkBufferPoolCycle-4`** | Acquire 32KB slice, write, Zero-Trust memory scrub (`clear`), return to `sync.Pool` | **`273.1 ns/op`** *(4.06M cycles)* | `16,976 ns/op` *(TSan inspecting 32,768 bytes/op)* | **`24 B/op` (`1 allocs/op`)** | **62x faster** |
-| **Unit & E2E Suite (`go test`)** | Config presets, Env interpolation, Zero-Trust Logger redaction, HTTP + UDS (`0600`) SSE Proxy | **`0.066s total`** (`config`: `0.023s`, `telemetry`: `0.018s`, `transport`: `0.025s`) | `6.709s total` *(10,000 concurrent reads/writes verified)* | Pass (`100% leak-free`) | — |
-
----
-
-### 2. Raw Terminal Output — Production Mode (Native Speed)
-
-```text
-$ go test ./...
-ok      [github.com/jaguargate/jaguargate/internal/config](https://github.com/jaguargate/jaguargate/internal/config)        0.023s
-ok      [github.com/jaguargate/jaguargate/internal/telemetry](https://github.com/jaguargate/jaguargate/internal/telemetry)     0.018s
-ok      [github.com/jaguargate/jaguargate/internal/transport](https://github.com/jaguargate/jaguargate/internal/transport)     0.025s
-
-$ go test -bench=. -benchmem ./internal/...
-goos: linux
-goarch: amd64
-pkg: [github.com/jaguargate/jaguargate/internal/config](https://github.com/jaguargate/jaguargate/internal/config)
-cpu: Intel(R) Core(TM) i7-7500U CPU @ 2.70GHz
-BenchmarkAtomicConfigRead-4      1000000000               0.5185 ns/op          0 B/op          0 allocs/op
-PASS
-ok      [github.com/jaguargate/jaguargate/internal/config](https://github.com/jaguargate/jaguargate/internal/config)        0.593s
-
-goos: linux
-goarch: amd64
-pkg: [github.com/jaguargate/jaguargate/internal/telemetry](https://github.com/jaguargate/jaguargate/internal/telemetry)
-cpu: Intel(R) Core(TM) i7-7500U CPU @ 2.70GHz
-BenchmarkBufferPoolCycle-4        4068264               273.1 ns/op           24 B/op          1 allocs/op
-PASS
-ok      [github.com/jaguargate/jaguargate/internal/telemetry](https://github.com/jaguargate/jaguargate/internal/telemetry)     2.468s
-```
+| Stage | Milestone Tag | Architectural Scope | Detailed Report | Status |
+| :--- | :--- | :--- | :--- | :--- |
+| **Stage 1** | `v0.2.0-core` | Lock-Free Config (`atomic.Pointer`), `sync.Pool` Buffer Recycling, Zero-Trust Logger & HTTP/UDS Proxy | [📄 `BENCHMARKS_STAGE_1.md`](BENCHMARKS_STAGE_1.md) | ✅ Verified |
+| **Stage 2** | `v0.4.0-input-guards` | Pre-compiled RE2 OWASP Engine, Deobfuscator, Binary EXIF Stripper, Spotlighting & Reversible PII Vault | [📄 `BENCHMARKS_STAGE_2.md`](BENCHMARKS_STAGE_2.md) | ✅ Verified |
+| **Stage 3** | `v0.6.0-streaming-tools` | Rune-Aware UTF-8 Sliding Window SSE Inspector & Selective Tool Call Firewall | `BENCHMARKS_STAGE_3.md` | ⏳ Next |
+| **Stage 4** | `v0.8.0-scale-mcp` | Distributed L1/L2 State (AES-GCM Redis), SHA-256 Loop Breaker, gRPC & MCP Guardrail | `BENCHMARKS_STAGE_4.md` | ⏳ Planned |
+| **Stage 5** | `v1.0.0-release` | Pure-Go Wasm Sandbox (`wazero`), OpenTelemetry, Webhooks & Built-in Red Teaming (`jgate pounce`) | `BENCHMARKS_STAGE_5.md` | ⏳ Planned |
 
 ---
 
-### 3. Raw Terminal Output — Concurrency & Data-Race Audit (`-race`)
+## 📈 Consolidated Evolution Matrix (Stage 1 ➔ Current)
 
-```text
-$ go test -v -race -bench=. -benchmem ./...
-=== RUN   TestMinimalThreeLineConfigAndPresets
---- PASS: TestMinimalThreeLineConfigAndPresets (0.00s)
-=== RUN   TestEnvVarInterpolation
---- PASS: TestEnvVarInterpolation (0.00s)
-=== RUN   TestConcurrentLockFreeAtomicReadsAndWrites
---- PASS: TestConcurrentLockFreeAtomicReadsAndWrites (0.00s)
-BenchmarkAtomicConfigRead-4       5526794               245.1 ns/op            0 B/op          0 allocs/op
-PASS
-ok      [github.com/jaguargate/jaguargate/internal/config](https://github.com/jaguargate/jaguargate/internal/config)        2.762s
-
-=== RUN   TestZeroTrustLoggerRedaction
---- PASS: TestZeroTrustLoggerRedaction (0.00s)
-BenchmarkBufferPoolCycle-4          96268             16976 ns/op           8254 B/op          1 allocs/op
-PASS
-ok      [github.com/jaguargate/jaguargate/internal/telemetry](https://github.com/jaguargate/jaguargate/internal/telemetry)     2.885s
-
-=== RUN   TestHTTPAndUnixSocketProxyWithSSEStreaming
---- PASS: TestHTTPAndUnixSocketProxyWithSSEStreaming (0.03s)
-PASS
-ok      [github.com/jaguargate/jaguargate/internal/transport](https://github.com/jaguargate/jaguargate/internal/transport)     1.062s
-```
+| Component / Benchmark | Stage Introduced | Latency (ns/op) | Latency (ms) | Memory (`B/op`) | Allocations (`allocs/op`) |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| **`BenchmarkAtomicConfigRead-4`** *(Lock-Free Config)* | Stage 1 | **`0.51 ns/op`** | `0.0000005 ms` | **`0 B/op`** | **`0 allocs/op`** |
+| **`BenchmarkBufferPoolCycle-4`** *(32KB Scrub & Recycle)* | Stage 1 | **`273.1 ns/op`** | `0.000273 ms` | **`24 B/op`** | **`1 allocs/op`** |
+| **`BenchmarkStripJPEGMetadata-4`** *(Binary EXIF Hygiene)* | Stage 2 | **`31.44 ns/op`** | `0.000031 ms` | **`32 B/op`** | **`1 allocs/op`** |
+| **`BenchmarkOWASPInputEngine-4`** *(Full JSON OWASP + PII Vault)* | Stage 2 | **`118,794 ns/op`** | **`0.1187 ms`** | **`3,839 B/op`** | `108 allocs/op` |
+| **Cumulative Hot-Path Overhead** *(Stage 1 + Stage 2)* | **Current** | **`~119,099 ns/op`** | **`~0.119 ms`** | **`~3,895 B/op`** | **88.1% under `< 1.0 ms` SLA** |
 
 ---
 
-## 🧠 Architectural Takeaways (EN / PT-BR)
+## 🧪 Cumulative Quality & Security Gates
 
-* **[EN] Why `0.5185 ns/op` on Config Reads?**
-  By storing the active configuration in an `atomic.Pointer[Config]`, the Go compiler inlines `Manager.Get()` into a single CPU register load from L1 cache with zero mutex contention. Hot-reloading `jaguargate.yaml` swaps the pointer address atomically without pausing in-flight AI requests.
-* **[PT-BR] Por que `0.5185 ns/op` na Leitura de Configuração?**
-  Ao armazenar a configuração ativa em um `atomic.Pointer[Config]`, o compilador do Go aplica *inlining* em `Manager.Get()`, transformando a chamada em uma única leitura de registrador do Cache L1 da CPU sem disputa de *Mutex*. O *Hot-Reload* do `jaguargate.yaml` troca o endereço do ponteiro atomicamente sem pausar nenhuma requisição de IA em andamento.
-
-* **[EN] Why `273.1 ns/op` for 32KB Zero-Trust Buffer Recycling?**
-  Instead of allocating new 32KB heap buffers per SSE stream (which triggers Garbage Collector latency spikes), `ByteSlicePool` recycles memory via per-CPU-core local pools (`sync.Pool`) and scrubs all 32,768 bytes using vectorized `clear(b)` assembly before reuse.
-* **[PT-BR] Por que `273.1 ns/op` na Reciclagem Zero-Trust de Buffers de 32KB?**
-  Em vez de alocar novos blocos de 32KB no Heap a cada streaming SSE (o que causaria pausas no Garbage Collector), o `ByteSlicePool` recicla a memória usando filas locais por núcleo de CPU (`sync.Pool`) e zera todos os 32.768 bytes via instruções vetoriais (`clear(b)`) antes de reutilizar o buffer.
+| Verification Gate | Command | Stage 1 Result | Stage 2 Result |
+| :--- | :--- | :--- | :--- |
+| **Unit & E2E Execution Speed** | `go test -count=1 ./...` | `0.066s` (3 pkgs) | **`0.058s` (5 pkgs)** |
+| **Concurrency Data-Race Audit** | `go test -race ./...` | `PASS` (0 races) | **`PASS` (0 races)** |
+| **Coverage-Guided Binary Fuzzing** | `go test -fuzz=Fuzz...` | N/A | **`PASS` (`46,573 execs/sec`, 19 paths, 0 panics)** |
