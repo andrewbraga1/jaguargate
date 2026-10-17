@@ -13,6 +13,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -20,6 +21,8 @@ import (
 
 	"github.com/jaguargate/jaguargate/internal/config"
 	"github.com/jaguargate/jaguargate/internal/guards"
+	"github.com/jaguargate/jaguargate/internal/mcp"
+	"github.com/jaguargate/jaguargate/internal/state"
 	"github.com/jaguargate/jaguargate/internal/stream"
 	"github.com/jaguargate/jaguargate/internal/telemetry"
 )
@@ -29,17 +32,21 @@ type ctxStartTimeKey struct{}
 
 // GatewayServer manages the multi-transport listeners and the low-latency reverse proxy.
 type GatewayServer struct {
-	cfgMgr      *config.Manager
-	logger      *slog.Logger
-	bufferPool  *telemetry.ByteSlicePool
-	guardEngine *guards.Engine
-	proxy       *httputil.ReverseProxy
-	httpServer  *http.Server
-	udsServer   *http.Server
-	udsPath     string
+	cfgMgr         *config.Manager
+	logger         *slog.Logger
+	bufferPool     *telemetry.ByteSlicePool
+	stateStore     *state.HybridStore
+	circuitBreaker *state.CircuitBreaker
+	guardEngine    *guards.Engine
+	mcpInspector   *mcp.Inspector
+	proxy          *httputil.ReverseProxy
+	httpServer     *http.Server
+	udsServer      *http.Server
+	rpcServer      *http.Server
+	udsPath        string
 }
 
-// NewGatewayServer initializes the reverse proxy with pre-warmed keep-alive pools, buffer recycling, and OWASP/Stream guards.
+// NewGatewayServer initializes the reverse proxy with pre-warmed keep-alive pools, L1/L2 state, MCP & OWASP guards.
 func NewGatewayServer(cfgMgr *config.Manager, logger *slog.Logger) (*GatewayServer, error) {
 	snap := cfgMgr.Get()
 	targetURL, err := url.Parse(snap.Network.Egress.UpstreamURL)
@@ -48,7 +55,18 @@ func NewGatewayServer(cfgMgr *config.Manager, logger *slog.Logger) (*GatewayServ
 	}
 
 	bufPool := telemetry.NewByteSlicePool()
-	guardEngine := guards.NewEngine(guards.NewPIIVault())
+
+	stateStore, err := state.NewHybridStore(snap.Extensions.StateStore)
+	if err != nil {
+		return nil, fmt.Errorf("initialize state store: %w", err)
+	}
+
+	vault := guards.NewPIIVault()
+	vault.SetExternalStore(stateStore)
+
+	circuitBreaker := state.NewCircuitBreaker()
+	guardEngine := guards.NewEngine(vault)
+	mcpInspector := mcp.NewInspector(guardEngine, circuitBreaker)
 
 	dialer := &net.Dialer{
 		Timeout:   10 * time.Second,
@@ -89,7 +107,6 @@ func NewGatewayServer(cfgMgr *config.Manager, logger *slog.Logger) (*GatewayServ
 			activeCfg := cfgMgr.Get()
 			inboundRes, _ := resp.Request.Context().Value(ctxInspectionKey{}).(guards.InspectionResult)
 
-			// Calculate monotonic gateway latency in microseconds for DevOps/APM observability
 			if startTime, ok := resp.Request.Context().Value(ctxStartTimeKey{}).(time.Time); ok {
 				resp.Header.Set("X-JaguarGate-Latency-Us", strconv.FormatInt(time.Since(startTime).Microseconds(), 10))
 			}
@@ -98,7 +115,6 @@ func NewGatewayServer(cfgMgr *config.Manager, logger *slog.Logger) (*GatewayServ
 			isSSE := strings.Contains(strings.ToLower(contentType), "text/event-stream")
 
 			if isSSE && resp.Body != nil {
-				// Enterprise SSE Anti-Buffering headers for Nginx, Traefik, Cloudflare & Docker
 				resp.Header.Set("X-Accel-Buffering", "no")
 				resp.Header.Set("Cache-Control", "no-cache, no-transform")
 				resp.Header.Del("Content-Length")
@@ -131,11 +147,22 @@ func NewGatewayServer(cfgMgr *config.Manager, logger *slog.Logger) (*GatewayServ
 				return nil
 			}
 
-			// Non-streaming response: inspect output JSON (Tool Call Firewall + Canary Leak + Output Sanitizer + PII Restore)
 			if resp.Body != nil {
 				rawResp, err := io.ReadAll(resp.Body)
 				_ = resp.Body.Close()
 				if err == nil {
+					// If response is MCP JSON-RPC 2.0 (e.g. resources/read result), run MCP sanitization
+					if activeCfg.Network.MCP.Enabled && mcp.IsJSONRPCPayload(rawResp) {
+						sessionID := extractSessionID(resp.Request)
+						mcpRes := mcpInspector.InspectPayload(rawResp, sessionID, "", activeCfg)
+						for _, c := range mcpRes.Codes {
+							if !slices.Contains(inboundRes.Codes, c) {
+								inboundRes.Codes = append(inboundRes.Codes, c)
+							}
+						}
+						rawResp = mcpRes.ModifiedBody
+					}
+
 					outRes := guardEngine.SanitizeOutputJSON(rawResp, inboundRes, activeCfg)
 					if activeCfg.Telemetry.WarningFlags.EmitHTTPHeaders {
 						resp.Header.Set("X-JaguarGate-Status", outRes.Status)
@@ -173,15 +200,18 @@ func NewGatewayServer(cfgMgr *config.Manager, logger *slog.Logger) (*GatewayServ
 	}
 
 	return &GatewayServer{
-		cfgMgr:      cfgMgr,
-		logger:      logger,
-		bufferPool:  bufPool,
-		guardEngine: guardEngine,
-		proxy:       rp,
+		cfgMgr:         cfgMgr,
+		logger:         logger,
+		bufferPool:     bufPool,
+		stateStore:     stateStore,
+		circuitBreaker: circuitBreaker,
+		guardEngine:    guardEngine,
+		mcpInspector:   mcpInspector,
+		proxy:          rp,
 	}, nil
 }
 
-// Handler wraps the reverse proxy with OWASP Input Guards, payload size limits, and healthcheck.
+// Handler wraps the reverse proxy with Stage 2-4 Guards (OWASP, Tool Firewall, Circuit Breaker & MCP Inspector).
 func (s *GatewayServer) Handler() http.Handler {
 	mux := http.NewServeMux()
 
@@ -205,7 +235,6 @@ func (s *GatewayServer) Handler() http.Handler {
 			r.Body = http.MaxBytesReader(w, r.Body, maxBytes)
 		}
 
-		// Execute OWASP Input Inspection on requests carrying a body
 		if r.Body != nil && (r.Method == http.MethodPost || r.Method == http.MethodPut) {
 			buf := telemetry.AcquireBuffer()
 			_, readErr := buf.ReadFrom(r.Body)
@@ -223,9 +252,43 @@ func (s *GatewayServer) Handler() http.Handler {
 			rawBody := bytes.Clone(buf.Bytes())
 			telemetry.ReleaseBuffer(buf)
 
-			res := s.guardEngine.InspectJSONPayload(rawBody, cfg)
+			sessionID := extractSessionID(r)
+			var res guards.InspectionResult
+
+			// Route 1: Model Context Protocol (MCP JSON-RPC 2.0) Traffic
+			if cfg.Network.MCP.Enabled && mcp.IsJSONRPCPayload(rawBody) {
+				mcpSrv := r.Header.Get("X-MCP-Server")
+				mcpRes := s.mcpInspector.InspectPayload(rawBody, sessionID, mcpSrv, cfg)
+				res = guards.InspectionResult{
+					ModifiedBody: mcpRes.ModifiedBody,
+					Status:       mcpRes.Status,
+					Severity:     mcpRes.Severity,
+					Codes:        mcpRes.Codes,
+					PrunedTools:  mcpRes.PrunedCount,
+					Blocked:      mcpRes.Blocked,
+				}
+			} else {
+				// Route 2: Standard LLM Chat / Agent Completions Traffic
+				res = s.guardEngine.InspectJSONPayload(rawBody, cfg)
+			}
+
+			// Enforce Session Token Budget Circuit Breaker (JG-CFG-202)
+			if s.circuitBreaker.CheckAndTrackTokens(sessionID, len(rawBody), cfg.Whitelist.CircuitBreaker) {
+				if !slices.Contains(res.Codes, "JG-CFG-202") {
+					res.Codes = append(res.Codes, "JG-CFG-202")
+				}
+				if res.Status == "CLEAN" {
+					if cfg.Core.Mode == "shadow" {
+						res.Status = "SHADOW_FLAGGED"
+					} else {
+						res.Status = "SANITIZED"
+					}
+					res.Severity = "CONFIG_WARNING"
+				}
+			}
+
 			if len(res.Codes) > 0 {
-				s.logger.Warn("JaguarGate input guard triggered",
+				s.logger.Warn("JaguarGate guard triggered",
 					slog.String("status", res.Status),
 					slog.String("severity", res.Severity),
 					slog.String("codes", strings.Join(res.Codes, ",")),
@@ -258,7 +321,7 @@ func (s *GatewayServer) Handler() http.Handler {
 	return mux
 }
 
-// Start launches the configured HTTP and/or Unix Domain Socket listeners concurrently.
+// Start launches the configured HTTP, Unix Domain Socket, and high-speed RPC listeners concurrently.
 func (s *GatewayServer) Start(ctx context.Context) error {
 	cfg := s.cfgMgr.Get()
 	handler := s.Handler()
@@ -266,7 +329,7 @@ func (s *GatewayServer) Start(ctx context.Context) error {
 	readTimeout := time.Duration(cfg.Network.Ingress.HTTP.ReadTimeoutMs) * time.Millisecond
 	writeTimeout := time.Duration(cfg.Network.Ingress.HTTP.WriteTimeoutMs) * time.Millisecond
 
-	errCh := make(chan error, 2)
+	errCh := make(chan error, 3)
 	var wg sync.WaitGroup
 
 	if cfg.Network.Ingress.HTTP.Enabled {
@@ -324,6 +387,23 @@ func (s *GatewayServer) Start(ctx context.Context) error {
 		}()
 	}
 
+	if cfg.Network.Ingress.GRPC.Enabled && cfg.Network.Ingress.GRPC.ListenAddr != "" {
+		s.rpcServer = &http.Server{
+			Addr:              cfg.Network.Ingress.GRPC.ListenAddr,
+			Handler:           handler,
+			ReadHeaderTimeout: 5 * time.Second,
+			ReadTimeout:       readTimeout,
+			WriteTimeout:      writeTimeout,
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := s.rpcServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				errCh <- fmt.Errorf("RPC listener error: %w", err)
+			}
+		}()
+	}
+
 	select {
 	case <-ctx.Done():
 		s.logger.Info(config.T(cfg.Core.Language, config.MsgServerShutdown))
@@ -335,6 +415,9 @@ func (s *GatewayServer) Start(ctx context.Context) error {
 		if s.udsServer != nil {
 			_ = s.udsServer.Shutdown(shutdownCtx)
 		}
+		if s.rpcServer != nil {
+			_ = s.rpcServer.Shutdown(shutdownCtx)
+		}
 		if s.udsPath != "" {
 			_ = os.Remove(s.udsPath)
 		}
@@ -343,4 +426,17 @@ func (s *GatewayServer) Start(ctx context.Context) error {
 	case err := <-errCh:
 		return err
 	}
+}
+
+func extractSessionID(r *http.Request) string {
+	if r == nil {
+		return "default_session"
+	}
+	if sid := strings.TrimSpace(r.Header.Get("X-JaguarGate-Session-ID")); sid != "" {
+		return sid
+	}
+	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil && host != "" {
+		return host
+	}
+	return "default_session"
 }
