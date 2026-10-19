@@ -1,0 +1,36 @@
+name: JaguarGate CI & Security Suite
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Test, Race Detector & Pounce Audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Setup Go 1.23
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+          cache: true
+
+      - name: Run static analysis (go vet)
+        run: go vet ./...
+
+      - name: Run unit, E2E & example validation tests with Race Detector
+        run: go test -v -race -count=1 ./...
+
+      - name: Build static jgate binary
+        run: CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o jgate ./cmd/jgate
+
+      - name: Execute built-in OWASP & MCP Red-Teaming Suite (jgate pounce)
+        run: ./jgate pounce
