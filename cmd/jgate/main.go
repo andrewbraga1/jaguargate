@@ -123,26 +123,51 @@ func runDoctor(cfgPath, langOverride string) {
 	isPT := strings.EqualFold(activeLang, "pt-BR") || strings.EqualFold(activeLang, "pt")
 
 	if err != nil {
-		fmt.Fprintln(os.Stderr, config.T(activeLang, config.MsgConfigInvalid, err))
+		fmt.Fprintf(os.Stderr, "[FAIL] %s\n", config.T(activeLang, config.MsgConfigInvalid, err))
 		os.Exit(1)
 	}
 
-	upstreamReachable := checkTCPReachability(cfg.Network.Egress.UpstreamURL)
-
+	// 1. Evaluate HTTP Ingress Listener status dynamically
 	listenAddr := cfg.Network.Ingress.HTTP.ListenAddr
 	if strings.HasPrefix(listenAddr, ":") {
 		listenAddr = "127.0.0.1" + listenAddr
 	}
 	gatewayBaseURL := "http://" + listenAddr
+	httpBadge := statusBadge(cfg.Network.Ingress.HTTP.Enabled, true)
+
+	// 2. Evaluate Upstream AI Target reachability dynamically (TCP or Unix Socket)
+	upstreamTarget := cfg.Network.Egress.UpstreamURL
+	var upstreamReachable bool
+	if cfg.Network.Egress.UpstreamUnixSocket != "" {
+		upstreamTarget = "unix://" + cfg.Network.Egress.UpstreamUnixSocket
+		upstreamReachable = checkUnixReachability(cfg.Network.Egress.UpstreamUnixSocket)
+	} else {
+		upstreamReachable = checkTCPReachability(cfg.Network.Egress.UpstreamURL)
+	}
+	upstreamBadge := statusBadge(upstreamReachable, false)
+
+	// 3. Evaluate State Store (L1 Memory vs L2 Redis + Fail-Open) dynamically
+	stateBadge, stateSummary := evaluateStateStoreStatus(cfg.Extensions.StateStore, isPT)
+
+	// 4. Evaluate Prometheus Metrics endpoint URL dynamically
+	metricsURL := gatewayBaseURL + "/metrics"
+	if cfg.Telemetry.OpenTelemetry.Enabled && cfg.Telemetry.OpenTelemetry.PrometheusListen != "" {
+		promAddr := cfg.Telemetry.OpenTelemetry.PrometheusListen
+		if strings.HasPrefix(promAddr, ":") {
+			promAddr = "127.0.0.1" + promAddr
+		}
+		metricsURL = "http://" + promAddr + "/metrics"
+	}
 
 	if isPT {
 		fmt.Println("===============================================================================")
 		fmt.Printf("  JAGUARGATE (%s) — DIAGNÓSTICO E GUIA DE CONEXÃO DEV / DEVOPS\n", Version)
 		fmt.Println("===============================================================================")
-		fmt.Printf("  [OK] Arquivo de Configuração : %s (Modo: %s | Preset: %s)\n", cfgPath, cfg.Core.Mode, cfg.Core.Preset)
-		fmt.Printf("  [OK] Escuta HTTP Local       : %s\n", gatewayBaseURL)
-		fmt.Printf("  [OK] Destino Upstream IA     : %s (Conectável agora: %v)\n", cfg.Network.Egress.UpstreamURL, upstreamReachable)
-		fmt.Printf("  [OK] Endpoint Prometheus     : %s/metrics\n", gatewayBaseURL)
+		fmt.Printf("  [OK]   Arquivo de Configuração : %s (Modo: %s | Preset: %s)\n", cfgPath, cfg.Core.Mode, cfg.Core.Preset)
+		fmt.Printf("  %s Escuta HTTP Local       : %s (Ativo: %v)\n", httpBadge, gatewayBaseURL, cfg.Network.Ingress.HTTP.Enabled)
+		fmt.Printf("  %s Destino Upstream IA     : %s (Conectável agora: %v)\n", upstreamBadge, upstreamTarget, upstreamReachable)
+		fmt.Printf("  %s Estado / Cofre L1-L2    : %s\n", stateBadge, stateSummary)
+		fmt.Printf("  [OK]   Probes & Prometheus     : %s/readyz | %s\n", gatewayBaseURL, metricsURL)
 		fmt.Println("-------------------------------------------------------------------------------")
 		fmt.Println("  1. CONECTAR SDKs, CLINE, CURSOR OU CONTINUE (NA MESMA MÁQUINA):")
 		fmt.Printf("     export OPENAI_BASE_URL=\"%s/v1\"\n", gatewayBaseURL)
@@ -153,7 +178,8 @@ func runDoctor(cfgPath, langOverride string) {
 		fmt.Printf("     export JAGUARGATE_UPSTREAM_URL=\"%s\"\n", cfg.Network.Egress.UpstreamURL)
 		fmt.Println("     ./jgate serve -c jaguargate.yaml")
 		fmt.Println("\n  3. OBSERVABILIDADE (PROMETHEUS / GRAFANA / DATADOG):")
-		fmt.Printf("     curl -s %s/metrics\n", gatewayBaseURL)
+		fmt.Printf("     curl -s %s\n", metricsURL)
+		fmt.Printf("     curl -s %s/readyz\n", gatewayBaseURL)
 		fmt.Println("     Header de Latência por Request: X-JaguarGate-Latency-Us")
 		fmt.Println("===============================================================================")
 		return
@@ -162,10 +188,11 @@ func runDoctor(cfgPath, langOverride string) {
 	fmt.Println("===============================================================================")
 	fmt.Printf("  JAGUARGATE (%s) — DIAGNOSTICS & DEV / DEVOPS CONNECTION GUIDE\n", Version)
 	fmt.Println("===============================================================================")
-	fmt.Printf("  [OK] Configuration File      : %s (Mode: %s | Preset: %s)\n", cfgPath, cfg.Core.Mode, cfg.Core.Preset)
-	fmt.Printf("  [OK] HTTP Ingress Listener   : %s\n", gatewayBaseURL)
-	fmt.Printf("  [OK] Upstream AI Target      : %s (Currently Reachable: %v)\n", cfg.Network.Egress.UpstreamURL, upstreamReachable)
-	fmt.Printf("  [OK] Prometheus Endpoint     : %s/metrics\n", gatewayBaseURL)
+	fmt.Printf("  [OK]   Configuration File      : %s (Mode: %s | Preset: %s)\n", cfgPath, cfg.Core.Mode, cfg.Core.Preset)
+	fmt.Printf("  %s HTTP Ingress Listener   : %s (Enabled: %v)\n", httpBadge, gatewayBaseURL, cfg.Network.Ingress.HTTP.Enabled)
+	fmt.Printf("  %s Upstream AI Target      : %s (Currently Reachable: %v)\n", upstreamBadge, upstreamTarget, upstreamReachable)
+	fmt.Printf("  %s L1/L2 State Store       : %s\n", stateBadge, stateSummary)
+	fmt.Printf("  [OK]   Probes & Prometheus     : %s/readyz | %s\n", gatewayBaseURL, metricsURL)
 	fmt.Println("-------------------------------------------------------------------------------")
 	fmt.Println("  1. CONNECT SDKs, CLINE, CURSOR, OR CONTINUE (SAME HOST):")
 	fmt.Printf("     export OPENAI_BASE_URL=\"%s/v1\"\n", gatewayBaseURL)
@@ -176,25 +203,93 @@ func runDoctor(cfgPath, langOverride string) {
 	fmt.Printf("     export JAGUARGATE_UPSTREAM_URL=\"%s\"\n", cfg.Network.Egress.UpstreamURL)
 	fmt.Println("     ./jgate serve -c jaguargate.yaml")
 	fmt.Println("\n  3. OBSERVABILITY (PROMETHEUS / GRAFANA / DATADOG):")
-	fmt.Printf("     curl -s %s/metrics\n", gatewayBaseURL)
+	fmt.Printf("     curl -s %s\n", metricsURL)
+	fmt.Printf("     curl -s %s/readyz\n", gatewayBaseURL)
 	fmt.Println("     Per-Request Latency Header: X-JaguarGate-Latency-Us")
 	fmt.Println("===============================================================================")
 }
 
+func statusBadge(ok bool, warnOnly bool) string {
+	if ok {
+		return "[OK]  "
+	}
+	if warnOnly {
+		return "[WARN]"
+	}
+	return "[FAIL]"
+}
+
+func evaluateStateStoreStatus(sc config.StateStoreConfig, isPT bool) (string, string) {
+	driver := strings.ToLower(strings.TrimSpace(sc.Driver))
+	if driver == "" || driver == "memory" {
+		if isPT {
+			return "[OK]  ", "Memória Local L1 (Ultra-Baixa Latência)"
+		}
+		return "[OK]  ", "In-Memory L1 (Sub-Microsecond Local Store)"
+	}
+
+	// Driver is "redis": check if reachable
+	redisReachable := checkTCPReachability(sc.RedisURL)
+	if redisReachable {
+		if isPT {
+			return "[OK]  ", fmt.Sprintf("Híbrido L1 + Redis L2 AES-256-GCM (%s online)", sc.RedisURL)
+		}
+		return "[OK]  ", fmt.Sprintf("Hybrid L1 + Redis L2 AES-256-GCM (%s reachable)", sc.RedisURL)
+	}
+
+	if sc.FailOpenToLocalMemory {
+		if isPT {
+			return "[WARN]", fmt.Sprintf("Redis (%s) offline -> Fail-Open para Memória L1 ativo (JG-EXT-602)", sc.RedisURL)
+		}
+		return "[WARN]", fmt.Sprintf("Redis (%s) unreachable -> L1 Memory Fail-Open active (JG-EXT-602)", sc.RedisURL)
+	}
+
+	if isPT {
+		return "[FAIL]", fmt.Sprintf("Redis (%s) inacessível e Fail-Open desativado", sc.RedisURL)
+	}
+	return "[FAIL]", fmt.Sprintf("Redis (%s) unreachable and Fail-Open disabled", sc.RedisURL)
+}
+
 func checkTCPReachability(rawURL string) bool {
+	if rawURL == "" {
+		return false
+	}
+	if !strings.Contains(rawURL, "://") {
+		conn, err := net.DialTimeout("tcp", rawURL, 300*time.Millisecond)
+		if err != nil {
+			return false
+		}
+		_ = conn.Close()
+		return true
+	}
 	u, err := url.Parse(rawURL)
 	if err != nil || u.Host == "" {
 		return false
 	}
 	host := u.Host
 	if !strings.Contains(host, ":") {
-		if u.Scheme == "https" {
+		switch u.Scheme {
+		case "https":
 			host += ":443"
-		} else {
+		case "redis", "rediss":
+			host += ":6379"
+		default:
 			host += ":80"
 		}
 	}
 	conn, err := net.DialTimeout("tcp", host, 300*time.Millisecond)
+	if err != nil {
+		return false
+	}
+	_ = conn.Close()
+	return true
+}
+
+func checkUnixReachability(sockPath string) bool {
+	if sockPath == "" {
+		return false
+	}
+	conn, err := net.DialTimeout("unix", sockPath, 300*time.Millisecond)
 	if err != nil {
 		return false
 	}

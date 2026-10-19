@@ -89,13 +89,17 @@ func SanitizeOutputText(text, canaryToken string, cfg *config.Config, vault *PII
 	}
 
 	isShadow := cfg.Core.Mode == "shadow"
+	isPT := isPortuguese(cfg.Core.Language)
 	var codes []string
 
 	// 1. Critical System Prompt Canary Leak Detection (JG-SEC-501)
 	if cfg.Guards.CanaryTokens.Enabled && canaryToken != "" && strings.Contains(text, canaryToken) {
 		codes = append(codes, "JG-SEC-501")
 		if cfg.Guards.CanaryTokens.TruncateStreamOnLeak && !isShadow {
-			return "[CONTEÚDO RESTRITO / RESTRICTED CONTENT: System Prompt Leak Prevented (JG-SEC-501)]", codes, true
+			if isPT {
+				return "[CONTEÚDO RESTRITO: Vazamento de System Prompt Bloqueado (JG-SEC-501)]", codes, true
+			}
+			return "[RESTRICTED CONTENT: System Prompt Leak Prevented (JG-SEC-501)]", codes, true
 		}
 	}
 
@@ -110,7 +114,11 @@ func SanitizeOutputText(text, canaryToken string, cfg *config.Config, vault *PII
 					codes = append(codes, "JG-SEC-502")
 				}
 				if !isShadow {
-					working = strings.ReplaceAll(working, m[0], "[CONTEÚDO RESTRITO / RESTRICTED IMAGE]")
+					replacement := "[RESTRICTED IMAGE (JG-SEC-502)]"
+					if isPT {
+						replacement = "[IMAGEM RESTRITA (JG-SEC-502)]"
+					}
+					working = strings.ReplaceAll(working, m[0], replacement)
 				}
 			}
 		}
@@ -122,7 +130,11 @@ func SanitizeOutputText(text, canaryToken string, cfg *config.Config, vault *PII
 			codes = append(codes, "JG-SEC-502")
 		}
 		if !isShadow {
-			working = reExecutableScript.ReplaceAllString(working, "[CONTEÚDO RESTRITO / RESTRICTED SCRIPT]")
+			replacement := "[RESTRICTED SCRIPT (JG-SEC-502)]"
+			if isPT {
+				replacement = "[SCRIPT RESTRITO (JG-SEC-502)]"
+			}
+			working = reExecutableScript.ReplaceAllString(working, replacement)
 		}
 	}
 
@@ -167,6 +179,7 @@ func (e *Engine) SanitizeOutputJSON(body []byte, inboundRes InspectionResult, cf
 	}
 
 	isShadow := cfg.Core.Mode == "shadow"
+	isPT := isPortuguese(cfg.Core.Language)
 	modified := false
 
 	// Inspect OpenAI / LiteLLM / vLLM "choices" array
@@ -210,7 +223,11 @@ func (e *Engine) SanitizeOutputJSON(body []byte, inboundRes InspectionResult, cf
 								chMap["finish_reason"] = "stop"
 							}
 							if msgMap["content"] == nil || msgMap["content"] == "" {
-								msgMap["content"] = "[JaguarGate: Unauthorized tool call omitted by policy (JG-CFG-101)]"
+								if isPT {
+									msgMap["content"] = "[JaguarGate: Chamada de ferramenta não autorizada omitida pela política (JG-CFG-101)]"
+								} else {
+									msgMap["content"] = "[JaguarGate: Unauthorized tool call omitted by policy (JG-CFG-101)]"
+								}
 							}
 						}
 					}
@@ -367,4 +384,9 @@ func sanitizeDomainsInText(input string, allowedDomains []string, isShadow bool)
 		return foundURL
 	})
 	return out, violated
+}
+
+func isPortuguese(lang string) bool {
+	l := strings.TrimSpace(lang)
+	return strings.EqualFold(l, "pt-BR") || strings.EqualFold(l, "pt")
 }

@@ -204,23 +204,23 @@ func RunPounceSuite(lang string) SuiteReport {
 	}
 }
 
-// FormatReport renders a clean, single-language Enterprise CLI table (EN default, PT-BR optional).
+// FormatReport renders a clean, single-language Enterprise CLI table displaying the ACTUAL triggered flags.
 func (r SuiteReport) FormatReport() string {
 	isPT := strings.EqualFold(strings.TrimSpace(r.Language), "pt-BR") || strings.EqualFold(strings.TrimSpace(r.Language), "pt")
 	var b strings.Builder
 
 	if isPT {
-		b.WriteString("\n===============================================================================================\n")
+		b.WriteString("\n===========================================================================================================\n")
 		b.WriteString("  JAGUARGATE RED-TEAMING SUITE (jgate pounce) — RELATÓRIO DE AUDITORIA DE SEGURANÇA\n")
-		b.WriteString("===============================================================================================\n")
-		fmt.Fprintf(&b, "%-7s | %-12s | %-47s | %-10s | %-6s | %-6s\n", "ID", "CATEGORIA", "CENÁRIO DE ATAQUE SIMULADO", "FLAG", "LAT.", "STATUS")
-		b.WriteString("-----------------------------------------------------------------------------------------------\n")
+		b.WriteString("===========================================================================================================\n")
+		fmt.Fprintf(&b, "%-7s | %-12s | %-47s | %-21s | %-6s | %-6s\n", "ID", "CATEGORIA", "CENÁRIO DE ATAQUE SIMULADO", "FLAGS ACIONADAS", "LAT.", "STATUS")
+		b.WriteString("-----------------------------------------------------------------------------------------------------------\n")
 	} else {
-		b.WriteString("\n===============================================================================================\n")
+		b.WriteString("\n===========================================================================================================\n")
 		b.WriteString("  JAGUARGATE RED-TEAMING SUITE (jgate pounce) — SECURITY AUDIT REPORT\n")
-		b.WriteString("===============================================================================================\n")
-		fmt.Fprintf(&b, "%-7s | %-12s | %-47s | %-10s | %-6s | %-6s\n", "ID", "CATEGORY", "SIMULATED ATTACK SCENARIO", "FLAG", "LAT.", "STATUS")
-		b.WriteString("-----------------------------------------------------------------------------------------------\n")
+		b.WriteString("===========================================================================================================\n")
+		fmt.Fprintf(&b, "%-7s | %-12s | %-47s | %-21s | %-6s | %-6s\n", "ID", "CATEGORY", "SIMULATED ATTACK SCENARIO", "TRIGGERED FLAGS", "LAT.", "STATUS")
+		b.WriteString("-----------------------------------------------------------------------------------------------------------\n")
 	}
 
 	for _, res := range r.Results {
@@ -228,11 +228,15 @@ func (r SuiteReport) FormatReport() string {
 		if !res.Passed {
 			statusStr = "FAIL"
 		}
-		fmt.Fprintf(&b, "%-7s | %-12s | %-47s | %-10s | %4dµs | %-6s\n",
-			res.ID, res.Category, res.Scenario, res.ExpectedCode, res.LatencyUs, statusStr)
+		actualFlags := "NONE"
+		if len(res.ActualCodes) > 0 {
+			actualFlags = strings.Join(res.ActualCodes, ",")
+		}
+		fmt.Fprintf(&b, "%-7s | %-12s | %-47s | %-21s | %4dµs | %-6s\n",
+			res.ID, res.Category, res.Scenario, actualFlags, res.LatencyUs, statusStr)
 	}
 
-	b.WriteString("-----------------------------------------------------------------------------------------------\n")
+	b.WriteString("-----------------------------------------------------------------------------------------------------------\n")
 	if isPT {
 		verdict := "APROVADO (8/8 Vetores Neutralizados)"
 		if !r.AllPassed {
@@ -246,7 +250,7 @@ func (r SuiteReport) FormatReport() string {
 		}
 		fmt.Fprintf(&b, "  VERDICT: %s | Total Suite Duration: %v\n", verdict, r.TotalDuration.Round(time.Microsecond))
 	}
-	b.WriteString("===============================================================================================\n")
+	b.WriteString("===========================================================================================================\n")
 
 	return b.String()
 }

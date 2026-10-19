@@ -261,7 +261,17 @@ func (s *SSEInspector) haltOnCanaryLeak() {
 	s.halted = true
 	s.status = "BLOCKED"
 	s.severity = "INTRUSION_ALERT"
-	s.emitSyntheticDeltaChunk("[CONTEÚDO RESTRITO / RESTRICTED CONTENT: System Prompt Leak Halted (JG-SEC-501)]")
+
+	lang := ""
+	if s.cfg != nil {
+		lang = strings.TrimSpace(s.cfg.Core.Language)
+	}
+	if strings.EqualFold(lang, "pt-BR") || strings.EqualFold(lang, "pt") {
+		s.emitSyntheticDeltaChunk("[CONTEÚDO RESTRITO: Vazamento de System Prompt Interrompido (JG-SEC-501)]")
+	} else {
+		s.emitSyntheticDeltaChunk("[RESTRICTED CONTENT: System Prompt Leak Halted (JG-SEC-501)]")
+	}
+
 	s.emitWarningEventIfNeeded()
 	s.outBuf.WriteString("data: [DONE]\n\n")
 	s.populateTrailers()

@@ -238,20 +238,50 @@ func NewGatewayServer(cfgMgr *config.Manager, logger *slog.Logger) (*GatewayServ
 	}, nil
 }
 
-// Handler wraps the reverse proxy with Stage 2-5 Guards, Sandbox, Healthcheck, and Prometheus Metrics.
+// Handler wraps the reverse proxy with Stage 2-5 Guards, Sandbox, Liveness/Readiness Probes, and Prometheus Metrics.
 func (s *GatewayServer) Handler() http.Handler {
 	mux := http.NewServeMux()
 
+	// Kubernetes Liveness Probe (/healthz) — also supports ?check=upstream for deep health verification
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		cfg := s.cfgMgr.Get()
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("X-JaguarGate-Status", "CLEAN")
+
+		if r.URL.Query().Get("check") == "upstream" {
+			reachable := probeUpstream(cfg.Network.Egress)
+			statusStr := "ok"
+			if !reachable {
+				statusStr = "degraded"
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprintf(w, `{"status":%q,"version":%q,"mode":%q,"preset":%q,"upstream_reachable":%v}`,
+				statusStr, cfg.Core.Version, cfg.Core.Mode, cfg.Core.Preset, reachable)
+			return
+		}
+
 		w.WriteHeader(http.StatusOK)
 		_, _ = fmt.Fprintf(w, `{"status":"ok","version":%q,"mode":%q,"preset":%q}`,
 			cfg.Core.Version, cfg.Core.Mode, cfg.Core.Preset)
 	})
 
-	// Expose Prometheus / OpenMetrics endpoint on /metrics as well
+	// Kubernetes / Load-Balancer Readiness Probe (/readyz) — dynamically verifies upstream reachability
+	mux.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
+		cfg := s.cfgMgr.Get()
+		reachable := probeUpstream(cfg.Network.Egress)
+		w.Header().Set("Content-Type", "application/json")
+		if !reachable {
+			w.Header().Set("X-JaguarGate-Status", "UPSTREAM_UNAVAILABLE")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = fmt.Fprintf(w, `{"status":"not_ready","upstream_reachable":false,"upstream":%q}`, cfg.Network.Egress.UpstreamURL)
+			return
+		}
+		w.Header().Set("X-JaguarGate-Status", "CLEAN")
+		w.WriteHeader(http.StatusOK)
+		_, _ = fmt.Fprintf(w, `{"status":"ready","upstream_reachable":true,"upstream":%q}`, cfg.Network.Egress.UpstreamURL)
+	})
+
+	// Expose Prometheus / OpenMetrics endpoint on /metrics
 	mux.Handle("/metrics", s.metrics.Handler())
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -505,6 +535,35 @@ func (s *GatewayServer) Start(ctx context.Context) error {
 	case err := <-errCh:
 		return err
 	}
+}
+
+func probeUpstream(egress config.EgressConfig) bool {
+	if egress.UpstreamUnixSocket != "" {
+		conn, err := net.DialTimeout("unix", egress.UpstreamUnixSocket, 300*time.Millisecond)
+		if err != nil {
+			return false
+		}
+		_ = conn.Close()
+		return true
+	}
+	u, err := url.Parse(egress.UpstreamURL)
+	if err != nil || u.Host == "" {
+		return false
+	}
+	host := u.Host
+	if !strings.Contains(host, ":") {
+		if u.Scheme == "https" {
+			host += ":443"
+		} else {
+			host += ":80"
+		}
+	}
+	conn, err := net.DialTimeout("tcp", host, 300*time.Millisecond)
+	if err != nil {
+		return false
+	}
+	_ = conn.Close()
+	return true
 }
 
 func extractSessionID(r *http.Request) string {
