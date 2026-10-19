@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/jaguargate/jaguargate/internal/config"
+	"github.com/jaguargate/jaguargate/internal/extensions"
 	"github.com/jaguargate/jaguargate/internal/guards"
 	"github.com/jaguargate/jaguargate/internal/mcp"
 	"github.com/jaguargate/jaguargate/internal/state"
@@ -30,11 +31,14 @@ import (
 type ctxInspectionKey struct{}
 type ctxStartTimeKey struct{}
 
-// GatewayServer manages the multi-transport listeners and the low-latency reverse proxy.
+// GatewayServer manages the multi-transport listeners, telemetry, and the low-latency reverse proxy.
 type GatewayServer struct {
 	cfgMgr         *config.Manager
 	logger         *slog.Logger
 	bufferPool     *telemetry.ByteSlicePool
+	metrics        *telemetry.MetricsCollector
+	webhooks       *telemetry.WebhookDispatcher
+	sandbox        *extensions.Sandbox
 	stateStore     *state.HybridStore
 	circuitBreaker *state.CircuitBreaker
 	guardEngine    *guards.Engine
@@ -43,10 +47,11 @@ type GatewayServer struct {
 	httpServer     *http.Server
 	udsServer      *http.Server
 	rpcServer      *http.Server
+	metricsServer  *http.Server
 	udsPath        string
 }
 
-// NewGatewayServer initializes the reverse proxy with pre-warmed keep-alive pools, L1/L2 state, MCP & OWASP guards.
+// NewGatewayServer initializes the reverse proxy with pre-warmed keep-alive pools, L1/L2 state, Wasm sandbox, MCP, OWASP & Telemetry.
 func NewGatewayServer(cfgMgr *config.Manager, logger *slog.Logger) (*GatewayServer, error) {
 	snap := cfgMgr.Get()
 	targetURL, err := url.Parse(snap.Network.Egress.UpstreamURL)
@@ -55,6 +60,9 @@ func NewGatewayServer(cfgMgr *config.Manager, logger *slog.Logger) (*GatewayServ
 	}
 
 	bufPool := telemetry.NewByteSlicePool()
+	metrics := telemetry.NewMetricsCollector()
+	webhooks := telemetry.NewWebhookDispatcher()
+	sandbox := extensions.NewSandbox()
 
 	stateStore, err := state.NewHybridStore(snap.Extensions.StateStore)
 	if err != nil {
@@ -107,8 +115,10 @@ func NewGatewayServer(cfgMgr *config.Manager, logger *slog.Logger) (*GatewayServ
 			activeCfg := cfgMgr.Get()
 			inboundRes, _ := resp.Request.Context().Value(ctxInspectionKey{}).(guards.InspectionResult)
 
+			var latencyUs int64
 			if startTime, ok := resp.Request.Context().Value(ctxStartTimeKey{}).(time.Time); ok {
-				resp.Header.Set("X-JaguarGate-Latency-Us", strconv.FormatInt(time.Since(startTime).Microseconds(), 10))
+				latencyUs = time.Since(startTime).Microseconds()
+				resp.Header.Set("X-JaguarGate-Latency-Us", strconv.FormatInt(latencyUs, 10))
 			}
 
 			contentType := resp.Header.Get("Content-Type")
@@ -119,13 +129,14 @@ func NewGatewayServer(cfgMgr *config.Manager, logger *slog.Logger) (*GatewayServ
 				resp.Header.Set("Cache-Control", "no-cache, no-transform")
 				resp.Header.Del("Content-Length")
 
+				status := inboundRes.Status
+				severity := inboundRes.Severity
+				if status == "" {
+					status = "CLEAN"
+					severity = "NONE"
+				}
+
 				if activeCfg.Telemetry.WarningFlags.EmitHTTPHeaders {
-					status := inboundRes.Status
-					severity := inboundRes.Severity
-					if status == "" {
-						status = "CLEAN"
-						severity = "NONE"
-					}
 					resp.Header.Set("X-JaguarGate-Status", status)
 					resp.Header.Set("X-JaguarGate-Severity", severity)
 					if len(inboundRes.Codes) > 0 {
@@ -143,6 +154,7 @@ func NewGatewayServer(cfgMgr *config.Manager, logger *slog.Logger) (*GatewayServ
 					}
 				}
 
+				metrics.RecordRequest(status, inboundRes.Codes, inboundRes.PrunedTools, latencyUs)
 				resp.Body = stream.NewSSEInspector(resp.Body, activeCfg, guardEngine.Vault(), inboundRes, resp.Trailer)
 				return nil
 			}
@@ -151,7 +163,6 @@ func NewGatewayServer(cfgMgr *config.Manager, logger *slog.Logger) (*GatewayServ
 				rawResp, err := io.ReadAll(resp.Body)
 				_ = resp.Body.Close()
 				if err == nil {
-					// If response is MCP JSON-RPC 2.0 (e.g. resources/read result), run MCP sanitization
 					if activeCfg.Network.MCP.Enabled && mcp.IsJSONRPCPayload(rawResp) {
 						sessionID := extractSessionID(resp.Request)
 						mcpRes := mcpInspector.InspectPayload(rawResp, sessionID, "", activeCfg)
@@ -174,6 +185,18 @@ func NewGatewayServer(cfgMgr *config.Manager, logger *slog.Logger) (*GatewayServ
 							resp.Header.Set("X-JaguarGate-Pruned-Count", strconv.Itoa(outRes.PrunedTools))
 						}
 					}
+
+					metrics.RecordRequest(outRes.Status, outRes.Codes, outRes.PrunedTools, latencyUs)
+					if len(outRes.Codes) > 0 {
+						webhooks.Enqueue(telemetry.WebhookEvent{
+							Status:      outRes.Status,
+							Severity:    outRes.Severity,
+							Codes:       outRes.Codes,
+							Path:        resp.Request.URL.Path,
+							PrunedTools: outRes.PrunedTools,
+						}, activeCfg.Telemetry.Webhooks)
+					}
+
 					resp.Body = io.NopCloser(bytes.NewReader(outRes.ModifiedBody))
 					resp.ContentLength = int64(len(outRes.ModifiedBody))
 					resp.Header.Set("Content-Length", strconv.Itoa(len(outRes.ModifiedBody)))
@@ -185,6 +208,7 @@ func NewGatewayServer(cfgMgr *config.Manager, logger *slog.Logger) (*GatewayServ
 				resp.Header.Set("X-JaguarGate-Status", "CLEAN")
 				resp.Header.Set("X-JaguarGate-Severity", "NONE")
 			}
+			metrics.RecordRequest("CLEAN", nil, 0, latencyUs)
 			return nil
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
@@ -203,6 +227,9 @@ func NewGatewayServer(cfgMgr *config.Manager, logger *slog.Logger) (*GatewayServ
 		cfgMgr:         cfgMgr,
 		logger:         logger,
 		bufferPool:     bufPool,
+		metrics:        metrics,
+		webhooks:       webhooks,
+		sandbox:        sandbox,
 		stateStore:     stateStore,
 		circuitBreaker: circuitBreaker,
 		guardEngine:    guardEngine,
@@ -211,7 +238,7 @@ func NewGatewayServer(cfgMgr *config.Manager, logger *slog.Logger) (*GatewayServ
 	}, nil
 }
 
-// Handler wraps the reverse proxy with Stage 2-4 Guards (OWASP, Tool Firewall, Circuit Breaker & MCP Inspector).
+// Handler wraps the reverse proxy with Stage 2-5 Guards, Sandbox, Healthcheck, and Prometheus Metrics.
 func (s *GatewayServer) Handler() http.Handler {
 	mux := http.NewServeMux()
 
@@ -223,6 +250,9 @@ func (s *GatewayServer) Handler() http.Handler {
 		_, _ = fmt.Fprintf(w, `{"status":"ok","version":%q,"mode":%q,"preset":%q}`,
 			cfg.Core.Version, cfg.Core.Mode, cfg.Core.Preset)
 	})
+
+	// Expose Prometheus / OpenMetrics endpoint on /metrics as well
+	mux.Handle("/metrics", s.metrics.Handler())
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		startTime := time.Now()
@@ -252,6 +282,10 @@ func (s *GatewayServer) Handler() http.Handler {
 			rawBody := bytes.Clone(buf.Bytes())
 			telemetry.ReleaseBuffer(buf)
 
+			// Optional Stage 5 Wasm / Custom Policy Sandbox Execution (with Fail-Open JG-EXT-601)
+			sbRes := s.sandbox.Execute(r.Context(), rawBody, cfg.Extensions.WasmPlugins)
+			rawBody = sbRes.ModifiedPayload
+
 			sessionID := extractSessionID(r)
 			var res guards.InspectionResult
 
@@ -270,6 +304,21 @@ func (s *GatewayServer) Handler() http.Handler {
 			} else {
 				// Route 2: Standard LLM Chat / Agent Completions Traffic
 				res = s.guardEngine.InspectJSONPayload(rawBody, cfg)
+			}
+
+			// Merge any sandbox Fail-Open warning codes (JG-EXT-601)
+			for _, sc := range sbRes.WarningCodes {
+				if !slices.Contains(res.Codes, sc) {
+					res.Codes = append(res.Codes, sc)
+				}
+				if res.Status == "CLEAN" {
+					if cfg.Core.Mode == "shadow" {
+						res.Status = "SHADOW_FLAGGED"
+					} else {
+						res.Status = "SANITIZED"
+					}
+					res.Severity = "CONFIG_WARNING"
+				}
 			}
 
 			// Enforce Session Token Budget Circuit Breaker (JG-CFG-202)
@@ -297,11 +346,21 @@ func (s *GatewayServer) Handler() http.Handler {
 			}
 
 			if res.Blocked {
+				latencyUs := time.Since(startTime).Microseconds()
+				s.metrics.RecordRequest(res.Status, res.Codes, res.PrunedTools, latencyUs)
+				s.webhooks.Enqueue(telemetry.WebhookEvent{
+					Status:      res.Status,
+					Severity:    res.Severity,
+					Codes:       res.Codes,
+					Path:        r.URL.Path,
+					PrunedTools: res.PrunedTools,
+				}, cfg.Telemetry.Webhooks)
+
 				if cfg.Telemetry.WarningFlags.EmitHTTPHeaders {
 					w.Header().Set("X-JaguarGate-Status", res.Status)
 					w.Header().Set("X-JaguarGate-Severity", res.Severity)
 					w.Header().Set("X-JaguarGate-Codes", strings.Join(res.Codes, ","))
-					w.Header().Set("X-JaguarGate-Latency-Us", strconv.FormatInt(time.Since(startTime).Microseconds(), 10))
+					w.Header().Set("X-JaguarGate-Latency-Us", strconv.FormatInt(latencyUs, 10))
 				}
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusForbidden)
@@ -321,7 +380,7 @@ func (s *GatewayServer) Handler() http.Handler {
 	return mux
 }
 
-// Start launches the configured HTTP, Unix Domain Socket, and high-speed RPC listeners concurrently.
+// Start launches the configured HTTP, Unix Domain Socket, RPC, and Prometheus Metrics listeners concurrently.
 func (s *GatewayServer) Start(ctx context.Context) error {
 	cfg := s.cfgMgr.Get()
 	handler := s.Handler()
@@ -329,7 +388,7 @@ func (s *GatewayServer) Start(ctx context.Context) error {
 	readTimeout := time.Duration(cfg.Network.Ingress.HTTP.ReadTimeoutMs) * time.Millisecond
 	writeTimeout := time.Duration(cfg.Network.Ingress.HTTP.WriteTimeoutMs) * time.Millisecond
 
-	errCh := make(chan error, 3)
+	errCh := make(chan error, 4)
 	var wg sync.WaitGroup
 
 	if cfg.Network.Ingress.HTTP.Enabled {
@@ -404,6 +463,23 @@ func (s *GatewayServer) Start(ctx context.Context) error {
 		}()
 	}
 
+	if cfg.Telemetry.OpenTelemetry.Enabled && cfg.Telemetry.OpenTelemetry.PrometheusListen != "" {
+		metricsMux := http.NewServeMux()
+		metricsMux.Handle("/metrics", s.metrics.Handler())
+		s.metricsServer = &http.Server{
+			Addr:              cfg.Telemetry.OpenTelemetry.PrometheusListen,
+			Handler:           metricsMux,
+			ReadHeaderTimeout: 5 * time.Second,
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := s.metricsServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				errCh <- fmt.Errorf("Prometheus metrics listener error: %w", err)
+			}
+		}()
+	}
+
 	select {
 	case <-ctx.Done():
 		s.logger.Info(config.T(cfg.Core.Language, config.MsgServerShutdown))
@@ -417,6 +493,9 @@ func (s *GatewayServer) Start(ctx context.Context) error {
 		}
 		if s.rpcServer != nil {
 			_ = s.rpcServer.Shutdown(shutdownCtx)
+		}
+		if s.metricsServer != nil {
+			_ = s.metricsServer.Shutdown(shutdownCtx)
 		}
 		if s.udsPath != "" {
 			_ = os.Remove(s.udsPath)

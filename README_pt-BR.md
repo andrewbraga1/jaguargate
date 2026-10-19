@@ -102,6 +102,32 @@ jgate start -c configs/jaguargate.yaml
 
 ---
 
+---
+
+## 🌐 Configuração de Idioma (`en` Default | `pt-BR`)
+
+**[PT-BR]** Por padrão, o JaguarGate exibe todas as tabelas da CLI (`jgate doctor`, `jgate pounce`, `jgate check`) e logs operacionais em **Inglês (`en`)** para manter a saída limpa e monolíngue em pipelines de CI/CD e SIEM. Você pode alterar o idioma para **Português (`pt-BR`)** de três formas:
+
+1. **CLI Flag (Per-Command Override):**
+   ```bash
+   ./jgate doctor --lang pt-BR
+   ./jgate pounce --lang pt-BR
+   ```
+2. **Environment Variable (Docker / Kubernetes / CI):**
+   ```bash
+   export JAGUARGATE_LANG="pt-BR"
+   ./jgate serve -c jaguargate.yaml
+   ```
+3. **Configuration File (`jaguargate.yaml`):**
+   ```yaml
+   core:
+     version: "1.0"
+     preset: "balanced"
+     language: "pt-BR" # Default: "en"
+   ```
+
+---
+
 ## 📊 Cobertura OWASP Top 10 para LLMs e Agentes
 
 | Ameaça OWASP | Mecanismo de Defesa do JaguarGate | Comportamento Padrão (`sanitize_and_warn`) |

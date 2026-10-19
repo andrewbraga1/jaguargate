@@ -90,6 +90,9 @@ func applyEnvOverrides(cfg *Config) {
 	if v := strings.TrimSpace(os.Getenv("JAGUARGATE_PRESET")); v != "" {
 		cfg.Core.Preset = v
 	}
+	if v := strings.TrimSpace(os.Getenv("JAGUARGATE_LANG")); v != "" {
+		cfg.Core.Language = v
+	}
 }
 
 func interpolateEnvVars(content string) string {

@@ -2,25 +2,27 @@ package config
 
 import (
 	"errors"
+	"fmt"
 	"net/url"
+	"slices"
 	"strings"
 )
 
-// Config represents the complete declarative contract of JaguarGate.
+// Config represents the complete JaguarGate v1.0 contract.
 type Config struct {
 	Core       CoreConfig       `yaml:"core" json:"core"`
 	Network    NetworkConfig    `yaml:"network" json:"network"`
-	Guards     GuardsConfig     `yaml:"guards" json:"guards"`
 	Whitelist  WhitelistConfig  `yaml:"whitelist" json:"whitelist"`
-	Telemetry  TelemetryConfig  `yaml:"telemetry" json:"telemetry"`
+	Guards     GuardsConfig     `yaml:"guards" json:"guards"`
 	Extensions ExtensionsConfig `yaml:"extensions" json:"extensions"`
+	Telemetry  TelemetryConfig  `yaml:"telemetry" json:"telemetry"`
 }
 
 type CoreConfig struct {
 	Version  string `yaml:"version" json:"version"`
-	Language string `yaml:"language" json:"language"`
-	Preset   string `yaml:"preset" json:"preset"`
 	Mode     string `yaml:"mode" json:"mode"`
+	Preset   string `yaml:"preset" json:"preset"`
+	Language string `yaml:"language" json:"language"`
 }
 
 type NetworkConfig struct {
@@ -31,7 +33,7 @@ type NetworkConfig struct {
 
 type IngressConfig struct {
 	HTTP       HTTPIngressConfig `yaml:"http" json:"http"`
-	UnixSocket UDSIngressConfig  `yaml:"unix_socket" json:"unix_socket"`
+	UnixSocket UnixSocketConfig  `yaml:"unix_socket" json:"unix_socket"`
 	GRPC       GRPCIngressConfig `yaml:"grpc" json:"grpc"`
 }
 
@@ -43,7 +45,7 @@ type HTTPIngressConfig struct {
 	MaxPayloadMB   int64  `yaml:"max_payload_mb" json:"max_payload_mb"`
 }
 
-type UDSIngressConfig struct {
+type UnixSocketConfig struct {
 	Enabled    bool   `yaml:"enabled" json:"enabled"`
 	SocketPath string `yaml:"socket_path" json:"socket_path"`
 	SocketMode string `yaml:"socket_mode" json:"socket_mode"`
@@ -55,82 +57,18 @@ type GRPCIngressConfig struct {
 }
 
 type EgressConfig struct {
-	UpstreamURL          string `yaml:"upstream_url" json:"upstream_url"`
-	UpstreamUnixSocket   string `yaml:"upstream_unix_socket" json:"upstream_unix_socket"`
-	KeepAlivePoolSize    int    `yaml:"keep_alive_pool_size" json:"keep_alive_pool_size"`
-	IdleConnTimeoutSec   int    `yaml:"idle_conn_timeout_seconds" json:"idle_conn_timeout_seconds"`
-	TLSVerify            bool   `yaml:"tls_verify" json:"tls_verify"`
+	UpstreamURL        string `yaml:"upstream_url" json:"upstream_url"`
+	UpstreamUnixSocket string `yaml:"upstream_unix_socket" json:"upstream_unix_socket"`
+	KeepAlivePoolSize  int    `yaml:"keep_alive_pool_size" json:"keep_alive_pool_size"`
+	IdleConnTimeoutSec int    `yaml:"idle_conn_timeout_sec" json:"idle_conn_timeout_sec"`
+	TLSVerify          bool   `yaml:"tls_verify" json:"tls_verify"`
 }
 
 type MCPConfig struct {
-	Enabled                   bool `yaml:"enabled" json:"enabled"`
-	SanitizeExternalResources bool `yaml:"sanitize_external_resources" json:"sanitize_external_resources"`
-	MaxRPCBatchSize           int  `yaml:"max_rpc_batch_size" json:"max_rpc_batch_size"`
-}
-
-type GuardsConfig struct {
-	Deobfuscation   DeobfuscationConfig   `yaml:"deobfuscation" json:"deobfuscation"`
-	Multimodal      MultimodalConfig      `yaml:"multimodal" json:"multimodal"`
-	Spotlighting    SpotlightingConfig    `yaml:"spotlighting" json:"spotlighting"`
-	CanaryTokens    CanaryTokensConfig    `yaml:"canary_tokens" json:"canary_tokens"`
-	PIIVault        PIIVaultConfig        `yaml:"pii_vault" json:"pii_vault"`
-	OutputSanitizer OutputSanitizerConfig `yaml:"output_sanitizer" json:"output_sanitizer"`
-}
-
-type DeobfuscationConfig struct {
-	Enabled               bool `yaml:"enabled" json:"enabled"`
-	DecodeBase64          bool `yaml:"decode_base64" json:"decode_base64"`
-	DecodeHex             bool `yaml:"decode_hex" json:"decode_hex"`
-	StripInvisibleUnicode bool `yaml:"strip_invisible_unicode" json:"strip_invisible_unicode"`
-	MaxDecodeDepth        int  `yaml:"max_decode_depth" json:"max_decode_depth"`
-}
-
-type MultimodalConfig struct {
-	BypassRegexOnMedia   bool     `yaml:"bypass_regex_on_media" json:"bypass_regex_on_media"`
-	VerifyMagicBytes     bool     `yaml:"verify_magic_bytes" json:"verify_magic_bytes"`
-	StripEXIFXMPMetadata bool     `yaml:"strip_exif_xmp_metadata" json:"strip_exif_xmp_metadata"`
-	AllowedMimeTypes     []string `yaml:"allowed_mime_types" json:"allowed_mime_types"`
-}
-
-type SpotlightingConfig struct {
-	Enabled          bool     `yaml:"enabled" json:"enabled"`
-	DynamicTagPrefix string   `yaml:"dynamic_tag_prefix" json:"dynamic_tag_prefix"`
-	MarkRoles        []string `yaml:"mark_roles" json:"mark_roles"`
-}
-
-type CanaryTokensConfig struct {
-	Enabled                bool `yaml:"enabled" json:"enabled"`
-	AutoInjectSystemPrompt bool `yaml:"auto_inject_system_prompt" json:"auto_inject_system_prompt"`
-	TruncateStreamOnLeak   bool `yaml:"truncate_stream_on_leak" json:"truncate_stream_on_leak"`
-}
-
-type PIIVaultConfig struct {
-	Enabled         bool            `yaml:"enabled" json:"enabled"`
-	RestoreOnOutput bool            `yaml:"restore_on_output" json:"restore_on_output"`
-	TTLSeconds      int             `yaml:"ttl_seconds" json:"ttl_seconds"`
-	Entities        PIIEntities     `yaml:"entities" json:"entities"`
-	CustomPatterns  []CustomPattern `yaml:"custom_patterns" json:"custom_patterns"`
-}
-
-type PIIEntities struct {
-	CPF        bool `yaml:"cpf" json:"cpf"`
-	CNPJ       bool `yaml:"cnpj" json:"cnpj"`
-	CreditCard bool `yaml:"credit_card" json:"credit_card"`
-	Email      bool `yaml:"email" json:"email"`
-	AWSKeys    bool `yaml:"aws_keys" json:"aws_keys"`
-	APISecrets bool `yaml:"api_secrets" json:"api_secrets"`
-	JWTTokens  bool `yaml:"jwt_tokens" json:"jwt_tokens"`
-}
-
-type CustomPattern struct {
-	Name  string `yaml:"name" json:"name"`
-	Regex string `yaml:"regex" json:"regex"`
-}
-
-type OutputSanitizerConfig struct {
-	BlockUntrustedMarkdownImages bool `yaml:"block_untrusted_markdown_images" json:"block_untrusted_markdown_images"`
-	StripExecutableScripts       bool `yaml:"strip_executable_scripts" json:"strip_executable_scripts"`
-	SlidingWindowRunes           int  `yaml:"sliding_window_runes" json:"sliding_window_runes"`
+	Enabled                   bool   `yaml:"enabled" json:"enabled"`
+	Transport                 string `yaml:"transport" json:"transport"`
+	MaxRPCBatchSize           int    `yaml:"max_rpc_batch_size" json:"max_rpc_batch_size"`
+	SanitizeExternalResources bool   `yaml:"sanitize_external_resources" json:"sanitize_external_resources"`
 }
 
 type WhitelistConfig struct {
@@ -147,44 +85,68 @@ type CircuitBreakerConfig struct {
 	MaxTokensPerSession   int `yaml:"max_tokens_per_session" json:"max_tokens_per_session"`
 }
 
-type TelemetryConfig struct {
-	WarningFlags  WarningFlagsConfig `yaml:"warning_flags" json:"warning_flags"`
-	Logging       LoggingConfig      `yaml:"logging" json:"logging"`
-	Webhooks      WebhooksConfig     `yaml:"webhooks" json:"webhooks"`
-	OpenTelemetry OTelConfig         `yaml:"opentelemetry" json:"opentelemetry"`
+type GuardsConfig struct {
+	Spotlighting    SpotlightingConfig    `yaml:"spotlighting" json:"spotlighting"`
+	CanaryTokens    CanaryTokensConfig    `yaml:"canary_tokens" json:"canary_tokens"`
+	Deobfuscation   DeobfuscationConfig   `yaml:"deobfuscation" json:"deobfuscation"`
+	Multimodal      MultimodalConfig      `yaml:"multimodal" json:"multimodal"`
+	PIIVault        PIIVaultConfig        `yaml:"pii_vault" json:"pii_vault"`
+	OutputSanitizer OutputSanitizerConfig `yaml:"output_sanitizer" json:"output_sanitizer"`
 }
 
-type WarningFlagsConfig struct {
-	EmitHTTPHeaders          bool `yaml:"emit_http_headers" json:"emit_http_headers"`
-	EmitHTTPTrailersOnStream bool `yaml:"emit_http_trailers_on_stream" json:"emit_http_trailers_on_stream"`
-	EmitSSEWarningEvent      bool `yaml:"emit_sse_warning_event" json:"emit_sse_warning_event"`
-	IncludeBodyTelemetry     bool `yaml:"include_body_telemetry_field" json:"include_body_telemetry_field"`
+type SpotlightingConfig struct {
+	Enabled          bool     `yaml:"enabled" json:"enabled"`
+	DynamicTagPrefix string   `yaml:"dynamic_tag_prefix" json:"dynamic_tag_prefix"`
+	MarkRoles        []string `yaml:"mark_roles" json:"mark_roles"`
 }
 
-type LoggingConfig struct {
-	Level                string `yaml:"level" json:"level"`
-	Format               string `yaml:"format" json:"format"`
-	ZeroTrustRedaction   bool   `yaml:"zero_trust_redaction" json:"zero_trust_redaction"`
-	RedactionPlaceholder string `yaml:"redaction_placeholder" json:"redaction_placeholder"`
+type CanaryTokensConfig struct {
+	Enabled                bool `yaml:"enabled" json:"enabled"`
+	AutoInjectSystemPrompt bool `yaml:"auto_inject_system_prompt" json:"auto_inject_system_prompt"`
+	TruncateStreamOnLeak   bool `yaml:"truncate_stream_on_leak" json:"truncate_stream_on_leak"`
 }
 
-type WebhooksConfig struct {
-	Enabled            bool     `yaml:"enabled" json:"enabled"`
-	URL                string   `yaml:"url" json:"url"`
-	TriggerSeverities  []string `yaml:"trigger_severities" json:"trigger_severities"`
-	RateLimitPerMinute int      `yaml:"rate_limit_per_minute" json:"rate_limit_per_minute"`
-	BatchWindowSeconds int      `yaml:"batch_window_seconds" json:"batch_window_seconds"`
+type DeobfuscationConfig struct {
+	Enabled               bool `yaml:"enabled" json:"enabled"`
+	MaxDecodeDepth        int  `yaml:"max_decode_depth" json:"max_decode_depth"`
+	DecodeBase64          bool `yaml:"decode_base64" json:"decode_base64"`
+	DecodeHex             bool `yaml:"decode_hex" json:"decode_hex"`
+	StripInvisibleUnicode bool `yaml:"strip_invisible_unicode" json:"strip_invisible_unicode"`
 }
 
-type OTelConfig struct {
-	Enabled              bool   `yaml:"enabled" json:"enabled"`
-	PrometheusListenAddr string `yaml:"prometheus_listen_addr" json:"prometheus_listen_addr"`
+type MultimodalConfig struct {
+	BypassRegexOnMedia   bool     `yaml:"bypass_regex_on_media" json:"bypass_regex_on_media"`
+	StripEXIFXMPMetadata bool     `yaml:"strip_exif_xmp_metadata" json:"strip_exif_xmp_metadata"`
+	VerifyMagicBytes     bool     `yaml:"verify_magic_bytes" json:"verify_magic_bytes"`
+	AllowedMimeTypes     []string `yaml:"allowed_mime_types" json:"allowed_mime_types"`
+}
+
+type PIIVaultConfig struct {
+	Enabled         bool              `yaml:"enabled" json:"enabled"`
+	RestoreOnOutput bool              `yaml:"restore_on_output" json:"restore_on_output"`
+	TTLSeconds      int               `yaml:"ttl_seconds" json:"ttl_seconds"`
+	Entities        PIIEntitiesConfig `yaml:"entities" json:"entities"`
+}
+
+type PIIEntitiesConfig struct {
+	CPF        bool `yaml:"cpf" json:"cpf"`
+	CNPJ       bool `yaml:"cnpj" json:"cnpj"`
+	CreditCard bool `yaml:"credit_card" json:"credit_card"`
+	Email      bool `yaml:"email" json:"email"`
+	AWSKeys    bool `yaml:"aws_keys" json:"aws_keys"`
+	APISecrets bool `yaml:"api_secrets" json:"api_secrets"`
+	JWTTokens  bool `yaml:"jwt_tokens" json:"jwt_tokens"`
+}
+
+type OutputSanitizerConfig struct {
+	SlidingWindowRunes           int  `yaml:"sliding_window_runes" json:"sliding_window_runes"`
+	BlockUntrustedMarkdownImages bool `yaml:"block_untrusted_markdown_images" json:"block_untrusted_markdown_images"`
+	StripExecutableScripts       bool `yaml:"strip_executable_scripts" json:"strip_executable_scripts"`
 }
 
 type ExtensionsConfig struct {
-	StateStore          StateStoreConfig          `yaml:"state_store" json:"state_store"`
-	WasmPlugins         WasmPluginsConfig         `yaml:"wasm_plugins" json:"wasm_plugins"`
-	CommunitySignatures CommunitySignaturesConfig `yaml:"community_signatures" json:"community_signatures"`
+	StateStore  StateStoreConfig  `yaml:"state_store" json:"state_store"`
+	WasmPlugins WasmPluginsConfig `yaml:"wasm_plugins" json:"wasm_plugins"`
 }
 
 type StateStoreConfig struct {
@@ -195,26 +157,60 @@ type StateStoreConfig struct {
 }
 
 type WasmPluginsConfig struct {
-	Enabled               bool   `yaml:"enabled" json:"enabled"`
-	Directory             string `yaml:"directory" json:"directory"`
-	MaxExecutionTimeoutMs int    `yaml:"max_execution_timeout_ms" json:"max_execution_timeout_ms"`
-	MaxMemoryMegabytes    int    `yaml:"max_memory_megabytes" json:"max_memory_megabytes"`
+	Enabled            bool              `yaml:"enabled" json:"enabled"`
+	MaxExecutionTimeMs int               `yaml:"max_execution_time_ms" json:"max_execution_time_ms"`
+	Modules            []WasmModuleEntry `yaml:"modules" json:"modules"`
 }
 
-type CommunitySignaturesConfig struct {
-	Enabled   bool   `yaml:"enabled" json:"enabled"`
-	Directory string `yaml:"directory" json:"directory"`
-	HotReload bool   `yaml:"hot_reload" json:"hot_reload"`
+type WasmModuleEntry struct {
+	Name      string `yaml:"name" json:"name"`
+	Path      string `yaml:"path" json:"path"`
+	OnTimeout string `yaml:"on_timeout" json:"on_timeout"`
 }
 
-// DefaultConfig returns a complete safe baseline configuration before applying user overrides.
+type TelemetryConfig struct {
+	Logging       LoggingConfig       `yaml:"logging" json:"logging"`
+	WarningFlags  WarningFlagsConfig  `yaml:"warning_flags" json:"warning_flags"`
+	OpenTelemetry OpenTelemetryConfig `yaml:"opentelemetry" json:"opentelemetry"`
+	Webhooks      WebhooksConfig      `yaml:"webhooks" json:"webhooks"`
+}
+
+type LoggingConfig struct {
+	Format           string `yaml:"format" json:"format"`
+	Level            string `yaml:"level" json:"level"`
+	ZeroTrustPrompts bool   `yaml:"zero_trust_prompts" json:"zero_trust_prompts"`
+}
+
+type WarningFlagsConfig struct {
+	EmitHTTPHeaders          bool `yaml:"emit_http_headers" json:"emit_http_headers"`
+	EmitSSEWarningEvent      bool `yaml:"emit_sse_warning_event" json:"emit_sse_warning_event"`
+	EmitHTTPTrailersOnStream bool `yaml:"emit_http_trailers_on_stream" json:"emit_http_trailers_on_stream"`
+	IncludeBodyTelemetry     bool `yaml:"include_body_telemetry" json:"include_body_telemetry"`
+}
+
+type OpenTelemetryConfig struct {
+	Enabled          bool   `yaml:"enabled" json:"enabled"`
+	PrometheusListen string `yaml:"prometheus_listen" json:"prometheus_listen"`
+	OTLPEndpoint     string `yaml:"otlp_endpoint" json:"otlp_endpoint"`
+}
+
+type WebhooksConfig struct {
+	Enabled    bool     `yaml:"enabled" json:"enabled"`
+	URL        string   `yaml:"url" json:"url"`
+	SecretHmac string   `yaml:"secret_hmac" json:"secret_hmac"`
+	Events     []string `yaml:"events" json:"events"`
+	Endpoints  []string `yaml:"endpoints" json:"endpoints"`
+	TriggerOn  []string `yaml:"trigger_on" json:"trigger_on"`
+}
+
+// DefaultConfig returns the resilient Enterprise defaults with English ("en") as the default language.
 func DefaultConfig() Config {
 	return Config{
 		Core: CoreConfig{
 			Version:  "1.0",
-			Language: "pt-BR",
+			Mode:     "sanitize_and_warn",
 			Preset:   "balanced",
-			Mode:     "", // Resolved by ApplyPreset if left empty
+			Language: "en",
 		},
 		Network: NetworkConfig{
 			Ingress: IngressConfig{
@@ -223,9 +219,9 @@ func DefaultConfig() Config {
 					ListenAddr:     "127.0.0.1:4010",
 					ReadTimeoutMs:  30000,
 					WriteTimeoutMs: 120000,
-					MaxPayloadMB:   15,
+					MaxPayloadMB:   10,
 				},
-				UnixSocket: UDSIngressConfig{
+				UnixSocket: UnixSocketConfig{
 					Enabled:    false,
 					SocketPath: "/tmp/jaguargate.sock",
 					SocketMode: "0600",
@@ -243,24 +239,23 @@ func DefaultConfig() Config {
 			},
 			MCP: MCPConfig{
 				Enabled:                   true,
-				SanitizeExternalResources: true,
+				Transport:                 "http_sse",
 				MaxRPCBatchSize:           20,
+				SanitizeExternalResources: true,
+			},
+		},
+		Whitelist: WhitelistConfig{
+			EnforceToolWhitelist: false,
+			AllowedTools:         []string{"*"},
+			AllowedMCPServers:    []string{"*"},
+			AllowedDomains:       []string{"*"},
+			CircuitBreaker: CircuitBreakerConfig{
+				MaxIdenticalToolCalls: 3,
+				WindowSeconds:         120,
+				MaxTokensPerSession:   32000,
 			},
 		},
 		Guards: GuardsConfig{
-			Deobfuscation: DeobfuscationConfig{
-				Enabled:               true,
-				DecodeBase64:          true,
-				DecodeHex:             true,
-				StripInvisibleUnicode: true,
-				MaxDecodeDepth:        2,
-			},
-			Multimodal: MultimodalConfig{
-				BypassRegexOnMedia:   true,
-				VerifyMagicBytes:     true,
-				StripEXIFXMPMetadata: true,
-				AllowedMimeTypes:     []string{"image/jpeg", "image/png", "image/webp", "application/pdf"},
-			},
 			Spotlighting: SpotlightingConfig{
 				Enabled:          true,
 				DynamicTagPrefix: "jg_untrusted",
@@ -271,11 +266,24 @@ func DefaultConfig() Config {
 				AutoInjectSystemPrompt: true,
 				TruncateStreamOnLeak:   true,
 			},
+			Deobfuscation: DeobfuscationConfig{
+				Enabled:               true,
+				MaxDecodeDepth:        2,
+				DecodeBase64:          true,
+				DecodeHex:             true,
+				StripInvisibleUnicode: true,
+			},
+			Multimodal: MultimodalConfig{
+				BypassRegexOnMedia:   true,
+				StripEXIFXMPMetadata: true,
+				VerifyMagicBytes:     true,
+				AllowedMimeTypes:     []string{"image/jpeg", "image/png", "image/webp", "application/pdf"},
+			},
 			PIIVault: PIIVaultConfig{
 				Enabled:         true,
 				RestoreOnOutput: true,
 				TTLSeconds:      300,
-				Entities: PIIEntities{
+				Entities: PIIEntitiesConfig{
 					CPF:        true,
 					CNPJ:       true,
 					CreditCard: true,
@@ -286,115 +294,83 @@ func DefaultConfig() Config {
 				},
 			},
 			OutputSanitizer: OutputSanitizerConfig{
+				SlidingWindowRunes:           64,
 				BlockUntrustedMarkdownImages: true,
 				StripExecutableScripts:       true,
-				SlidingWindowRunes:           64,
-			},
-		},
-		Whitelist: WhitelistConfig{
-			EnforceToolWhitelist: false,
-			CircuitBreaker: CircuitBreakerConfig{
-				MaxIdenticalToolCalls: 3,
-				WindowSeconds:         120,
-				MaxTokensPerSession:   32000,
-			},
-		},
-		Telemetry: TelemetryConfig{
-			WarningFlags: WarningFlagsConfig{
-				EmitHTTPHeaders:          true,
-				EmitHTTPTrailersOnStream: true,
-				EmitSSEWarningEvent:      true,
-				IncludeBodyTelemetry:     false,
-			},
-			Logging: LoggingConfig{
-				Level:                "info",
-				Format:               "json",
-				ZeroTrustRedaction:   true,
-				RedactionPlaceholder: "***[JG-REDACTED]***",
 			},
 		},
 		Extensions: ExtensionsConfig{
 			StateStore: StateStoreConfig{
 				Driver:                "memory",
+				AESGCMKeyEnv:          "JAGUARGATE_AES_KEY",
 				FailOpenToLocalMemory: true,
 			},
 			WasmPlugins: WasmPluginsConfig{
-				Enabled:               false,
-				Directory:             "./plugins/wasm",
-				MaxExecutionTimeoutMs: 2,
-				MaxMemoryMegabytes:    16,
+				Enabled:            false,
+				MaxExecutionTimeMs: 2,
 			},
-			CommunitySignatures: CommunitySignaturesConfig{
-				Enabled:   true,
-				Directory: "./plugins/signatures",
-				HotReload: true,
+		},
+		Telemetry: TelemetryConfig{
+			Logging: LoggingConfig{
+				Format:           "json",
+				Level:            "info",
+				ZeroTrustPrompts: true,
+			},
+			WarningFlags: WarningFlagsConfig{
+				EmitHTTPHeaders:          true,
+				EmitSSEWarningEvent:      true,
+				EmitHTTPTrailersOnStream: true,
+				IncludeBodyTelemetry:     false,
+			},
+			OpenTelemetry: OpenTelemetryConfig{
+				Enabled:          false,
+				PrometheusListen: "127.0.0.1:9091",
+			},
+			Webhooks: WebhooksConfig{
+				Enabled:   false,
+				TriggerOn: []string{"INTRUSION_ALERT"},
 			},
 		},
 	}
 }
 
-// ApplyPreset adjusts default mode and strictness according to the chosen 3-line preset.
+// ApplyPreset adjusts operational mode and strictness based on core.preset.
 func (c *Config) ApplyPreset() {
-	switch c.Core.Preset {
+	switch strings.ToLower(strings.TrimSpace(c.Core.Preset)) {
 	case "permissive":
-		if c.Core.Mode == "" {
-			c.Core.Mode = "shadow"
+		c.Core.Mode = "shadow"
+	case "strict":
+		c.Core.Mode = "hard_block"
+		c.Whitelist.EnforceToolWhitelist = true
+	case "balanced", "":
+		if c.Core.Preset == "" {
+			c.Core.Preset = "balanced"
 		}
-	case "balanced":
 		if c.Core.Mode == "" {
 			c.Core.Mode = "sanitize_and_warn"
 		}
-	case "strict":
-		if c.Core.Mode == "" {
-			c.Core.Mode = "hard_block"
-		}
-		c.Guards.PIIVault.Entities.Email = true
-		c.Whitelist.EnforceToolWhitelist = true
+	}
+	if strings.TrimSpace(c.Core.Language) == "" {
+		c.Core.Language = "en"
 	}
 }
 
-// Validate checks structural and security invariants of the configuration.
+// Validate verifies structural invariants of the configuration contract.
 func (c *Config) Validate() error {
-	lang := c.Core.Language
-	if lang != "pt-BR" && lang != "en" {
-		return errors.New(T("en", MsgErrInvalidLang, lang))
+	if c.Core.Version == "" {
+		c.Core.Version = "1.0"
 	}
-	if c.Core.Version != "1.0" {
-		return errors.New(T(lang, MsgErrInvalidVersion, c.Core.Version))
+	validModes := []string{"shadow", "sanitize_and_warn", "hard_block"}
+	if !slices.Contains(validModes, c.Core.Mode) {
+		return fmt.Errorf("invalid core.mode %q (must be shadow, sanitize_and_warn, or hard_block)", c.Core.Mode)
 	}
-	switch c.Core.Preset {
-	case "permissive", "balanced", "strict":
-	default:
-		return errors.New(T(lang, MsgErrInvalidPreset, c.Core.Preset))
+	if c.Network.Egress.UpstreamURL == "" && c.Network.Egress.UpstreamUnixSocket == "" {
+		return errors.New("network.egress.upstream_url or upstream_unix_socket is required")
 	}
-	switch c.Core.Mode {
-	case "shadow", "sanitize_and_warn", "hard_block":
-	default:
-		return errors.New(T(lang, MsgErrInvalidMode, c.Core.Mode))
+	if c.Network.Egress.UpstreamURL != "" {
+		if _, err := url.ParseRequestURI(c.Network.Egress.UpstreamURL); err != nil {
+			return fmt.Errorf("invalid network.egress.upstream_url %q: %w", c.Network.Egress.UpstreamURL, err)
+		}
 	}
-
-	if !c.Network.Ingress.HTTP.Enabled && !c.Network.Ingress.UnixSocket.Enabled && !c.Network.Ingress.GRPC.Enabled {
-		return errors.New(T(lang, MsgErrNoIngressActive))
-	}
-
-	if c.Network.Ingress.UnixSocket.Enabled && strings.TrimSpace(c.Network.Ingress.UnixSocket.SocketPath) == "" {
-		return errors.New(T(lang, MsgErrInvalidSocket))
-	}
-
-	u, err := url.Parse(c.Network.Egress.UpstreamURL)
-	if err != nil || u.Scheme == "" || u.Host == "" {
-		return errors.New(T(lang, MsgErrInvalidUpstream, c.Network.Egress.UpstreamURL))
-	}
-
-	// Enforce maximum decode depth cap to prevent CPU zip-bomb style attacks
-	if c.Guards.Deobfuscation.MaxDecodeDepth <= 0 || c.Guards.Deobfuscation.MaxDecodeDepth > 5 {
-		c.Guards.Deobfuscation.MaxDecodeDepth = 2
-	}
-
-	// Mandatory Zero-Trust Redaction placeholder fallback
-	if strings.TrimSpace(c.Telemetry.Logging.RedactionPlaceholder) == "" {
-		c.Telemetry.Logging.RedactionPlaceholder = "***[JG-REDACTED]***"
-	}
-
 	return nil
 }
