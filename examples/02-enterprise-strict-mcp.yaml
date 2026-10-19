@@ -1,0 +1,109 @@
+# ==============================================================================
+# 🛡️ JAGUARGATE — SCENARIO 02: ENTERPRISE STRICT MODE + MCP FIREWALL + REDIS L2
+# ==============================================================================
+# [EN] Production hardening for FinTech, HealthTech, and multi-tenant AI SaaS:
+#   - Mode "hard_block" (Preset "strict") returns HTTP 403 on intrusion attempts.
+#   - Enforces strict Tool Call & Model Context Protocol (MCP JSON-RPC 2.0) whitelists.
+#   - Distributed L1/L2 PII Vault backed by Redis with AES-256-GCM encryption.
+#   - Dedicated Prometheus /metrics port (:9091) and async HMAC-SHA256 SIEM webhooks.
+# ==============================================================================
+
+core:
+  version: "1.0"
+  mode: "hard_block"
+  preset: "strict"
+  language: "en"
+
+network:
+  ingress:
+    http:
+      enabled: true
+      listen_addr: "0.0.0.0:4010"
+      read_timeout_ms: 30000
+      write_timeout_ms: 120000
+      max_payload_mb: 10
+  egress:
+    upstream_url: "http://127.0.0.1:4000" # Upstream LiteLLM / vLLM / OpenAI Router
+    tls_verify: true
+    keep_alive_pool_size: 256
+    idle_conn_timeout_sec: 90
+  mcp:
+    enabled: true
+    inspect_jsonrpc: true
+    sanitize_external_resources: true
+
+guards:
+  prompt_injection:
+    enabled: true
+    action: "block"
+  spotlighting:
+    enabled: true
+    delimiter_prefix: "JG_UNTRUSTED_DATA"
+  canary_tokens:
+    enabled: true
+    truncate_stream_on_leak: true
+  pii_vault:
+    enabled: true
+    restore_on_output: true
+    ttl_seconds: 300
+    entities:
+      cpf: true
+      cnpj: true
+      credit_card: true
+      email: true
+      secrets_and_keys: true
+  multimodal:
+    enabled: true
+    strip_exif_and_metadata: true
+    verify_magic_bytes: true
+  output_sanitizer:
+    enabled: true
+    block_untrusted_markdown_images: true
+    strip_executable_scripts: true
+    sliding_window_runes: 64
+
+whitelist:
+  enforce_tool_whitelist: true
+  allowed_tools:
+    - "get_customer_balance"
+    - "search_knowledge_base"
+    - "create_support_ticket"
+  allowed_domains:
+    - "api.internal.corp"
+    - "*.trusted-partner.com.br"
+  allowed_mcp_servers:
+    - "mcp-corporate-kb"
+    - "mcp-ReadOnly-sql"
+  circuit_breaker:
+    enabled: true
+    max_identical_tool_calls: 3
+    window_seconds: 60
+    max_tokens_per_session: 50000
+
+telemetry:
+  logging:
+    level: "warn"
+    format: "json"
+    zero_trust_prompts: true
+  warning_flags:
+    emit_http_headers: true
+    emit_http_trailers_on_stream: true
+    emit_sse_warning_event: true
+    include_body_telemetry: false
+  opentelemetry:
+    enabled: true
+    prometheus_listen: "0.0.0.0:9091"
+  webhooks:
+    enabled: false
+    endpoint_url: "https://siem.internal.corp/v1/jaguargate-alerts"
+    hmac_secret: "replace-with-production-hmac-sha256-secret"
+    timeout_ms: 2000
+
+extensions:
+  state_store:
+    driver: "redis"
+    redis_url: "127.0.0.1:6379"
+    # 32-byte (64 hex chars) AES-256-GCM key for encrypting PII mappings at rest in Redis
+    aes_gcm_key_hex: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    fail_open_to_local_memory: true
+    key_prefix: "jgate:prod:"

@@ -1,34 +1,32 @@
 # ==============================================================================
-# STAGE 1: Test & Build Environment (Go 1.23 + GCC for -race detector)
+# Stage 1: Static Binary Builder (Go 1.23)
 # ==============================================================================
 FROM golang:1.23-alpine AS builder
 
-RUN apk add --no-cache git ca-certificates build-base
+WORKDIR /src
+
+# Cache dependencies first
+COPY go.mod go.sum ./
+RUN go mod download
+
+# Copy source and compile a stripped, 100% static binary (zero libc dependency)
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+    go build -ldflags="-s -w" -o /out/jgate ./cmd/jgate
+
+# ==============================================================================
+# Stage 2: Minimal Hardened Distroless Runtime (~12MB, Non-Root, No Shell)
+# ==============================================================================
+FROM gcr.io/distroless/static-debian12:nonroot
 
 WORKDIR /app
 
-# Cache dependencies first
-COPY go.mod go.sum* ./
-RUN go mod download
+COPY --from=builder /out/jgate /app/jgate
+COPY jaguargate.yaml /app/jaguargate.yaml
 
-COPY . .
+USER nonroot:nonroot
 
-# Build a 100% static binary (zero C dependencies) stripped of debug symbols (-s -w)
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /jgate ./cmd/jgate
+EXPOSE 4010 9091
 
-# ==============================================================================
-# STAGE 2: Zero-Trust Production Image (FROM scratch -> ~8MB, no shell!)
-# ==============================================================================
-FROM scratch
-
-# Copy TLS certificates for HTTPS upstream calls (OpenAI / Anthropic)
-COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
-
-# Copy the static binary and default configuration contract
-COPY --from=builder /jgate /jgate
-COPY --from=builder /app/configs/jaguargate.yaml /configs/jaguargate.yaml
-
-EXPOSE 4010 4011
-
-ENTRYPOINT ["/jgate"]
-CMD ["start", "-c", "/configs/jaguargate.yaml"]
+ENTRYPOINT ["/app/jgate"]
+CMD ["serve", "-c", "/app/jaguargate.yaml"]

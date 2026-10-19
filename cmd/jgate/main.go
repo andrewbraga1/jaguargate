@@ -19,7 +19,7 @@ import (
 	"github.com/jaguargate/jaguargate/internal/transport"
 )
 
-const Version = "v1.0.0"
+const Version = "v1.0.2"
 
 func main() {
 	if len(os.Args) < 2 {

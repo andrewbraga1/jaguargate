@@ -1,0 +1,28 @@
+# ==============================================================================
+# 🐆 JAGUARGATE — SCENARIO 00: BEGINNER QUICKSTART ("THE PRIVACY BOUNCER")
+# ==============================================================================
+# [EN] What does this do?
+# Think of JaguarGate as a smart privacy filter between you and Artificial Intelligence.
+# With just these 3 sections, JaguarGate automatically hides your personal data
+# (CPF, CNPJ, Credit Cards, Emails, and API Keys) BEFORE your message leaves your
+# computer, and restores the original values when the AI replies.
+#
+# [PT-BR] O que este arquivo faz?
+# Pense no JaguarGate como um porteiro de privacidade entre você e a IA.
+# Com apenas estas 3 linhas principais, ele esconde automaticamente seus dados
+# (CPF, CNPJ, Cartões, E-mails e Senhas/Chaves) ANTES da mensagem sair do seu PC
+# e devolve os dados originais quando a resposta da IA chega.
+# ==============================================================================
+
+core:
+  version: "1.0"
+  preset: "balanced"   # Automatic protection (masks PII & neutralizes attacks without breaking chats)
+  language: "en"       # Change to "pt-BR" for Portuguese tables and logs
+
+network:
+  ingress:
+    http:
+      enabled: true
+      listen_addr: "127.0.0.1:4010"         # Connect your AI app/chat here
+  egress:
+    upstream_url: "http://127.0.0.1:11434"  # Where your real AI lives (e.g., Ollama, LiteLLM, OpenAI)

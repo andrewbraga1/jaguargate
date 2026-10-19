@@ -1,0 +1,64 @@
+# ==============================================================================
+# 💻 JAGUARGATE — SCENARIO 01: DEVELOPER IDE GUARD (CLINE / CURSOR / CONTINUE)
+# ==============================================================================
+# [EN] Ideal for Software Engineers using AI coding assistants in VS Code.
+# Prevents accidental leakage of .env secrets (AWS AKIA, OpenAI sk-, GitHub ghp_,
+# Slack xoxb-, JWTs) and customer CPF/CNPJ records during codebase indexing,
+# while stopping Infinite Agent Loops from burning API credits.
+#
+# [PT-BR] Ideal para Desenvolvedores usando assistentes de código no VS Code.
+# Impede o vazamento acidental de chaves do .env (AWS, OpenAI, GitHub, Slack, JWT)
+# e documentos de testes (CPF/CNPJ), além de travar loops infinitos de agentes.
+# ==============================================================================
+
+core:
+  version: "1.0"
+  mode: "sanitize_and_warn"
+  preset: "balanced"
+  language: "en"
+
+network:
+  ingress:
+    http:
+      enabled: true
+      listen_addr: "127.0.0.1:4010"
+      max_payload_mb: 15
+  egress:
+    # Point to your local Ollama (:11434), LiteLLM proxy (:4000), or https://api.openai.com
+    upstream_url: "http://127.0.0.1:11434"
+    keep_alive_pool_size: 64
+
+guards:
+  prompt_injection:
+    enabled: true
+    action: "neutralize"
+  deobfuscation:
+    enabled: true
+    strip_invisible_unicode: true
+    decode_base64: true
+    decode_hex: true
+    max_decode_depth: 2
+  pii_vault:
+    enabled: true
+    restore_on_output: true
+    ttl_seconds: 600
+    entities:
+      cpf: true
+      cnpj: true               # Supports legacy numeric & 2026+ Alphanumeric CNPJ
+      credit_card: true
+      email: true
+      secrets_and_keys: true   # Redacts AKIA*, sk-*, ghp_*, xoxb-*, Bearer JWT
+
+whitelist:
+  # Circuit Breaker stops runaway coding agents repeating the exact same failed tool call
+  circuit_breaker:
+    enabled: true
+    max_identical_tool_calls: 3
+    window_seconds: 120
+    max_tokens_per_session: 100000
+
+telemetry:
+  logging:
+    level: "info"
+    format: "json"
+    zero_trust_prompts: true   # Never writes your source code or prompts to disk logs

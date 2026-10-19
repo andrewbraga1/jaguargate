@@ -1,0 +1,35 @@
+# ==============================================================================
+# 🐳 JAGUARGATE — SCENARIO 03: DOCKER COMPOSE SIDECAR + REDIS L2 STATE STORE
+# ==============================================================================
+# Usage:
+#   docker compose -f examples/03-docker-compose-sidecar.yml up --build -d
+# ==============================================================================
+
+services:
+  jaguargate:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    container_name: jaguargate-proxy
+    restart: unless-stopped
+    ports:
+      - "4010:4010"   # AI / MCP Gateway Ingress
+      - "9091:9091"   # Prometheus / OpenMetrics Endpoint
+    environment:
+      - JAGUARGATE_LISTEN_ADDR=0.0.0.0:4010
+      - JAGUARGATE_UPSTREAM_URL=http://host.docker.internal:11434
+      - JAGUARGATE_MODE=sanitize_and_warn
+      - JAGUARGATE_LANG=en
+      - GOMEMLIMIT=64MiB
+    volumes:
+      - ./00-quickstart-beginner.yaml:/app/jaguargate.yaml:ro
+    depends_on:
+      - redis-vault
+
+  redis-vault:
+    image: redis:7-alpine
+    container_name: jaguargate-redis-l2
+    restart: unless-stopped
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - "127.0.0.1:6379:6379"
