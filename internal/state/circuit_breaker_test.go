@@ -92,11 +92,11 @@ func TestCircuitBreakerConcurrentAccess(t *testing.T) {
 	}
 
 	var wg sync.WaitGroup
-	for i := 0; i < 20; i++ {
+	for range 20 {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for j := 0; j < 25; j++ {
+			for range 25 {
 				_ = cb.CheckToolCallLoop("concurrent-sess", "tool_a", `{"k":"v"}`, cfg)
 				_ = cb.CheckAndTrackTokens("concurrent-sess", 64, cfg)
 			}

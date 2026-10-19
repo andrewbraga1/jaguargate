@@ -180,7 +180,7 @@ func runDoctor(cfgPath, langOverride string) {
 		fmt.Println("\n  3. OBSERVABILIDADE (PROMETHEUS / GRAFANA / DATADOG):")
 		fmt.Printf("     curl -s %s\n", metricsURL)
 		fmt.Printf("     curl -s %s/readyz\n", gatewayBaseURL)
-		fmt.Println("     Header de Latência por Request: X-JaguarGate-Latency-Us")
+		fmt.Println("     Headers de Latência : X-JaguarGate-Latency-Us (Gateway) | X-JaguarGate-Upstream-Ms (LLM)")
 		fmt.Println("===============================================================================")
 		return
 	}
@@ -205,7 +205,7 @@ func runDoctor(cfgPath, langOverride string) {
 	fmt.Println("\n  3. OBSERVABILITY (PROMETHEUS / GRAFANA / DATADOG):")
 	fmt.Printf("     curl -s %s\n", metricsURL)
 	fmt.Printf("     curl -s %s/readyz\n", gatewayBaseURL)
-	fmt.Println("     Per-Request Latency Header: X-JaguarGate-Latency-Us")
+	fmt.Println("     Latency Headers     : X-JaguarGate-Latency-Us (Gateway) | X-JaguarGate-Upstream-Ms (LLM)")
 	fmt.Println("===============================================================================")
 }
 

@@ -1,8 +1,9 @@
 package telemetry
 
 import (
+	"cmp"
 	"net/http"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -27,7 +28,7 @@ func NewMetricsCollector() *MetricsCollector {
 	return &MetricsCollector{}
 }
 
-// RecordRequest atomically records request outcome, flag codes, pruned tool count, and latency in microseconds.
+// RecordRequest atomically records request outcome, flag codes, pruned tool count, and gateway latency in microseconds.
 func (m *MetricsCollector) RecordRequest(status string, codes []string, prunedTools int, latencyUs int64) {
 	if m == nil {
 		return
@@ -93,13 +94,13 @@ func (m *MetricsCollector) RenderPrometheusText() string {
 	b.WriteString(strconv.FormatUint(m.prunedToolsTotal.Load(), 10))
 	b.WriteByte('\n')
 
-	b.WriteString("# HELP jaguargate_latency_microseconds_sum Cumulative gateway inspection overhead in microseconds.\n")
+	b.WriteString("# HELP jaguargate_latency_microseconds_sum Cumulative gateway inspection overhead in microseconds (excludes LLM upstream time).\n")
 	b.WriteString("# TYPE jaguargate_latency_microseconds_sum counter\n")
 	b.WriteString("jaguargate_latency_microseconds_sum ")
 	b.WriteString(strconv.FormatUint(m.latencySumUs.Load(), 10))
 	b.WriteByte('\n')
 
-	b.WriteString("# HELP jaguargate_latency_microseconds_count Total requests measured for latency.\n")
+	b.WriteString("# HELP jaguargate_latency_microseconds_count Total requests measured for gateway inspection latency.\n")
 	b.WriteString("# TYPE jaguargate_latency_microseconds_count counter\n")
 	b.WriteString("jaguargate_latency_microseconds_count ")
 	b.WriteString(strconv.FormatUint(m.latencyCount.Load(), 10))
@@ -118,7 +119,11 @@ func (m *MetricsCollector) RenderPrometheusText() string {
 		}
 		return true
 	})
-	sort.Slice(entries, func(i, j int) bool { return entries[i].code < entries[j].code })
+
+	// Modern Go (1.21+): generic type-safe pdqsort without reflection overhead
+	slices.SortFunc(entries, func(a, b codeEntry) int {
+		return cmp.Compare(a.code, b.code)
+	})
 
 	b.WriteString("# HELP jaguargate_flag_triggers_total Total security and governance flags triggered by code.\n")
 	b.WriteString("# TYPE jaguargate_flag_triggers_total counter\n")

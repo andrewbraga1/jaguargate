@@ -29,7 +29,8 @@ import (
 )
 
 type ctxInspectionKey struct{}
-type ctxStartTimeKey struct{}
+type ctxInboundLatencyUsKey struct{}
+type ctxUpstreamStartTimeKey struct{}
 
 // GatewayServer manages the multi-transport listeners, telemetry, and the low-latency reverse proxy.
 type GatewayServer struct {
@@ -112,13 +113,14 @@ func NewGatewayServer(cfgMgr *config.Manager, logger *slog.Logger) (*GatewayServ
 		FlushInterval: -1, // Immediate token-by-token flush for SSE streaming
 		BufferPool:    bufPool,
 		ModifyResponse: func(resp *http.Response) error {
+			outboundStart := time.Now()
 			activeCfg := cfgMgr.Get()
 			inboundRes, _ := resp.Request.Context().Value(ctxInspectionKey{}).(guards.InspectionResult)
+			inboundUs, _ := resp.Request.Context().Value(ctxInboundLatencyUsKey{}).(int64)
 
-			var latencyUs int64
-			if startTime, ok := resp.Request.Context().Value(ctxStartTimeKey{}).(time.Time); ok {
-				latencyUs = time.Since(startTime).Microseconds()
-				resp.Header.Set("X-JaguarGate-Latency-Us", strconv.FormatInt(latencyUs, 10))
+			if upstreamStart, ok := resp.Request.Context().Value(ctxUpstreamStartTimeKey{}).(time.Time); ok {
+				upstreamMs := time.Since(upstreamStart).Milliseconds()
+				resp.Header.Set("X-JaguarGate-Upstream-Ms", strconv.FormatInt(upstreamMs, 10))
 			}
 
 			contentType := resp.Header.Get("Content-Type")
@@ -135,6 +137,9 @@ func NewGatewayServer(cfgMgr *config.Manager, logger *slog.Logger) (*GatewayServ
 					status = "CLEAN"
 					severity = "NONE"
 				}
+
+				gatewayUs := max(1, inboundUs+time.Since(outboundStart).Microseconds())
+				resp.Header.Set("X-JaguarGate-Latency-Us", strconv.FormatInt(gatewayUs, 10))
 
 				if activeCfg.Telemetry.WarningFlags.EmitHTTPHeaders {
 					resp.Header.Set("X-JaguarGate-Status", status)
@@ -154,7 +159,7 @@ func NewGatewayServer(cfgMgr *config.Manager, logger *slog.Logger) (*GatewayServ
 					}
 				}
 
-				metrics.RecordRequest(status, inboundRes.Codes, inboundRes.PrunedTools, latencyUs)
+				metrics.RecordRequest(status, inboundRes.Codes, inboundRes.PrunedTools, gatewayUs)
 				resp.Body = stream.NewSSEInspector(resp.Body, activeCfg, guardEngine.Vault(), inboundRes, resp.Trailer)
 				return nil
 			}
@@ -175,6 +180,9 @@ func NewGatewayServer(cfgMgr *config.Manager, logger *slog.Logger) (*GatewayServ
 					}
 
 					outRes := guardEngine.SanitizeOutputJSON(rawResp, inboundRes, activeCfg)
+					gatewayUs := max(1, inboundUs+time.Since(outboundStart).Microseconds())
+					resp.Header.Set("X-JaguarGate-Latency-Us", strconv.FormatInt(gatewayUs, 10))
+
 					if activeCfg.Telemetry.WarningFlags.EmitHTTPHeaders {
 						resp.Header.Set("X-JaguarGate-Status", outRes.Status)
 						resp.Header.Set("X-JaguarGate-Severity", outRes.Severity)
@@ -186,7 +194,7 @@ func NewGatewayServer(cfgMgr *config.Manager, logger *slog.Logger) (*GatewayServ
 						}
 					}
 
-					metrics.RecordRequest(outRes.Status, outRes.Codes, outRes.PrunedTools, latencyUs)
+					metrics.RecordRequest(outRes.Status, outRes.Codes, outRes.PrunedTools, gatewayUs)
 					if len(outRes.Codes) > 0 {
 						webhooks.Enqueue(telemetry.WebhookEvent{
 							Status:      outRes.Status,
@@ -204,11 +212,13 @@ func NewGatewayServer(cfgMgr *config.Manager, logger *slog.Logger) (*GatewayServ
 				}
 			}
 
+			gatewayUs := max(1, inboundUs+time.Since(outboundStart).Microseconds())
+			resp.Header.Set("X-JaguarGate-Latency-Us", strconv.FormatInt(gatewayUs, 10))
 			if activeCfg.Telemetry.WarningFlags.EmitHTTPHeaders && resp.Header.Get("X-JaguarGate-Status") == "" {
 				resp.Header.Set("X-JaguarGate-Status", "CLEAN")
 				resp.Header.Set("X-JaguarGate-Severity", "NONE")
 			}
-			metrics.RecordRequest("CLEAN", nil, 0, latencyUs)
+			metrics.RecordRequest("CLEAN", nil, 0, gatewayUs)
 			return nil
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
@@ -242,8 +252,8 @@ func NewGatewayServer(cfgMgr *config.Manager, logger *slog.Logger) (*GatewayServ
 func (s *GatewayServer) Handler() http.Handler {
 	mux := http.NewServeMux()
 
-	// Kubernetes Liveness Probe (/healthz) — also supports ?check=upstream for deep health verification
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+	// Modern Go (1.22+): explicit method routing in ServeMux ("GET /healthz", "GET /readyz", "GET /metrics")
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		cfg := s.cfgMgr.Get()
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("X-JaguarGate-Status", "CLEAN")
@@ -265,8 +275,7 @@ func (s *GatewayServer) Handler() http.Handler {
 			cfg.Core.Version, cfg.Core.Mode, cfg.Core.Preset)
 	})
 
-	// Kubernetes / Load-Balancer Readiness Probe (/readyz) — dynamically verifies upstream reachability
-	mux.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, r *http.Request) {
 		cfg := s.cfgMgr.Get()
 		reachable := probeUpstream(cfg.Network.Egress)
 		w.Header().Set("Content-Type", "application/json")
@@ -281,19 +290,18 @@ func (s *GatewayServer) Handler() http.Handler {
 		_, _ = fmt.Fprintf(w, `{"status":"ready","upstream_reachable":true,"upstream":%q}`, cfg.Network.Egress.UpstreamURL)
 	})
 
-	// Expose Prometheus / OpenMetrics endpoint on /metrics
-	mux.Handle("/metrics", s.metrics.Handler())
+	mux.Handle("GET /metrics", s.metrics.Handler())
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		startTime := time.Now()
-		ctx := context.WithValue(r.Context(), ctxStartTimeKey{}, startTime)
-		r = r.WithContext(ctx)
+		inboundStart := time.Now()
 
 		cfg := s.cfgMgr.Get()
 		maxBytes := cfg.Network.Ingress.HTTP.MaxPayloadMB * 1024 * 1024
 		if maxBytes > 0 && r.Body != nil {
 			r.Body = http.MaxBytesReader(w, r.Body, maxBytes)
 		}
+
+		var inboundLatencyUs int64
 
 		if r.Body != nil && (r.Method == http.MethodPost || r.Method == http.MethodPut) {
 			buf := telemetry.AcquireBuffer()
@@ -366,6 +374,8 @@ func (s *GatewayServer) Handler() http.Handler {
 				}
 			}
 
+			inboundLatencyUs = max(1, time.Since(inboundStart).Microseconds())
+
 			if len(res.Codes) > 0 {
 				s.logger.Warn("JaguarGate guard triggered",
 					slog.String("status", res.Status),
@@ -376,8 +386,7 @@ func (s *GatewayServer) Handler() http.Handler {
 			}
 
 			if res.Blocked {
-				latencyUs := time.Since(startTime).Microseconds()
-				s.metrics.RecordRequest(res.Status, res.Codes, res.PrunedTools, latencyUs)
+				s.metrics.RecordRequest(res.Status, res.Codes, res.PrunedTools, inboundLatencyUs)
 				s.webhooks.Enqueue(telemetry.WebhookEvent{
 					Status:      res.Status,
 					Severity:    res.Severity,
@@ -390,7 +399,7 @@ func (s *GatewayServer) Handler() http.Handler {
 					w.Header().Set("X-JaguarGate-Status", res.Status)
 					w.Header().Set("X-JaguarGate-Severity", res.Severity)
 					w.Header().Set("X-JaguarGate-Codes", strings.Join(res.Codes, ","))
-					w.Header().Set("X-JaguarGate-Latency-Us", strconv.FormatInt(latencyUs, 10))
+					w.Header().Set("X-JaguarGate-Latency-Us", strconv.FormatInt(inboundLatencyUs, 10))
 				}
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusForbidden)
@@ -402,7 +411,13 @@ func (s *GatewayServer) Handler() http.Handler {
 			r.ContentLength = int64(len(res.ModifiedBody))
 			r.Header.Set("Content-Length", strconv.Itoa(len(res.ModifiedBody)))
 			r = r.WithContext(context.WithValue(r.Context(), ctxInspectionKey{}, res))
+		} else {
+			inboundLatencyUs = max(1, time.Since(inboundStart).Microseconds())
 		}
+
+		ctx := context.WithValue(r.Context(), ctxInboundLatencyUsKey{}, inboundLatencyUs)
+		ctx = context.WithValue(ctx, ctxUpstreamStartTimeKey{}, time.Now())
+		r = r.WithContext(ctx)
 
 		s.proxy.ServeHTTP(w, r)
 	})
@@ -495,7 +510,7 @@ func (s *GatewayServer) Start(ctx context.Context) error {
 
 	if cfg.Telemetry.OpenTelemetry.Enabled && cfg.Telemetry.OpenTelemetry.PrometheusListen != "" {
 		metricsMux := http.NewServeMux()
-		metricsMux.Handle("/metrics", s.metrics.Handler())
+		metricsMux.Handle("GET /metrics", s.metrics.Handler())
 		s.metricsServer = &http.Server{
 			Addr:              cfg.Telemetry.OpenTelemetry.PrometheusListen,
 			Handler:           metricsMux,

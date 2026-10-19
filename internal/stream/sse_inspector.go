@@ -122,13 +122,14 @@ func (s *SSEInspector) processAvailableLines(flushAll bool) {
 func (s *SSEInspector) handleSSELine(line string) {
 	trimmed := strings.TrimSpace(line)
 
-	// Pass through empty keep-alive lines and SSE comments
-	if trimmed == "" || !strings.HasPrefix(trimmed, "data:") {
+	// Modern Go (1.20+): single-pass prefix check and slice cut via strings.CutPrefix
+	rawPayload, isDataLine := strings.CutPrefix(trimmed, "data:")
+	if trimmed == "" || !isDataLine {
 		s.outBuf.WriteString(line)
 		return
 	}
 
-	payloadStr := strings.TrimSpace(strings.TrimPrefix(trimmed, "data:"))
+	payloadStr := strings.TrimSpace(rawPayload)
 
 	// Check for stream completion marker: data: [DONE]
 	if payloadStr == "[DONE]" {
