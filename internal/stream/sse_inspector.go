@@ -10,8 +10,8 @@ import (
 	"strings"
 	"unicode/utf8"
 
-	"github.com/jaguargate/jaguargate/internal/config"
-	"github.com/jaguargate/jaguargate/internal/guards"
+	"github.com/andrewbraga1/jaguargate/internal/config"
+	"github.com/andrewbraga1/jaguargate/internal/guards"
 )
 
 const piiOpenPrefix = "\x3cJG_PII_"

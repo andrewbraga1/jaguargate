@@ -38,7 +38,7 @@ $ go test -v -count=1 ./...
 === RUN   TestConcurrentLockFreeAtomicReadsAndWrites
 --- PASS: TestConcurrentLockFreeAtomicReadsAndWrites (0.00s)
 PASS
-ok      [github.com/jaguargate/jaguargate/internal/config](https://github.com/jaguargate/jaguargate/internal/config)        0.004s
+ok      [github.com/andrewbraga1/jaguargate/internal/config](https://github.com/andrewbraga1/jaguargate/internal/config)        0.004s
 === RUN   TestDeobfuscatorUnicodeSmugglingAndNestedBase64
 --- PASS: TestDeobfuscatorUnicodeSmugglingAndNestedBase64 (0.00s)
 === RUN   TestReversiblePIIVaultMaskAndRestore
@@ -46,7 +46,7 @@ ok      [github.com/jaguargate/jaguargate/internal/config](https://github.com/ja
 === RUN   TestEngineThreeModesSpotlightingAndCanary
 --- PASS: TestEngineThreeModesSpotlightingAndCanary (0.00s)
 PASS
-ok      [github.com/jaguargate/jaguargate/internal/guards](https://github.com/jaguargate/jaguargate/internal/guards)        0.012s
+ok      [github.com/andrewbraga1/jaguargate/internal/guards](https://github.com/andrewbraga1/jaguargate/internal/guards)        0.012s
 === RUN   TestJPEGMetadataStrippingAndMagicBytes
 --- PASS: TestJPEGMetadataStrippingAndMagicBytes (0.00s)
 === RUN   TestSpoofedMagicBytesDetection
@@ -54,22 +54,22 @@ ok      [github.com/jaguargate/jaguargate/internal/guards](https://github.com/ja
 === RUN   FuzzStripJPEGMetadata
 --- PASS: FuzzStripJPEGMetadata (0.00s)
 PASS
-ok      [github.com/jaguargate/jaguargate/internal/multimodal](https://github.com/jaguargate/jaguargate/internal/multimodal)    0.010s
+ok      [github.com/andrewbraga1/jaguargate/internal/multimodal](https://github.com/andrewbraga1/jaguargate/internal/multimodal)    0.010s
 === RUN   TestZeroTrustLoggerRedaction
 --- PASS: TestZeroTrustLoggerRedaction (0.00s)
 PASS
-ok      [github.com/jaguargate/jaguargate/internal/telemetry](https://github.com/jaguargate/jaguargate/internal/telemetry)     0.006s
+ok      [github.com/andrewbraga1/jaguargate/internal/telemetry](https://github.com/andrewbraga1/jaguargate/internal/telemetry)     0.006s
 === RUN   TestHTTPAndUnixSocketProxyWithSSEStreaming
 --- PASS: TestHTTPAndUnixSocketProxyWithSSEStreaming (0.02s)
 PASS
-ok      [github.com/jaguargate/jaguargate/internal/transport](https://github.com/jaguargate/jaguargate/internal/transport)     0.026s
+ok      [github.com/andrewbraga1/jaguargate/internal/transport](https://github.com/andrewbraga1/jaguargate/internal/transport)     0.026s
 
 $ go test -race ./...
-ok      [github.com/jaguargate/jaguargate/internal/config](https://github.com/jaguargate/jaguargate/internal/config)        (cached)
-ok      [github.com/jaguargate/jaguargate/internal/guards](https://github.com/jaguargate/jaguargate/internal/guards)        1.035s
-ok      [github.com/jaguargate/jaguargate/internal/multimodal](https://github.com/jaguargate/jaguargate/internal/multimodal)    (cached)
-ok      [github.com/jaguargate/jaguargate/internal/telemetry](https://github.com/jaguargate/jaguargate/internal/telemetry)     (cached)
-ok      [github.com/jaguargate/jaguargate/internal/transport](https://github.com/jaguargate/jaguargate/internal/transport)     1.044s
+ok      [github.com/andrewbraga1/jaguargate/internal/config](https://github.com/andrewbraga1/jaguargate/internal/config)        (cached)
+ok      [github.com/andrewbraga1/jaguargate/internal/guards](https://github.com/andrewbraga1/jaguargate/internal/guards)        1.035s
+ok      [github.com/andrewbraga1/jaguargate/internal/multimodal](https://github.com/andrewbraga1/jaguargate/internal/multimodal)    (cached)
+ok      [github.com/andrewbraga1/jaguargate/internal/telemetry](https://github.com/andrewbraga1/jaguargate/internal/telemetry)     (cached)
+ok      [github.com/andrewbraga1/jaguargate/internal/transport](https://github.com/andrewbraga1/jaguargate/internal/transport)     1.044s
 ```
 
 ---
@@ -83,37 +83,37 @@ fuzz: elapsed: 0s, gathering baseline coverage: 16/16 completed, now fuzzing wit
 fuzz: elapsed: 3s, execs: 122427 (40792/sec), new interesting: 3 (total: 19)
 fuzz: elapsed: 3s, execs: 122427 (0/sec), new interesting: 3 (total: 19)
 PASS
-ok      [github.com/jaguargate/jaguargate/internal/multimodal](https://github.com/jaguargate/jaguargate/internal/multimodal)    3.094s
+ok      [github.com/andrewbraga1/jaguargate/internal/multimodal](https://github.com/andrewbraga1/jaguargate/internal/multimodal)    3.094s
 
 $ go test -bench=. -benchmem ./internal/...
 goos: linux
 goarch: amd64
-pkg: [github.com/jaguargate/jaguargate/internal/config](https://github.com/jaguargate/jaguargate/internal/config)
+pkg: [github.com/andrewbraga1/jaguargate/internal/config](https://github.com/andrewbraga1/jaguargate/internal/config)
 cpu: Intel(R) Core(TM) i7-7500U CPU @ 2.70GHz
 BenchmarkAtomicConfigRead-4      1000000000               0.5566 ns/op          0 B/op          0 allocs/op
 PASS
-ok      [github.com/jaguargate/jaguargate/internal/config](https://github.com/jaguargate/jaguargate/internal/config)        0.627s
+ok      [github.com/andrewbraga1/jaguargate/internal/config](https://github.com/andrewbraga1/jaguargate/internal/config)        0.627s
 goos: linux
 goarch: amd64
-pkg: [github.com/jaguargate/jaguargate/internal/guards](https://github.com/jaguargate/jaguargate/internal/guards)
+pkg: [github.com/andrewbraga1/jaguargate/internal/guards](https://github.com/andrewbraga1/jaguargate/internal/guards)
 cpu: Intel(R) Core(TM) i7-7500U CPU @ 2.70GHz
 BenchmarkOWASPInputEngine-4           10000             118794 ns/op            3839 B/op        108 allocs/op
 PASS
-ok      [github.com/jaguargate/jaguargate/internal/guards](https://github.com/jaguargate/jaguargate/internal/guards)        1.196s
+ok      [github.com/andrewbraga1/jaguargate/internal/guards](https://github.com/andrewbraga1/jaguargate/internal/guards)        1.196s
 goos: linux
 goarch: amd64
-pkg: [github.com/jaguargate/jaguargate/internal/multimodal](https://github.com/jaguargate/jaguargate/internal/multimodal)
+pkg: [github.com/andrewbraga1/jaguargate/internal/multimodal](https://github.com/andrewbraga1/jaguargate/internal/multimodal)
 cpu: Intel(R) Core(TM) i7-7500U CPU @ 2.70GHz
 BenchmarkStripJPEGMetadata-4       40115696               32.10 ns/op           32 B/op          1 allocs/op
 PASS
-ok      [github.com/jaguargate/jaguargate/internal/multimodal](https://github.com/jaguargate/jaguargate/internal/multimodal)    2.167s
+ok      [github.com/andrewbraga1/jaguargate/internal/multimodal](https://github.com/andrewbraga1/jaguargate/internal/multimodal)    2.167s
 goos: linux
 goarch: amd64
-pkg: [github.com/jaguargate/jaguargate/internal/telemetry](https://github.com/jaguargate/jaguargate/internal/telemetry)
+pkg: [github.com/andrewbraga1/jaguargate/internal/telemetry](https://github.com/andrewbraga1/jaguargate/internal/telemetry)
 cpu: Intel(R) Core(TM) i7-7500U CPU @ 2.70GHz
 BenchmarkBufferPoolCycle-4          4005704               282.0 ns/op           24 B/op          1 allocs/op
 PASS
-ok      [github.com/jaguargate/jaguargate/internal/telemetry](https://github.com/jaguargate/jaguargate/internal/telemetry)     1.437s
+ok      [github.com/andrewbraga1/jaguargate/internal/telemetry](https://github.com/andrewbraga1/jaguargate/internal/telemetry)     1.437s
 PASS
-ok      [github.com/jaguargate/jaguargate/internal/transport](https://github.com/jaguargate/jaguargate/internal/transport)     0.030s
+ok      [github.com/andrewbraga1/jaguargate/internal/transport](https://github.com/andrewbraga1/jaguargate/internal/transport)     0.030s
 ```

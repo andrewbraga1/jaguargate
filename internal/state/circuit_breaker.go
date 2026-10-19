@@ -10,7 +10,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/jaguargate/jaguargate/internal/config"
+	"github.com/andrewbraga1/jaguargate/internal/config"
 )
 
 type loopCounter struct {

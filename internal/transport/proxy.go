@@ -19,13 +19,13 @@ import (
 	"sync"
 	"time"
 
-	"github.com/jaguargate/jaguargate/internal/config"
-	"github.com/jaguargate/jaguargate/internal/extensions"
-	"github.com/jaguargate/jaguargate/internal/guards"
-	"github.com/jaguargate/jaguargate/internal/mcp"
-	"github.com/jaguargate/jaguargate/internal/state"
-	"github.com/jaguargate/jaguargate/internal/stream"
-	"github.com/jaguargate/jaguargate/internal/telemetry"
+	"github.com/andrewbraga1/jaguargate/internal/config"
+	"github.com/andrewbraga1/jaguargate/internal/extensions"
+	"github.com/andrewbraga1/jaguargate/internal/guards"
+	"github.com/andrewbraga1/jaguargate/internal/mcp"
+	"github.com/andrewbraga1/jaguargate/internal/state"
+	"github.com/andrewbraga1/jaguargate/internal/stream"
+	"github.com/andrewbraga1/jaguargate/internal/telemetry"
 )
 
 type ctxInspectionKey struct{}

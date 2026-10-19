@@ -7,10 +7,10 @@ import (
 	"slices"
 	"strings"
 
-	"github.com/jaguargate/jaguargate/internal/config"
-	"github.com/jaguargate/jaguargate/internal/guards"
-	"github.com/jaguargate/jaguargate/internal/state"
-	"github.com/jaguargate/jaguargate/internal/telemetry"
+	"github.com/andrewbraga1/jaguargate/internal/config"
+	"github.com/andrewbraga1/jaguargate/internal/guards"
+	"github.com/andrewbraga1/jaguargate/internal/state"
+	"github.com/andrewbraga1/jaguargate/internal/telemetry"
 )
 
 // MCPInspectionResult summarizes all actions taken on a JSON-RPC 2.0 MCP payload.

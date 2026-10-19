@@ -13,13 +13,13 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/jaguargate/jaguargate/internal/config"
-	"github.com/jaguargate/jaguargate/internal/redteam"
-	"github.com/jaguargate/jaguargate/internal/telemetry"
-	"github.com/jaguargate/jaguargate/internal/transport"
+	"github.com/andrewbraga1/jaguargate/internal/config"
+	"github.com/andrewbraga1/jaguargate/internal/redteam"
+	"github.com/andrewbraga1/jaguargate/internal/telemetry"
+	"github.com/andrewbraga1/jaguargate/internal/transport"
 )
 
-const Version = "v1.0.3"
+const Version = "v1.0.4"
 
 func main() {
 	if len(os.Args) < 2 {

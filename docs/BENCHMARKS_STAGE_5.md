@@ -77,69 +77,69 @@ VEC-08  | SSE-STREAM   | Corte em Tempo Real de Vazamento Canary em SSE  | JG-SE
 $ go test -bench=. -benchmem ./internal/...
 goos: linux
 goarch: amd64
-pkg: [github.com/jaguargate/jaguargate/internal/config](https://github.com/jaguargate/jaguargate/internal/config)
+pkg: [github.com/andrewbraga1/jaguargate/internal/config](https://github.com/andrewbraga1/jaguargate/internal/config)
 cpu: Intel(R) Core(TM) i7-7500U CPU @ 2.70GHz
 BenchmarkAtomicConfigRead-4             1000000000               0.5056 ns/op          0 B/op          0 allocs/op
 PASS
-ok      [github.com/jaguargate/jaguargate/internal/config](https://github.com/jaguargate/jaguargate/internal/config)        0.567s
+ok      [github.com/andrewbraga1/jaguargate/internal/config](https://github.com/andrewbraga1/jaguargate/internal/config)        0.567s
 goos: linux
 goarch: amd64
-pkg: [github.com/jaguargate/jaguargate/internal/extensions](https://github.com/jaguargate/jaguargate/internal/extensions)
+pkg: [github.com/andrewbraga1/jaguargate/internal/extensions](https://github.com/andrewbraga1/jaguargate/internal/extensions)
 cpu: Intel(R) Core(TM) i7-7500U CPU @ 2.70GHz
 BenchmarkSandboxFastHook-4               1413870               824.4 ns/op           656 B/op          8 allocs/op
 PASS
-ok      [github.com/jaguargate/jaguargate/internal/extensions](https://github.com/jaguargate/jaguargate/internal/extensions)    2.031s
+ok      [github.com/andrewbraga1/jaguargate/internal/extensions](https://github.com/andrewbraga1/jaguargate/internal/extensions)    2.031s
 goos: linux
 goarch: amd64
-pkg: [github.com/jaguargate/jaguargate/internal/guards](https://github.com/jaguargate/jaguargate/internal/guards)
+pkg: [github.com/andrewbraga1/jaguargate/internal/guards](https://github.com/andrewbraga1/jaguargate/internal/guards)
 cpu: Intel(R) Core(TM) i7-7500U CPU @ 2.70GHz
 BenchmarkOWASPInputEngine-4                10000            113393 ns/op            3847 B/op        108 allocs/op
 PASS
-ok      [github.com/jaguargate/jaguargate/internal/guards](https://github.com/jaguargate/jaguargate/internal/guards)        1.149s
+ok      [github.com/andrewbraga1/jaguargate/internal/guards](https://github.com/andrewbraga1/jaguargate/internal/guards)        1.149s
 goos: linux
 goarch: amd64
-pkg: [github.com/jaguargate/jaguargate/internal/mcp](https://github.com/jaguargate/jaguargate/internal/mcp)
+pkg: [github.com/andrewbraga1/jaguargate/internal/mcp](https://github.com/andrewbraga1/jaguargate/internal/mcp)
 cpu: Intel(R) Core(TM) i7-7500U CPU @ 2.70GHz
 BenchmarkMCPJSONRPCInspection-4           259644              4650 ns/op            2734 B/op         58 allocs/op
 PASS
-ok      [github.com/jaguargate/jaguargate/internal/mcp](https://github.com/jaguargate/jaguargate/internal/mcp)           2.240s
+ok      [github.com/andrewbraga1/jaguargate/internal/mcp](https://github.com/andrewbraga1/jaguargate/internal/mcp)           2.240s
 goos: linux
 goarch: amd64
-pkg: [github.com/jaguargate/jaguargate/internal/multimodal](https://github.com/jaguargate/jaguargate/internal/multimodal)
+pkg: [github.com/andrewbraga1/jaguargate/internal/multimodal](https://github.com/andrewbraga1/jaguargate/internal/multimodal)
 cpu: Intel(R) Core(TM) i7-7500U CPU @ 2.70GHz
 BenchmarkStripJPEGMetadata-4            40508389                29.33 ns/op           32 B/op          1 allocs/op
 PASS
-ok      [github.com/jaguargate/jaguargate/internal/multimodal](https://github.com/jaguargate/jaguargate/internal/multimodal)    1.920s
+ok      [github.com/andrewbraga1/jaguargate/internal/multimodal](https://github.com/andrewbraga1/jaguargate/internal/multimodal)    1.920s
 goos: linux
 goarch: amd64
-pkg: [github.com/jaguargate/jaguargate/internal/redteam](https://github.com/jaguargate/jaguargate/internal/redteam)
+pkg: [github.com/andrewbraga1/jaguargate/internal/redteam](https://github.com/andrewbraga1/jaguargate/internal/redteam)
 cpu: Intel(R) Core(TM) i7-7500U CPU @ 2.70GHz
 BenchmarkPounceFullSuite-4                  5076            235521 ns/op          120974 B/op        499 allocs/op
 PASS
-ok      [github.com/jaguargate/jaguargate/internal/redteam](https://github.com/jaguargate/jaguargate/internal/redteam)       2.073s
+ok      [github.com/andrewbraga1/jaguargate/internal/redteam](https://github.com/andrewbraga1/jaguargate/internal/redteam)       2.073s
 goos: linux
 goarch: amd64
-pkg: [github.com/jaguargate/jaguargate/internal/state](https://github.com/jaguargate/jaguargate/internal/state)
+pkg: [github.com/andrewbraga1/jaguargate/internal/state](https://github.com/andrewbraga1/jaguargate/internal/state)
 cpu: Intel(R) Core(TM) i7-7500U CPU @ 2.70GHz
 BenchmarkCircuitBreakerCheck-4           2229100               580.9 ns/op           160 B/op          4 allocs/op
 BenchmarkAESGCMSealOpen-4                1594242               718.6 ns/op           288 B/op          8 allocs/op
 PASS
-ok      [github.com/jaguargate/jaguargate/internal/state](https://github.com/jaguargate/jaguargate/internal/state)         3.761s
+ok      [github.com/andrewbraga1/jaguargate/internal/state](https://github.com/andrewbraga1/jaguargate/internal/state)         3.761s
 goos: linux
 goarch: amd64
-pkg: [github.com/jaguargate/jaguargate/internal/stream](https://github.com/jaguargate/jaguargate/internal/stream)
+pkg: [github.com/andrewbraga1/jaguargate/internal/stream](https://github.com/andrewbraga1/jaguargate/internal/stream)
 cpu: Intel(R) Core(TM) i7-7500U CPU @ 2.70GHz
 BenchmarkSSERuneSlidingWindow-4           157609              7072 ns/op           11472 B/op         39 allocs/op
 PASS
-ok      [github.com/jaguargate/jaguargate/internal/stream](https://github.com/jaguargate/jaguargate/internal/stream)        1.204s
+ok      [github.com/andrewbraga1/jaguargate/internal/stream](https://github.com/andrewbraga1/jaguargate/internal/stream)        1.204s
 goos: linux
 goarch: amd64
-pkg: [github.com/jaguargate/jaguargate/internal/telemetry](https://github.com/jaguargate/jaguargate/internal/telemetry)
+pkg: [github.com/andrewbraga1/jaguargate/internal/telemetry](https://github.com/andrewbraga1/jaguargate/internal/telemetry)
 cpu: Intel(R) Core(TM) i7-7500U CPU @ 2.70GHz
 BenchmarkBufferPoolCycle-4               4273653               277.8 ns/op            24 B/op          1 allocs/op
 BenchmarkAtomicMetricsRecord-4          15916279                85.14 ns/op            0 B/op          0 allocs/op
 PASS
-ok      [github.com/jaguargate/jaguargate/internal/telemetry](https://github.com/jaguargate/jaguargate/internal/telemetry)     2.912s
+ok      [github.com/andrewbraga1/jaguargate/internal/telemetry](https://github.com/andrewbraga1/jaguargate/internal/telemetry)     2.912s
 PASS
-ok      [github.com/jaguargate/jaguargate/internal/transport](https://github.com/jaguargate/jaguargate/internal/transport)     0.026s
+ok      [github.com/andrewbraga1/jaguargate/internal/transport](https://github.com/andrewbraga1/jaguargate/internal/transport)     0.026s
 ```

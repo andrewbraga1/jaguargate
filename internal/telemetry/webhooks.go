@@ -13,7 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/jaguargate/jaguargate/internal/config"
+	"github.com/andrewbraga1/jaguargate/internal/config"
 )
 
 // WebhookEvent represents a structured security alert sent asynchronously to SIEM/Slack/Discord.

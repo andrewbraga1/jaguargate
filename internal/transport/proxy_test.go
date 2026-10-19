@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jaguargate/jaguargate/internal/config"
-	"github.com/jaguargate/jaguargate/internal/telemetry"
+	"github.com/andrewbraga1/jaguargate/internal/config"
+	"github.com/andrewbraga1/jaguargate/internal/telemetry"
 )
 
 func TestHTTPAndUnixSocketProxyWithSSEStreaming(t *testing.T) {

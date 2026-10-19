@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jaguargate/jaguargate/internal/config"
+	"github.com/andrewbraga1/jaguargate/internal/config"
 )
 
 func TestHybridStoreAESGCMAndRedisFailOpen(t *testing.T) {

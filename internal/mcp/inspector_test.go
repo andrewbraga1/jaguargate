@@ -5,9 +5,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/jaguargate/jaguargate/internal/config"
-	"github.com/jaguargate/jaguargate/internal/guards"
-	"github.com/jaguargate/jaguargate/internal/state"
+	"github.com/andrewbraga1/jaguargate/internal/config"
+	"github.com/andrewbraga1/jaguargate/internal/guards"
+	"github.com/andrewbraga1/jaguargate/internal/state"
 )
 
 func TestMCPJSONRPCToolFirewallAndExternalResourceSanitization(t *testing.T) {

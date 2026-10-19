@@ -8,7 +8,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
-	"github.com/jaguargate/jaguargate/internal/config"
+	"github.com/andrewbraga1/jaguargate/internal/config"
 )
 
 var (

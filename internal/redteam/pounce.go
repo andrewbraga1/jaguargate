@@ -10,12 +10,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jaguargate/jaguargate/internal/config"
-	"github.com/jaguargate/jaguargate/internal/guards"
-	"github.com/jaguargate/jaguargate/internal/mcp"
-	"github.com/jaguargate/jaguargate/internal/multimodal"
-	"github.com/jaguargate/jaguargate/internal/state"
-	"github.com/jaguargate/jaguargate/internal/stream"
+	"github.com/andrewbraga1/jaguargate/internal/config"
+	"github.com/andrewbraga1/jaguargate/internal/guards"
+	"github.com/andrewbraga1/jaguargate/internal/mcp"
+	"github.com/andrewbraga1/jaguargate/internal/multimodal"
+	"github.com/andrewbraga1/jaguargate/internal/state"
+	"github.com/andrewbraga1/jaguargate/internal/stream"
 )
 
 // VectorResult holds the empirical outcome of a single Red-Team attack simulation.

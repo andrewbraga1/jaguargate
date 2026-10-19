@@ -30,28 +30,28 @@
 
 ```text
 $ go test ./...
-ok      [github.com/jaguargate/jaguargate/internal/config](https://github.com/jaguargate/jaguargate/internal/config)        0.023s
-ok      [github.com/jaguargate/jaguargate/internal/telemetry](https://github.com/jaguargate/jaguargate/internal/telemetry)     0.018s
-ok      [github.com/jaguargate/jaguargate/internal/transport](https://github.com/jaguargate/jaguargate/internal/transport)     0.025s
+ok      [github.com/andrewbraga1/jaguargate/internal/config](https://github.com/andrewbraga1/jaguargate/internal/config)        0.023s
+ok      [github.com/andrewbraga1/jaguargate/internal/telemetry](https://github.com/andrewbraga1/jaguargate/internal/telemetry)     0.018s
+ok      [github.com/andrewbraga1/jaguargate/internal/transport](https://github.com/andrewbraga1/jaguargate/internal/transport)     0.025s
 
 $ go test -bench=. -benchmem ./internal/...
 goos: linux
 goarch: amd64
-pkg: [github.com/jaguargate/jaguargate/internal/config](https://github.com/jaguargate/jaguargate/internal/config)
+pkg: [github.com/andrewbraga1/jaguargate/internal/config](https://github.com/andrewbraga1/jaguargate/internal/config)
 cpu: Intel(R) Core(TM) i7-7500U CPU @ 2.70GHz
 BenchmarkAtomicConfigRead-4      1000000000               0.5185 ns/op          0 B/op          0 allocs/op
 PASS
-ok      [github.com/jaguargate/jaguargate/internal/config](https://github.com/jaguargate/jaguargate/internal/config)        0.593s
+ok      [github.com/andrewbraga1/jaguargate/internal/config](https://github.com/andrewbraga1/jaguargate/internal/config)        0.593s
 
 goos: linux
 goarch: amd64
-pkg: [github.com/jaguargate/jaguargate/internal/telemetry](https://github.com/jaguargate/jaguargate/internal/telemetry)
+pkg: [github.com/andrewbraga1/jaguargate/internal/telemetry](https://github.com/andrewbraga1/jaguargate/internal/telemetry)
 cpu: Intel(R) Core(TM) i7-7500U CPU @ 2.70GHz
 BenchmarkBufferPoolCycle-4        4068264               273.1 ns/op           24 B/op          1 allocs/op
 PASS
-ok      [github.com/jaguargate/jaguargate/internal/telemetry](https://github.com/jaguargate/jaguargate/internal/telemetry)     2.468s
+ok      [github.com/andrewbraga1/jaguargate/internal/telemetry](https://github.com/andrewbraga1/jaguargate/internal/telemetry)     2.468s
 PASS
-ok      [github.com/jaguargate/jaguargate/internal/transport](https://github.com/jaguargate/jaguargate/internal/transport)     0.025s
+ok      [github.com/andrewbraga1/jaguargate/internal/transport](https://github.com/andrewbraga1/jaguargate/internal/transport)     0.025s
 ```
 
 ---
@@ -68,24 +68,24 @@ $ go test -v -race -bench=. -benchmem ./...
 --- PASS: TestConcurrentLockFreeAtomicReadsAndWrites (0.00s)
 goos: linux
 goarch: amd64
-pkg: [github.com/jaguargate/jaguargate/internal/config](https://github.com/jaguargate/jaguargate/internal/config)
+pkg: [github.com/andrewbraga1/jaguargate/internal/config](https://github.com/andrewbraga1/jaguargate/internal/config)
 cpu: Intel(R) Core(TM) i7-7500U CPU @ 2.70GHz
 BenchmarkAtomicConfigRead
 BenchmarkAtomicConfigRead-4       5526794               245.1 ns/op            0 B/op          0 allocs/op
 PASS
-ok      [github.com/jaguargate/jaguargate/internal/config](https://github.com/jaguargate/jaguargate/internal/config)        2.762s
+ok      [github.com/andrewbraga1/jaguargate/internal/config](https://github.com/andrewbraga1/jaguargate/internal/config)        2.762s
 === RUN   TestZeroTrustLoggerRedaction
 --- PASS: TestZeroTrustLoggerRedaction (0.00s)
 goos: linux
 goarch: amd64
-pkg: [github.com/jaguargate/jaguargate/internal/telemetry](https://github.com/jaguargate/jaguargate/internal/telemetry)
+pkg: [github.com/andrewbraga1/jaguargate/internal/telemetry](https://github.com/andrewbraga1/jaguargate/internal/telemetry)
 cpu: Intel(R) Core(TM) i7-7500U CPU @ 2.70GHz
 BenchmarkBufferPoolCycle
 BenchmarkBufferPoolCycle-4          96268             16976 ns/op           8254 B/op          1 allocs/op
 PASS
-ok      [github.com/jaguargate/jaguargate/internal/telemetry](https://github.com/jaguargate/jaguargate/internal/telemetry)     2.885s
+ok      [github.com/andrewbraga1/jaguargate/internal/telemetry](https://github.com/andrewbraga1/jaguargate/internal/telemetry)     2.885s
 === RUN   TestHTTPAndUnixSocketProxyWithSSEStreaming
 --- PASS: TestHTTPAndUnixSocketProxyWithSSEStreaming (0.03s)
 PASS
-ok      [github.com/jaguargate/jaguargate/internal/transport](https://github.com/jaguargate/jaguargate/internal/transport)     1.062s
+ok      [github.com/andrewbraga1/jaguargate/internal/transport](https://github.com/andrewbraga1/jaguargate/internal/transport)     1.062s
 ```

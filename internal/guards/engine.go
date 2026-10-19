@@ -10,9 +10,9 @@ import (
 	"slices"
 	"strings"
 
-	"github.com/jaguargate/jaguargate/internal/config"
-	"github.com/jaguargate/jaguargate/internal/multimodal"
-	"github.com/jaguargate/jaguargate/internal/telemetry"
+	"github.com/andrewbraga1/jaguargate/internal/config"
+	"github.com/andrewbraga1/jaguargate/internal/multimodal"
+	"github.com/andrewbraga1/jaguargate/internal/telemetry"
 )
 
 // Pre-compiled linear-time RE2 rules for Direct & Indirect Prompt Injection (EN + PT-BR).

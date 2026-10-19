@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/jaguargate/jaguargate/internal/config"
+	"github.com/andrewbraga1/jaguargate/internal/config"
 )
 
 func TestDeobfuscatorUnicodeSmugglingAndNestedBase64(t *testing.T) {

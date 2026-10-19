@@ -5,7 +5,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/jaguargate/jaguargate/internal/config"
+	"github.com/andrewbraga1/jaguargate/internal/config"
 )
 
 func TestCircuitBreakerCanonicalLoopAndTokenBudget(t *testing.T) {

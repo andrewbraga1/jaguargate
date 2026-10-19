@@ -6,7 +6,7 @@ import (
 	"errors"
 	"strings"
 
-	"github.com/jaguargate/jaguargate/internal/config"
+	"github.com/andrewbraga1/jaguargate/internal/config"
 )
 
 var (

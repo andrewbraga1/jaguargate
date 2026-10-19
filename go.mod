@@ -1,4 +1,4 @@
-module github.com/jaguargate/jaguargate
+module github.com/andrewbraga1/jaguargate
 
 go 1.23
 
