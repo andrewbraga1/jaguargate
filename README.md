@@ -97,7 +97,7 @@ jgate check
 jgate pounce
 
 # Start the gateway
-jgate start -c configs/jaguargate.yaml
+jgate serve -c configs/jaguargate.yaml
 ```
 
 ---

@@ -136,3 +136,67 @@ network:
 		t.Errorf("expected UDS healthz 200 OK, got %d", udsResp.StatusCode)
 	}
 }
+
+func TestProxyTokenBudgetEnforcementAndDeferredSSEMetrics(t *testing.T) {
+	upstreamCalled := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamCalled++
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Segredo: [JG-CANARY:\"}}]}\n\n"))
+	}))
+	defer upstream.Close()
+
+	tmpDir := t.TempDir()
+	cfgPath := filepath.Join(tmpDir, "jaguargate.yaml")
+	yamlCfg := `
+core:
+  version: "1.0"
+  preset: "balanced"
+network:
+  ingress:
+    http:
+      enabled: true
+      listen_addr: "127.0.0.1:0"
+  egress:
+    upstream_url: "` + upstream.URL + `"
+whitelist:
+  circuit_breaker:
+    max_tokens_per_session: 10
+    window_seconds: 120
+`
+	if err := os.WriteFile(cfgPath, []byte(yamlCfg), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	mgr, err := config.NewManager(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = mgr.Close() }()
+
+	logger := telemetry.NewZeroTrustLogger(io.Discard, "error", true, true, "***")
+	gw, err := NewGatewayServer(mgr, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	proxyServer := httptest.NewServer(gw.Handler())
+	defer proxyServer.Close()
+
+	// Payload of ~100 bytes (~25 tokens > max_tokens_per_session: 10) MUST be blocked before calling upstream
+	req, _ := http.NewRequest(http.MethodPost, proxyServer.URL+"/v1/chat/completions", strings.NewReader(`{"messages":[{"role":"user","content":"Esta mensagem ultrapassa o limite de 10 tokens configurado para a sessao."}]}`))
+	req.Header.Set("X-JaguarGate-Session-ID", "sess-over-budget")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("expected HTTP 429 Too Many Requests when token budget is exceeded, got %d", resp.StatusCode)
+	}
+	if upstreamCalled != 0 {
+		t.Fatalf("SECURITY FAILURE: upstream LLM was called (%d times) despite session exceeding token budget!", upstreamCalled)
+	}
+}

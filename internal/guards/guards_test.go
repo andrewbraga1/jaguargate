@@ -61,6 +61,29 @@ func TestReversiblePIIVaultMaskAndRestore(t *testing.T) {
 	}
 }
 
+func TestPIIVaultCrossSessionIsolation(t *testing.T) {
+	vault := NewPIIVault()
+	cfg := config.DefaultConfig().Guards.PIIVault
+
+	rawPromptA := "Segredo do Tenant A: CPF 123.456.789-01"
+	maskedA, _, count := vault.MaskTextWithSession("tenant-session-A", rawPromptA, cfg, false)
+	if count != 1 || strings.Contains(maskedA, "123.456.789-01") {
+		t.Fatalf("expected Tenant A CPF to be masked, got: %s", maskedA)
+	}
+
+	// Tenant B attempts to restore Tenant A's token in its own response
+	restoredByB := vault.RestoreTextWithSession("tenant-session-B", maskedA)
+	if strings.Contains(restoredByB, "123.456.789-01") {
+		t.Fatalf("CRITICAL SECURITY FAILURE: Tenant B restored Tenant A's PII token: %s", restoredByB)
+	}
+
+	// Tenant A can restore its own token
+	restoredByA := vault.RestoreTextWithSession("tenant-session-A", maskedA)
+	if !strings.Contains(restoredByA, "123.456.789-01") {
+		t.Fatalf("expected Tenant A to restore its own PII token, got: %s", restoredByA)
+	}
+}
+
 // TestPIIVaultTableDrivenAllEntitiesAndCNPJFormats validates all PII & Secret patterns
 // including Legacy Numeric CNPJ, 2026+ Alphanumeric CNPJ, Credit Cards, Emails, Cloud/API Keys, JWTs,
 // and verifies that regular alphanumeric SKUs/IDs do NOT trigger false positives.

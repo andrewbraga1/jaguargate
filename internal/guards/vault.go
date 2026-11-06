@@ -20,8 +20,10 @@ var (
 	reVaultAWSKey     = regexp.MustCompile(`\bAKIA[0-9A-Z]{16}\b`)
 	reVaultAPISecret  = regexp.MustCompile(`\b(?:sk-[A-Za-z0-9_-]{16,}|ghp_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{10,})\b`)
 	reVaultJWT        = regexp.MustCompile(`\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b`)
-	reVaultToken      = regexp.MustCompile(`\x3cJG_PII_[A-Z]+_[0-9a-f]{8}\x3e`)
+	reVaultToken      = regexp.MustCompile(`\x3cJG_PII_[A-Z]+_[0-9a-f]{8,32}\x3e`)
 )
+
+const maxVaultEntries = 16384
 
 // ExternalKV allows PIIVault to replicate masked tokens into the Stage 4 Hybrid L1/L2 State Store.
 type ExternalKV interface {
@@ -30,7 +32,9 @@ type ExternalKV interface {
 }
 
 type vaultEntry struct {
+	sessionID     string
 	originalValue string
+	isSecret      bool
 	expiresAt     time.Time
 }
 
@@ -55,10 +59,18 @@ func (v *PIIVault) SetExternalStore(store ExternalKV) {
 	v.mu.Unlock()
 }
 
-// MaskText replaces configured PII and secret entities with reversible tokens.
+// MaskText replaces configured PII and secret entities with reversible tokens under the default session scope.
 func (v *PIIVault) MaskText(input string, cfg config.PIIVaultConfig, redactOnly bool) (string, []string, int) {
+	return v.MaskTextWithSession("default_session", input, cfg, redactOnly)
+}
+
+// MaskTextWithSession replaces configured PII and secret entities with 128-bit session-bound tokens.
+func (v *PIIVault) MaskTextWithSession(sessionID, input string, cfg config.PIIVaultConfig, redactOnly bool) (string, []string, int) {
 	if !cfg.Enabled || input == "" {
 		return input, nil, 0
+	}
+	if sessionID == "" {
+		sessionID = "default_session"
 	}
 
 	ttl := time.Duration(cfg.TTLSeconds) * time.Second
@@ -83,7 +95,7 @@ func (v *PIIVault) MaskText(input string, cfg config.PIIVaultConfig, redactOnly 
 			if redactOnly {
 				return match
 			}
-			token, warnCode := v.storeValue(label, match, ttl)
+			token, warnCode := v.storeValue(sessionID, label, match, isSecret, ttl)
 			if warnCode != "" && !slices.Contains(extraCodes, warnCode) {
 				extraCodes = append(extraCodes, warnCode)
 			}
@@ -125,10 +137,18 @@ func (v *PIIVault) MaskText(input string, cfg config.PIIVaultConfig, redactOnly 
 	return out, codes, maskedCount
 }
 
-// RestoreText replaces any active tokens in the model output with their original values.
+// RestoreText replaces any active tokens in the model output belonging to the default session.
 func (v *PIIVault) RestoreText(output string) string {
+	return v.RestoreTextWithSession("default_session", output)
+}
+
+// RestoreTextWithSession replaces active tokens in the model output ONLY if they belong to the given sessionID.
+func (v *PIIVault) RestoreTextWithSession(sessionID, output string) string {
 	if output == "" {
 		return ""
+	}
+	if sessionID == "" {
+		sessionID = "default_session"
 	}
 	now := time.Now()
 	return reVaultToken.ReplaceAllStringFunc(output, func(token string) string {
@@ -138,43 +158,84 @@ func (v *PIIVault) RestoreText(output string) string {
 		v.mu.RUnlock()
 
 		if exists && now.Before(entry.expiresAt) {
+			if entry.sessionID != sessionID {
+				return token
+			}
 			return entry.originalValue
 		}
 
 		if ext != nil {
 			if val, _, err := ext.Get(token); err == nil && val != "" {
-				return val
+				if ownerSess, rawVal, ok := splitSessionBoundValue(val); ok {
+					if ownerSess == sessionID {
+						return rawVal
+					}
+					return token
+				}
 			}
 		}
 		return token
 	})
 }
 
-func (v *PIIVault) storeValue(label, rawValue string, ttl time.Duration) (string, string) {
-	var randBytes [4]byte
-	_, _ = rand.Read(randBytes[:])
-	token := fmt.Sprintf("\x3cJG_PII_%s_%s\x3e", label, hex.EncodeToString(randBytes[:]))
-
+func (v *PIIVault) storeValue(sessionID, label, rawValue string, isSecret bool, ttl time.Duration) (string, string) {
 	v.mu.Lock()
-	if len(v.entries) > 4096 {
-		now := time.Now()
+	var token string
+	for range 8 {
+		var randBytes [16]byte
+		_, _ = rand.Read(randBytes[:])
+		candidate := fmt.Sprintf("\x3cJG_PII_%s_%s\x3e", label, hex.EncodeToString(randBytes[:]))
+		if _, collision := v.entries[candidate]; !collision {
+			token = candidate
+			break
+		}
+	}
+
+	now := time.Now()
+	if len(v.entries) >= 4096 {
 		for k, e := range v.entries {
 			if now.After(e.expiresAt) {
 				delete(v.entries, k)
 			}
 		}
+		if len(v.entries) >= maxVaultEntries {
+			var oldestKey string
+			var oldestTime time.Time
+			for k, e := range v.entries {
+				if oldestKey == "" || e.expiresAt.Before(oldestTime) {
+					oldestKey = k
+					oldestTime = e.expiresAt
+				}
+			}
+			if oldestKey != "" {
+				delete(v.entries, oldestKey)
+			}
+		}
 	}
+
 	v.entries[token] = vaultEntry{
+		sessionID:     sessionID,
 		originalValue: rawValue,
-		expiresAt:     time.Now().Add(ttl),
+		isSecret:      isSecret,
+		expiresAt:     now.Add(ttl),
 	}
 	ext := v.extStore
 	v.mu.Unlock()
 
 	warnCode := ""
 	if ext != nil {
-		warnCode, _ = ext.Set(token, rawValue, ttl)
+		boundVal := sessionID + "\x00" + rawValue
+		warnCode, _ = ext.Set(token, boundVal, ttl)
 	}
 
 	return token, warnCode
+}
+
+func splitSessionBoundValue(stored string) (string, string, bool) {
+	for i := 0; i < len(stored); i++ {
+		if stored[i] == 0 {
+			return stored[:i], stored[i+1:], true
+		}
+	}
+	return "default_session", stored, true
 }

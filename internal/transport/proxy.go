@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -31,6 +32,7 @@ import (
 type ctxInspectionKey struct{}
 type ctxInboundLatencyUsKey struct{}
 type ctxUpstreamStartTimeKey struct{}
+type ctxConfigSnapKey struct{}
 
 // GatewayServer manages the multi-transport listeners, telemetry, and the low-latency reverse proxy.
 type GatewayServer struct {
@@ -106,16 +108,32 @@ func NewGatewayServer(cfgMgr *config.Manager, logger *slog.Logger) (*GatewayServ
 
 	rp := &httputil.ReverseProxy{
 		Rewrite: func(pr *httputil.ProxyRequest) {
-			pr.SetURL(targetURL)
-			pr.Out.Host = targetURL.Host
+			activeTarget := targetURL
+			if reqCfg, ok := pr.In.Context().Value(ctxConfigSnapKey{}).(*config.Config); ok && reqCfg != nil {
+				if parsed, uErr := url.Parse(reqCfg.Network.Egress.UpstreamURL); uErr == nil && parsed.Host != "" {
+					activeTarget = parsed
+				}
+			} else if latest := cfgMgr.Get(); latest != nil {
+				if parsed, uErr := url.Parse(latest.Network.Egress.UpstreamURL); uErr == nil && parsed.Host != "" {
+					activeTarget = parsed
+				}
+			}
+			pr.SetURL(activeTarget)
+			pr.Out.Host = activeTarget.Host
 		},
 		Transport:     customTransport,
 		FlushInterval: -1, // Immediate token-by-token flush for SSE streaming
 		BufferPool:    bufPool,
 		ModifyResponse: func(resp *http.Response) error {
 			outboundStart := time.Now()
-			activeCfg := cfgMgr.Get()
+			activeCfg, ok := resp.Request.Context().Value(ctxConfigSnapKey{}).(*config.Config)
+			if !ok || activeCfg == nil {
+				activeCfg = cfgMgr.Get()
+			}
 			inboundRes, _ := resp.Request.Context().Value(ctxInspectionKey{}).(guards.InspectionResult)
+			if inboundRes.SessionID == "" {
+				inboundRes.SessionID = extractSessionID(resp.Request)
+			}
 			inboundUs, _ := resp.Request.Context().Value(ctxInboundLatencyUsKey{}).(int64)
 
 			if upstreamStart, ok := resp.Request.Context().Value(ctxUpstreamStartTimeKey{}).(time.Time); ok {
@@ -159,17 +177,31 @@ func NewGatewayServer(cfgMgr *config.Manager, logger *slog.Logger) (*GatewayServ
 					}
 				}
 
-				metrics.RecordRequest(status, inboundRes.Codes, inboundRes.PrunedTools, gatewayUs)
-				resp.Body = stream.NewSSEInspector(resp.Body, activeCfg, guardEngine.Vault(), inboundRes, resp.Trailer)
+				sseInsp := stream.NewSSEInspector(resp.Body, activeCfg, guardEngine.Vault(), inboundRes, resp.Trailer)
+				reqPath := resp.Request.URL.Path
+				sseInsp.SetOnComplete(func(finalStatus, finalSeverity string, finalCodes []string, finalPruned int) {
+					metrics.RecordRequest(finalStatus, finalCodes, finalPruned, gatewayUs)
+					if len(finalCodes) > 0 {
+						webhooks.Enqueue(telemetry.WebhookEvent{
+							Status:      finalStatus,
+							Severity:    finalSeverity,
+							Codes:       finalCodes,
+							Path:        reqPath,
+							PrunedTools: finalPruned,
+						}, activeCfg.Telemetry.Webhooks)
+					}
+				})
+				resp.Body = sseInsp
 				return nil
 			}
 
 			if resp.Body != nil {
-				rawResp, err := io.ReadAll(resp.Body)
+				maxRespBytes := max(int64(10), activeCfg.Network.Ingress.HTTP.MaxPayloadMB) * 1024 * 1024
+				rawResp, err := io.ReadAll(io.LimitReader(resp.Body, maxRespBytes))
 				_ = resp.Body.Close()
 				if err == nil {
+					sessionID := inboundRes.SessionID
 					if activeCfg.Network.MCP.Enabled && mcp.IsJSONRPCPayload(rawResp) {
-						sessionID := extractSessionID(resp.Request)
 						mcpRes := mcpInspector.InspectPayload(rawResp, sessionID, "", activeCfg)
 						for _, c := range mcpRes.Codes {
 							if !slices.Contains(inboundRes.Codes, c) {
@@ -177,6 +209,8 @@ func NewGatewayServer(cfgMgr *config.Manager, logger *slog.Logger) (*GatewayServ
 							}
 						}
 						rawResp = mcpRes.ModifiedBody
+					} else if activeCfg.Whitelist.CircuitBreaker.MaxIdenticalToolCalls > 0 {
+						rawResp = filterLLMResponseToolLoops(rawResp, sessionID, circuitBreaker, activeCfg, &inboundRes)
 					}
 
 					outRes := guardEngine.SanitizeOutputJSON(rawResp, inboundRes, activeCfg)
@@ -333,6 +367,7 @@ func (s *GatewayServer) Handler() http.Handler {
 				mcpRes := s.mcpInspector.InspectPayload(rawBody, sessionID, mcpSrv, cfg)
 				res = guards.InspectionResult{
 					ModifiedBody: mcpRes.ModifiedBody,
+					SessionID:    sessionID,
 					Status:       mcpRes.Status,
 					Severity:     mcpRes.Severity,
 					Codes:        mcpRes.Codes,
@@ -341,7 +376,7 @@ func (s *GatewayServer) Handler() http.Handler {
 				}
 			} else {
 				// Route 2: Standard LLM Chat / Agent Completions Traffic
-				res = s.guardEngine.InspectJSONPayload(rawBody, cfg)
+				res = s.guardEngine.InspectJSONPayloadWithSession(rawBody, sessionID, cfg)
 			}
 
 			// Merge any sandbox Fail-Open warning codes (JG-EXT-601)
@@ -364,13 +399,17 @@ func (s *GatewayServer) Handler() http.Handler {
 				if !slices.Contains(res.Codes, "JG-CFG-202") {
 					res.Codes = append(res.Codes, "JG-CFG-202")
 				}
-				if res.Status == "CLEAN" {
-					if cfg.Core.Mode == "shadow" {
-						res.Status = "SHADOW_FLAGGED"
-					} else {
-						res.Status = "SANITIZED"
-					}
+				if res.Severity == "" || res.Severity == "NONE" {
 					res.Severity = "CONFIG_WARNING"
+				}
+				if cfg.Core.Mode == "shadow" {
+					if res.Status == "CLEAN" {
+						res.Status = "SHADOW_FLAGGED"
+					}
+				} else {
+					// Active enforcement: halt upstream consumption when session token budget is exceeded
+					res.Status = "BLOCKED"
+					res.Blocked = true
 				}
 			}
 
@@ -402,8 +441,12 @@ func (s *GatewayServer) Handler() http.Handler {
 					w.Header().Set("X-JaguarGate-Latency-Us", strconv.FormatInt(inboundLatencyUs, 10))
 				}
 				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(http.StatusForbidden)
-				_, _ = fmt.Fprintf(w, `{"error":{"message":"Request blocked by JaguarGate strict policy","codes":%q}}`, strings.Join(res.Codes, ","))
+				statusCode := http.StatusForbidden
+				if slices.Contains(res.Codes, "JG-CFG-202") && res.Severity == "CONFIG_WARNING" {
+					statusCode = http.StatusTooManyRequests
+				}
+				w.WriteHeader(statusCode)
+				_, _ = fmt.Fprintf(w, `{"error":{"message":"Request blocked by JaguarGate policy","codes":%q}}`, strings.Join(res.Codes, ","))
 				return
 			}
 
@@ -415,7 +458,8 @@ func (s *GatewayServer) Handler() http.Handler {
 			inboundLatencyUs = max(1, time.Since(inboundStart).Microseconds())
 		}
 
-		ctx := context.WithValue(r.Context(), ctxInboundLatencyUsKey{}, inboundLatencyUs)
+		ctx := context.WithValue(r.Context(), ctxConfigSnapKey{}, cfg)
+		ctx = context.WithValue(ctx, ctxInboundLatencyUsKey{}, inboundLatencyUs)
 		ctx = context.WithValue(ctx, ctxUpstreamStartTimeKey{}, time.Now())
 		r = r.WithContext(ctx)
 
@@ -423,6 +467,58 @@ func (s *GatewayServer) Handler() http.Handler {
 	})
 
 	return mux
+}
+
+func filterLLMResponseToolLoops(rawResp []byte, sessionID string, cb *state.CircuitBreaker, cfg *config.Config, inboundRes *guards.InspectionResult) []byte {
+	if len(rawResp) == 0 || cb == nil {
+		return rawResp
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(rawResp, &payload); err != nil {
+		return rawResp
+	}
+	isShadow := cfg.Core.Mode == "shadow"
+	modified := false
+
+	if choices, ok := payload["choices"].([]any); ok {
+		for i, chItem := range choices {
+			chMap, ok := chItem.(map[string]any)
+			if !ok {
+				continue
+			}
+			if msgMap, ok := chMap["message"].(map[string]any); ok {
+				if rawTools, ok := msgMap["tool_calls"].([]any); ok && len(rawTools) > 0 {
+					kept, codes, pruned := cb.FilterLoopingToolCalls(sessionID, rawTools, cfg.Whitelist.CircuitBreaker, isShadow)
+					inboundRes.PrunedTools += pruned
+					for _, c := range codes {
+						if !slices.Contains(inboundRes.Codes, c) {
+							inboundRes.Codes = append(inboundRes.Codes, c)
+						}
+					}
+					if !isShadow && pruned > 0 {
+						modified = true
+						if len(kept) > 0 {
+							msgMap["tool_calls"] = kept
+						} else {
+							delete(msgMap, "tool_calls")
+							if chMap["finish_reason"] == "tool_calls" {
+								chMap["finish_reason"] = "stop"
+							}
+						}
+						chMap["message"] = msgMap
+						choices[i] = chMap
+					}
+				}
+			}
+		}
+	}
+
+	if modified {
+		if updated, err := json.Marshal(payload); err == nil {
+			return updated
+		}
+	}
+	return rawResp
 }
 
 // Start launches the configured HTTP, Unix Domain Socket, RPC, and Prometheus Metrics listeners concurrently.

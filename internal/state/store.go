@@ -6,6 +6,7 @@ import (
 	"crypto/cipher"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -21,9 +22,12 @@ import (
 	"github.com/andrewbraga1/jaguargate/internal/config"
 )
 
+const maxL1Entries = 16384
+
 var (
 	ErrKeyNotFound      = errors.New("key not found or expired")
 	ErrRedisUnavailable = errors.New("redis state store unreachable")
+	ErrDecryptionFailed = errors.New("state store AES-256-GCM decryption failed")
 )
 
 type memItem struct {
@@ -38,7 +42,9 @@ type HybridStore struct {
 	l1        map[string]memItem
 	driver    string
 	redisAddr string
+	redisUser string
 	redisPass string
+	redisTLS  bool
 	failOpen  bool
 	aead      cipher.AEAD
 }
@@ -74,9 +80,11 @@ func NewHybridStore(cfg config.StateStoreConfig) (*HybridStore, error) {
 	}
 
 	if s.driver == "redis" && cfg.RedisURL != "" {
-		addr, pass := parseRedisURL(cfg.RedisURL)
+		addr, user, pass, useTLS := parseRedisURL(cfg.RedisURL)
 		s.redisAddr = addr
+		s.redisUser = user
 		s.redisPass = pass
+		s.redisTLS = useTLS
 	}
 
 	return s, nil
@@ -91,9 +99,10 @@ func (s *HybridStore) Set(key, value string, ttl time.Duration) (string, error) 
 	storedVal := value
 	if s.aead != nil {
 		enc, err := s.Encrypt(value)
-		if err == nil {
-			storedVal = enc
+		if err != nil {
+			return "", err
 		}
+		storedVal = enc
 	}
 
 	// Always write to L1 local cache for sub-microsecond local reads
@@ -118,13 +127,15 @@ func (s *HybridStore) Set(key, value string, ttl time.Duration) (string, error) 
 }
 
 // Get retrieves and decrypts a key. Checks L1 first, then L2 Redis if configured.
+// Never returns unauthenticated/corrupted ciphertext on AES-GCM failure (fail-closed cryptography).
 func (s *HybridStore) Get(key string) (string, string, error) {
 	if raw, ok := s.getL1(key); ok {
 		if s.aead != nil {
 			dec, err := s.Decrypt(raw)
-			if err == nil {
-				return dec, "", nil
+			if err != nil {
+				return "", "", fmt.Errorf("%w: %v", ErrDecryptionFailed, err)
 			}
+			return dec, "", nil
 		}
 		return raw, "", nil
 	}
@@ -147,15 +158,15 @@ func (s *HybridStore) Get(key string) (string, string, error) {
 			return "", "JG-EXT-602", err
 		}
 
-		// Populate L1 cache for subsequent hits
-		s.setL1(key, raw, 60*time.Second)
-
 		if s.aead != nil {
 			dec, decErr := s.Decrypt(raw)
-			if decErr == nil {
-				return dec, "", nil
+			if decErr != nil {
+				return "", "", fmt.Errorf("%w: %v", ErrDecryptionFailed, decErr)
 			}
+			s.setL1(key, raw, 60*time.Second)
+			return dec, "", nil
 		}
+		s.setL1(key, raw, 60*time.Second)
 		return raw, "", nil
 	}
 
@@ -198,17 +209,30 @@ func (s *HybridStore) Decrypt(encoded string) (string, error) {
 
 func (s *HybridStore) setL1(key, val string, ttl time.Duration) {
 	s.mu.Lock()
-	if len(s.l1) > 8192 {
-		now := time.Now()
+	now := time.Now()
+	if len(s.l1) >= 8192 {
 		for k, v := range s.l1 {
 			if now.After(v.expiresAt) {
 				delete(s.l1, k)
 			}
 		}
+		if len(s.l1) >= maxL1Entries {
+			var oldestKey string
+			var oldestTime time.Time
+			for k, v := range s.l1 {
+				if oldestKey == "" || v.expiresAt.Before(oldestTime) {
+					oldestKey = k
+					oldestTime = v.expiresAt
+				}
+			}
+			if oldestKey != "" {
+				delete(s.l1, oldestKey)
+			}
+		}
 	}
 	s.l1[key] = memItem{
 		val:       val,
-		expiresAt: time.Now().Add(ttl),
+		expiresAt: now.Add(ttl),
 	}
 	s.mu.Unlock()
 }
@@ -233,20 +257,36 @@ func newAES256GCM(secret string) (cipher.AEAD, error) {
 	return cipher.NewGCM(block)
 }
 
-func parseRedisURL(rawURL string) (string, string) {
+func parseRedisURL(rawURL string) (string, string, string, bool) {
 	if !strings.Contains(rawURL, "://") {
-		return rawURL, ""
+		return rawURL, "", "", false
 	}
 	u, err := url.Parse(rawURL)
 	if err != nil {
-		return rawURL, ""
+		return rawURL, "", "", false
 	}
-	pass, _ := u.User.Password()
+	user := ""
+	pass := ""
+	if u.User != nil {
+		user = u.User.Username()
+		pass, _ = u.User.Password()
+	}
 	host := u.Host
 	if !strings.Contains(host, ":") {
 		host += ":6379"
 	}
-	return host, pass
+	useTLS := strings.EqualFold(u.Scheme, "rediss")
+	return host, user, pass, useTLS
+}
+
+func (s *HybridStore) dialRedis() (net.Conn, error) {
+	dialer := &net.Dialer{Timeout: 25 * time.Millisecond}
+	if s.redisTLS {
+		return tls.DialWithDialer(dialer, "tcp", s.redisAddr, &tls.Config{
+			MinVersion: tls.VersionTLS12,
+		})
+	}
+	return dialer.Dial("tcp", s.redisAddr)
 }
 
 // Zero-dependency Redis Serialization Protocol (RESP) client with 25ms strict timeout.
@@ -254,7 +294,7 @@ func (s *HybridStore) redisSetEx(key, val string, ttlSec int) error {
 	if ttlSec <= 0 {
 		ttlSec = 60
 	}
-	conn, err := net.DialTimeout("tcp", s.redisAddr, 25*time.Millisecond)
+	conn, err := s.dialRedis()
 	if err != nil {
 		return err
 	}
@@ -263,8 +303,14 @@ func (s *HybridStore) redisSetEx(key, val string, ttlSec int) error {
 
 	reader := bufio.NewReader(conn)
 	if s.redisPass != "" {
-		if err := writeRESPCommand(conn, "AUTH", s.redisPass); err != nil {
-			return err
+		var authErr error
+		if s.redisUser != "" {
+			authErr = writeRESPCommand(conn, "AUTH", s.redisUser, s.redisPass)
+		} else {
+			authErr = writeRESPCommand(conn, "AUTH", s.redisPass)
+		}
+		if authErr != nil {
+			return authErr
 		}
 		if _, err := readRESPReply(reader); err != nil {
 			return err
@@ -279,7 +325,7 @@ func (s *HybridStore) redisSetEx(key, val string, ttlSec int) error {
 }
 
 func (s *HybridStore) redisGet(key string) (string, error) {
-	conn, err := net.DialTimeout("tcp", s.redisAddr, 25*time.Millisecond)
+	conn, err := s.dialRedis()
 	if err != nil {
 		return "", err
 	}
@@ -288,8 +334,14 @@ func (s *HybridStore) redisGet(key string) (string, error) {
 
 	reader := bufio.NewReader(conn)
 	if s.redisPass != "" {
-		if err := writeRESPCommand(conn, "AUTH", s.redisPass); err != nil {
-			return "", err
+		var authErr error
+		if s.redisUser != "" {
+			authErr = writeRESPCommand(conn, "AUTH", s.redisUser, s.redisPass)
+		} else {
+			authErr = writeRESPCommand(conn, "AUTH", s.redisPass)
+		}
+		if authErr != nil {
+			return "", authErr
 		}
 		if _, err := readRESPReply(reader); err != nil {
 			return "", err

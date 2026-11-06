@@ -128,7 +128,13 @@ func (d *WebhookDispatcher) deliver(evt WebhookEvent, endpoints []string, hmacKe
 			resp, doErr := d.client.Do(req)
 			if doErr == nil && resp != nil {
 				_ = resp.Body.Close()
-				d.sentCount.Add(1)
+				if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+					d.sentCount.Add(1)
+				} else {
+					d.droppedCount.Add(1)
+				}
+			} else {
+				d.droppedCount.Add(1)
 			}
 		}
 		cancel()

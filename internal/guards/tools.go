@@ -82,10 +82,19 @@ func SanitizeToolCallsSlice(rawTools []any, cfg config.WhitelistConfig, isShadow
 }
 
 // SanitizeOutputText checks a text segment for Canary Token leaks (JG-SEC-501),
-// untrusted Markdown image trackers or scripts (JG-SEC-502), and restores PII tokens.
+// untrusted Markdown image trackers or scripts (JG-SEC-502), and restores PII tokens for the default session.
 func SanitizeOutputText(text, canaryToken string, cfg *config.Config, vault *PIIVault) (string, []string, bool) {
+	return SanitizeOutputTextWithSession("default_session", text, canaryToken, cfg, vault)
+}
+
+// SanitizeOutputTextWithSession checks a text segment for Canary Token leaks (JG-SEC-501),
+// untrusted Markdown image trackers or scripts (JG-SEC-502), and restores PII tokens ONLY for the authorized sessionID.
+func SanitizeOutputTextWithSession(sessionID, text, canaryToken string, cfg *config.Config, vault *PIIVault) (string, []string, bool) {
 	if text == "" {
 		return "", nil, false
+	}
+	if sessionID == "" {
+		sessionID = "default_session"
 	}
 
 	isShadow := cfg.Core.Mode == "shadow"
@@ -138,9 +147,9 @@ func SanitizeOutputText(text, canaryToken string, cfg *config.Config, vault *PII
 		}
 	}
 
-	// 4. Reversible PII Vault Restoration
+	// 4. Reversible PII Vault Restoration (scoped strictly to sessionID)
 	if vault != nil && cfg.Guards.PIIVault.Enabled && cfg.Guards.PIIVault.RestoreOnOutput && !isShadow {
-		working = vault.RestoreText(working)
+		working = vault.RestoreTextWithSession(sessionID, working)
 	}
 
 	return working, codes, false
@@ -148,6 +157,11 @@ func SanitizeOutputText(text, canaryToken string, cfg *config.Config, vault *PII
 
 // SanitizeOutputJSON inspects a complete non-streaming LLM response body (choices[].message.content & tool_calls).
 func (e *Engine) SanitizeOutputJSON(body []byte, inboundRes InspectionResult, cfg *config.Config) OutputInspectionResult {
+	sessionID := inboundRes.SessionID
+	if sessionID == "" {
+		sessionID = "default_session"
+	}
+
 	out := OutputInspectionResult{
 		ModifiedBody: body,
 		Status:       inboundRes.Status,
@@ -166,7 +180,7 @@ func (e *Engine) SanitizeOutputJSON(body []byte, inboundRes InspectionResult, cf
 
 	var payload map[string]any
 	if err := json.Unmarshal(body, &payload); err != nil {
-		cleaned, codes, leaked := SanitizeOutputText(string(body), inboundRes.CanaryToken, cfg, e.vault)
+		cleaned, codes, leaked := SanitizeOutputTextWithSession(sessionID, string(body), inboundRes.CanaryToken, cfg, e.vault)
 		out.CanaryLeaked = leaked
 		for _, c := range codes {
 			out.addOutputCode(c)
@@ -192,7 +206,7 @@ func (e *Engine) SanitizeOutputJSON(body []byte, inboundRes InspectionResult, cf
 			if msgMap, ok := chMap["message"].(map[string]any); ok {
 				// 1. Inspect assistant text content
 				if contentStr, ok := msgMap["content"].(string); ok && contentStr != "" {
-					cleaned, codes, leaked := SanitizeOutputText(contentStr, inboundRes.CanaryToken, cfg, e.vault)
+					cleaned, codes, leaked := SanitizeOutputTextWithSession(sessionID, contentStr, inboundRes.CanaryToken, cfg, e.vault)
 					if leaked {
 						out.CanaryLeaked = true
 					}
@@ -212,7 +226,7 @@ func (e *Engine) SanitizeOutputJSON(body []byte, inboundRes InspectionResult, cf
 					for _, c := range toolCodes {
 						out.addOutputCode(c)
 					}
-					if !isShadow && pruned > 0 {
+					if !isShadow && (pruned > 0 || len(toolCodes) > 0) {
 						modified = true
 						if len(keptTools) > 0 {
 							msgMap["tool_calls"] = keptTools
@@ -242,7 +256,7 @@ func (e *Engine) SanitizeOutputJSON(body []byte, inboundRes InspectionResult, cf
 	// Also support Ollama native "/api/chat" top-level "message" object
 	if msgMap, ok := payload["message"].(map[string]any); ok {
 		if contentStr, ok := msgMap["content"].(string); ok && contentStr != "" {
-			cleaned, codes, leaked := SanitizeOutputText(contentStr, inboundRes.CanaryToken, cfg, e.vault)
+			cleaned, codes, leaked := SanitizeOutputTextWithSession(sessionID, contentStr, inboundRes.CanaryToken, cfg, e.vault)
 			if leaked {
 				out.CanaryLeaked = true
 			}
@@ -260,7 +274,7 @@ func (e *Engine) SanitizeOutputJSON(body []byte, inboundRes InspectionResult, cf
 			for _, c := range toolCodes {
 				out.addOutputCode(c)
 			}
-			if !isShadow && pruned > 0 {
+			if !isShadow && (pruned > 0 || len(toolCodes) > 0) {
 				modified = true
 				if len(keptTools) > 0 {
 					msgMap["tool_calls"] = keptTools

@@ -13,6 +13,8 @@ import (
 	"github.com/andrewbraga1/jaguargate/internal/config"
 )
 
+const maxCircuitBreakerEntries = 16384
+
 type loopCounter struct {
 	count     int
 	expiresAt time.Time
@@ -23,7 +25,7 @@ type tokenCounter struct {
 	expiresAt time.Time
 }
 
-// CircuitBreaker tracks agent tool-call loops (JG-CFG-201) and per-session token budgets (JG-CFG-202) in O(1) time.
+// CircuitBreaker tracks agent tool-call loops (JG-CFG-201) and per-session token budgets (JG-CFG-202).
 type CircuitBreaker struct {
 	mu          sync.Mutex
 	toolHistory map[string]loopCounter
@@ -58,6 +60,27 @@ func (cb *CircuitBreaker) CheckAndTrackTokens(sessionID string, payloadBytes int
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
 
+	if len(cb.tokenUsage) >= 4096 {
+		for k, v := range cb.tokenUsage {
+			if now.After(v.expiresAt) {
+				delete(cb.tokenUsage, k)
+			}
+		}
+		if len(cb.tokenUsage) >= maxCircuitBreakerEntries {
+			var oldestKey string
+			var oldestTime time.Time
+			for k, v := range cb.tokenUsage {
+				if oldestKey == "" || v.expiresAt.Before(oldestTime) {
+					oldestKey = k
+					oldestTime = v.expiresAt
+				}
+			}
+			if oldestKey != "" {
+				delete(cb.tokenUsage, oldestKey)
+			}
+		}
+	}
+
 	entry, exists := cb.tokenUsage[sessionID]
 	if !exists || now.After(entry.expiresAt) {
 		entry = tokenCounter{
@@ -73,7 +96,7 @@ func (cb *CircuitBreaker) CheckAndTrackTokens(sessionID string, payloadBytes int
 }
 
 // CheckToolCallLoop computes a canonical SHA-256 fingerprint of (sessionID + toolName + canonicalArgs)
-// and dynamically checks if identical calls exceed cfg.MaxIdenticalToolCalls within cfg.WindowSeconds in O(1) time.
+// and dynamically checks if identical calls exceed cfg.MaxIdenticalToolCalls within cfg.WindowSeconds.
 func (cb *CircuitBreaker) CheckToolCallLoop(sessionID, toolName, rawArgs string, cfg config.CircuitBreakerConfig) bool {
 	if cfg.MaxIdenticalToolCalls <= 0 || toolName == "" {
 		return false
@@ -92,6 +115,27 @@ func (cb *CircuitBreaker) CheckToolCallLoop(sessionID, toolName, rawArgs string,
 
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
+
+	if len(cb.toolHistory) >= 4096 {
+		for k, v := range cb.toolHistory {
+			if now.After(v.expiresAt) {
+				delete(cb.toolHistory, k)
+			}
+		}
+		if len(cb.toolHistory) >= maxCircuitBreakerEntries {
+			var oldestKey string
+			var oldestTime time.Time
+			for k, v := range cb.toolHistory {
+				if oldestKey == "" || v.expiresAt.Before(oldestTime) {
+					oldestKey = k
+					oldestTime = v.expiresAt
+				}
+			}
+			if oldestKey != "" {
+				delete(cb.toolHistory, oldestKey)
+			}
+		}
+	}
 
 	rec, exists := cb.toolHistory[hashKey]
 	if !exists || now.After(rec.expiresAt) {
@@ -155,9 +199,16 @@ func extractNameAndArgs(toolMap map[string]any) (string, string) {
 func computeToolCallFingerprint(sessionID, toolName, rawArgs string) string {
 	canonicalArgs := strings.TrimSpace(rawArgs)
 	if len(canonicalArgs) > 0 && (canonicalArgs[0] == '{' || canonicalArgs[0] == '[') {
-		var compactBuf bytes.Buffer
-		if err := json.Compact(&compactBuf, []byte(canonicalArgs)); err == nil {
-			canonicalArgs = compactBuf.String()
+		var parsed any
+		if err := json.Unmarshal([]byte(canonicalArgs), &parsed); err == nil {
+			if normalized, mErr := json.Marshal(parsed); mErr == nil {
+				canonicalArgs = string(normalized)
+			}
+		} else {
+			var compactBuf bytes.Buffer
+			if err := json.Compact(&compactBuf, []byte(canonicalArgs)); err == nil {
+				canonicalArgs = compactBuf.String()
+			}
 		}
 	}
 

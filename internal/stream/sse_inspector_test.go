@@ -60,6 +60,92 @@ func TestSelectiveToolCallFirewallPruning(t *testing.T) {
 	}
 }
 
+func TestIsolatedDomainSanitizationWithoutToolPruning(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.ApplyPreset()
+	cfg.Whitelist.EnforceToolWhitelist = true
+	cfg.Whitelist.AllowedTools = []string{"search_knowledge_base"}
+	cfg.Whitelist.AllowedDomains = []string{"*.yourdomain.com"}
+
+	engine := guards.NewEngine(guards.NewPIIVault())
+
+	// Single ALLOWED tool call containing a DISALLOWED domain (pruned == 0, but JG-CFG-103 triggered)
+	llmResponse := `{"choices":[{"index":0,"finish_reason":"tool_calls","message":{"role":"assistant","tool_calls":[{"id":"call_1","type":"function","function":{"name":"search_knowledge_base","arguments":"{\"url\":\"https://evil-exfil.com/steal\"}"}}]}}]}`
+
+	res := engine.SanitizeOutputJSON([]byte(llmResponse), guards.InspectionResult{}, &cfg)
+	if res.PrunedTools != 0 {
+		t.Fatalf("expected 0 pruned tools, got %d", res.PrunedTools)
+	}
+	if !slices.Contains(res.Codes, "JG-CFG-103") {
+		t.Fatalf("expected JG-CFG-103 flag code, got %v", res.Codes)
+	}
+	if strings.Contains(string(res.ModifiedBody), "evil-exfil.com") {
+		t.Fatalf("SECURITY FAILURE: disallowed domain survived in ModifiedBody when pruned==0: %s", string(res.ModifiedBody))
+	}
+}
+
+func TestSSEOneAndTwoCharPrefixSplitsAndAnthropicFormat(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.ApplyPreset()
+	cfg.Whitelist.AllowedDomains = []string{"*.trusted.com"}
+
+	canary := "jg_cnry_112233445566"
+
+	// 1. Split Canary right after 1st char ("j") and 2nd char ("g"), and use Anthropic delta.text SSE format
+	sseStream := strings.Join([]string{
+		`data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"Início j"}}`,
+		"",
+		`data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"g"}}`,
+		"",
+		`data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"_cnry_112233445566 EXFIL"}}`,
+		"",
+		`data: [DONE]`,
+		"",
+	}, "\n")
+
+	trailers := make(http.Header)
+	inspector := NewSSEInspector(
+		io.NopCloser(strings.NewReader(sseStream)),
+		&cfg,
+		guards.NewPIIVault(),
+		guards.InspectionResult{CanaryToken: canary, Status: "CLEAN", Severity: "NONE"},
+		trailers,
+	)
+
+	outBytes, err := io.ReadAll(inspector)
+	if err != nil {
+		t.Fatal(err)
+	}
+	outStr := string(outBytes)
+	if strings.Contains(outStr, "EXFIL") || strings.Contains(outStr, "112233445566") {
+		t.Fatalf("SECURITY FAILURE: 1-char/2-char split Canary leaked in Anthropic SSE stream:\n%s", outStr)
+	}
+	if trailers.Get("X-JaguarGate-Status") != "BLOCKED" {
+		t.Errorf("expected BLOCKED status trailer, got %q", trailers.Get("X-JaguarGate-Status"))
+	}
+
+	// 2. Split Markdown image right between "!" and "[spy](http://evil.org/x.png)"
+	mdStream := strings.Join([]string{
+		`data: {"choices":[{"index":0,"delta":{"content":"Olhe !"}}]}`,
+		"",
+		`data: {"choices":[{"index":0,"delta":{"content":"[spy](http://evil.org/x.png) fim"}}]}`,
+		"",
+		`data: [DONE]`,
+		"",
+	}, "\n")
+	mdInsp := NewSSEInspector(
+		io.NopCloser(strings.NewReader(mdStream)),
+		&cfg,
+		guards.NewPIIVault(),
+		guards.InspectionResult{Status: "CLEAN", Severity: "NONE"},
+		make(http.Header),
+	)
+	mdOut, _ := io.ReadAll(mdInsp)
+	if strings.Contains(string(mdOut), "evil.org") {
+		t.Fatalf("SECURITY FAILURE: Markdown image split after '!' bypassed SSE filter:\n%s", string(mdOut))
+	}
+}
+
 func TestChaoticSplitSSEStreamPIIRestoreAndMarkdownSanitizer(t *testing.T) {
 	cfg := config.DefaultConfig()
 	cfg.ApplyPreset()

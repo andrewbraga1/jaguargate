@@ -49,7 +49,7 @@ func main() {
 	case "doctor":
 		runDoctor(*cfgPath, *langFlag)
 
-	case "pounce":
+	case "pounce", "bote":
 		cfg, _ := config.LoadFromFile(*cfgPath)
 		activeLang := resolveLang(*langFlag, cfg)
 		report := redteam.RunPounceSuite(activeLang)
@@ -58,7 +58,7 @@ func main() {
 			os.Exit(1)
 		}
 
-	case "serve":
+	case "serve", "start":
 		runServe(*cfgPath, *langFlag)
 
 	default:
@@ -85,7 +85,7 @@ func runServe(cfgPath, langOverride string) {
 		snap.Telemetry.Logging.Level,
 		strings.EqualFold(snap.Telemetry.Logging.Format, "json"),
 		snap.Telemetry.Logging.ZeroTrustPrompts,
-		snap.Core.Language,
+		"***[JG-REDACTED]***",
 	)
 
 	_ = mgr.StartHotReload(

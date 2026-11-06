@@ -33,13 +33,14 @@ var rePromptInjection = regexp.MustCompile(
 // InspectionResult summarizes all OWASP & Whitelist actions taken on an incoming request.
 type InspectionResult struct {
 	ModifiedBody []byte
+	SessionID    string   // Session scope for reversible PII Vault isolation
 	Status       string   // "CLEAN" | "SANITIZED" | "SHADOW_FLAGGED" | "BLOCKED"
 	Severity     string   // "NONE" | "CONFIG_WARNING" | "INTRUSION_ALERT"
 	Codes        []string // Compact JG-* codes
 	CanaryToken  string   // Per-request Canary Token injected into system prompt
 	MaskedCount  int      // Number of PII/Secret entities masked
 	PrunedTools  int      // Number of unwhitelisted tool definitions/calls surgically omitted
-	Blocked      bool     // True ONLY when mode == "hard_block" and an intrusion occurs
+	Blocked      bool     // True ONLY when mode == "hard_block" and an intrusion/breaker occurs
 }
 
 // Engine executes OWASP Input/Output Defense, Multimodal Hygiene, Spotlighting, Tool Firewall, and PII Vaulting.
@@ -62,8 +63,17 @@ func (e *Engine) Vault() *PIIVault {
 
 // InspectJSONPayload parses an LLM JSON request, enforces OWASP guards & tool whitelists, and returns the resilient result.
 func (e *Engine) InspectJSONPayload(body []byte, cfg *config.Config) InspectionResult {
+	return e.InspectJSONPayloadWithSession(body, "default_session", cfg)
+}
+
+// InspectJSONPayloadWithSession parses an LLM or MCP JSON payload under an isolated sessionID scope.
+func (e *Engine) InspectJSONPayloadWithSession(body []byte, sessionID string, cfg *config.Config) InspectionResult {
+	if sessionID == "" {
+		sessionID = "default_session"
+	}
 	res := InspectionResult{
 		ModifiedBody: body,
+		SessionID:    sessionID,
 		Status:       "CLEAN",
 		Severity:     "NONE",
 	}
@@ -74,7 +84,7 @@ func (e *Engine) InspectJSONPayload(body []byte, cfg *config.Config) InspectionR
 
 	var payload map[string]any
 	if err := json.Unmarshal(body, &payload); err != nil {
-		cleaned, codes, intruded, masked := e.inspectTextSegment(string(body), "user", cfg, &res.CanaryToken)
+		cleaned, codes, intruded, masked := e.inspectTextSegment(sessionID, string(body), "user", cfg, &res.CanaryToken)
 		res.MaskedCount += masked
 		for _, c := range codes {
 			res.addCode(c, intruded)
@@ -88,26 +98,31 @@ func (e *Engine) InspectJSONPayload(body []byte, cfg *config.Config) InspectionR
 
 	modified := false
 	isShadow := cfg.Core.Mode == "shadow"
+	hasStandardLLMFields := false
 
 	// 1. Selective Tool Whitelist on top-level "tools" definition array if present
-	if rawTools, ok := payload["tools"].([]any); ok && cfg.Whitelist.EnforceToolWhitelist {
-		keptTools, toolCodes, pruned := SanitizeToolCallsSlice(rawTools, cfg.Whitelist, isShadow)
-		res.PrunedTools += pruned
-		for _, c := range toolCodes {
-			res.addCode(c, false)
-		}
-		if !isShadow && pruned > 0 {
-			modified = true
-			if len(keptTools) > 0 {
-				payload["tools"] = keptTools
-			} else {
-				delete(payload, "tools")
+	if rawTools, ok := payload["tools"].([]any); ok {
+		hasStandardLLMFields = true
+		if cfg.Whitelist.EnforceToolWhitelist {
+			keptTools, toolCodes, pruned := SanitizeToolCallsSlice(rawTools, cfg.Whitelist, isShadow)
+			res.PrunedTools += pruned
+			for _, c := range toolCodes {
+				res.addCode(c, false)
+			}
+			if !isShadow && (pruned > 0 || len(toolCodes) > 0) {
+				modified = true
+				if len(keptTools) > 0 {
+					payload["tools"] = keptTools
+				} else {
+					delete(payload, "tools")
+				}
 			}
 		}
 	}
 
 	// 2. Inspect standard "messages" array (OpenAI / Ollama / Anthropic / LiteLLM format)
 	if rawMsgs, ok := payload["messages"].([]any); ok {
+		hasStandardLLMFields = true
 		systemFound := false
 		for i, item := range rawMsgs {
 			msgMap, ok := item.(map[string]any)
@@ -126,7 +141,7 @@ func (e *Engine) InspectJSONPayload(body []byte, cfg *config.Config) InspectionR
 				for _, c := range toolCodes {
 					res.addCode(c, false)
 				}
-				if !isShadow && pruned > 0 {
+				if !isShadow && (pruned > 0 || len(toolCodes) > 0) {
 					modified = true
 					if len(keptMsgTools) > 0 {
 						msgMap["tool_calls"] = keptMsgTools
@@ -138,7 +153,7 @@ func (e *Engine) InspectJSONPayload(body []byte, cfg *config.Config) InspectionR
 
 			switch content := msgMap["content"].(type) {
 			case string:
-				cleaned, codes, intruded, masked := e.inspectTextSegment(content, role, cfg, &res.CanaryToken)
+				cleaned, codes, intruded, masked := e.inspectTextSegment(sessionID, content, role, cfg, &res.CanaryToken)
 				res.MaskedCount += masked
 				for _, c := range codes {
 					res.addCode(c, intruded)
@@ -155,7 +170,7 @@ func (e *Engine) InspectJSONPayload(body []byte, cfg *config.Config) InspectionR
 						continue
 					}
 					if txt, ok := partMap["text"].(string); ok {
-						cleaned, codes, intruded, masked := e.inspectTextSegment(txt, role, cfg, &res.CanaryToken)
+						cleaned, codes, intruded, masked := e.inspectTextSegment(sessionID, txt, role, cfg, &res.CanaryToken)
 						res.MaskedCount += masked
 						for _, c := range codes {
 							res.addCode(c, intruded)
@@ -196,13 +211,21 @@ func (e *Engine) InspectJSONPayload(body []byte, cfg *config.Config) InspectionR
 
 	// 3. Support single "prompt" field (Ollama /api/generate or completions endpoint)
 	if promptStr, ok := payload["prompt"].(string); ok {
-		cleaned, codes, intruded, masked := e.inspectTextSegment(promptStr, "user", cfg, &res.CanaryToken)
+		hasStandardLLMFields = true
+		cleaned, codes, intruded, masked := e.inspectTextSegment(sessionID, promptStr, "user", cfg, &res.CanaryToken)
 		res.MaskedCount += masked
 		for _, c := range codes {
 			res.addCode(c, intruded)
 		}
 		if !isShadow && cleaned != promptStr {
 			payload["prompt"] = cleaned
+			modified = true
+		}
+	}
+
+	// 4. Support arbitrary structured JSON objects (e.g., MCP params.arguments or custom agent payloads)
+	if !hasStandardLLMFields {
+		if e.inspectArbitraryJSONMap(payload, sessionID, cfg, &res, 0) {
 			modified = true
 		}
 	}
@@ -218,7 +241,91 @@ func (e *Engine) InspectJSONPayload(body []byte, cfg *config.Config) InspectionR
 	return res
 }
 
-func (e *Engine) inspectTextSegment(text, role string, cfg *config.Config, canaryOut *string) (string, []string, bool, int) {
+const maxJSONInspectionDepth = 8
+
+func (e *Engine) inspectArbitraryJSONMap(m map[string]any, sessionID string, cfg *config.Config, res *InspectionResult, depth int) bool {
+	if depth > maxJSONInspectionDepth {
+		return false
+	}
+	isShadow := cfg.Core.Mode == "shadow"
+	modified := false
+
+	for k, v := range m {
+		switch val := v.(type) {
+		case string:
+			cleaned, codes, intruded, masked := e.inspectTextSegment(sessionID, val, "user", cfg, &res.CanaryToken)
+			res.MaskedCount += masked
+			for _, c := range codes {
+				res.addCode(c, intruded)
+			}
+			if len(cfg.Whitelist.AllowedDomains) > 0 {
+				domCleaned, domViolated := sanitizeDomainsInText(cleaned, cfg.Whitelist.AllowedDomains, isShadow)
+				if domViolated {
+					res.addCode("JG-CFG-103", false)
+					cleaned = domCleaned
+				}
+			}
+			if !isShadow && cleaned != val {
+				m[k] = cleaned
+				modified = true
+			}
+		case map[string]any:
+			if e.inspectArbitraryJSONMap(val, sessionID, cfg, res, depth+1) {
+				m[k] = val
+				modified = true
+			}
+		case []any:
+			if e.inspectArbitraryJSONSlice(val, sessionID, cfg, res, depth+1) {
+				m[k] = val
+				modified = true
+			}
+		}
+	}
+	return modified
+}
+
+func (e *Engine) inspectArbitraryJSONSlice(s []any, sessionID string, cfg *config.Config, res *InspectionResult, depth int) bool {
+	if depth > maxJSONInspectionDepth {
+		return false
+	}
+	isShadow := cfg.Core.Mode == "shadow"
+	modified := false
+
+	for i, item := range s {
+		switch val := item.(type) {
+		case string:
+			cleaned, codes, intruded, masked := e.inspectTextSegment(sessionID, val, "user", cfg, &res.CanaryToken)
+			res.MaskedCount += masked
+			for _, c := range codes {
+				res.addCode(c, intruded)
+			}
+			if len(cfg.Whitelist.AllowedDomains) > 0 {
+				domCleaned, domViolated := sanitizeDomainsInText(cleaned, cfg.Whitelist.AllowedDomains, isShadow)
+				if domViolated {
+					res.addCode("JG-CFG-103", false)
+					cleaned = domCleaned
+				}
+			}
+			if !isShadow && cleaned != val {
+				s[i] = cleaned
+				modified = true
+			}
+		case map[string]any:
+			if e.inspectArbitraryJSONMap(val, sessionID, cfg, res, depth+1) {
+				s[i] = val
+				modified = true
+			}
+		case []any:
+			if e.inspectArbitraryJSONSlice(val, sessionID, cfg, res, depth+1) {
+				s[i] = val
+				modified = true
+			}
+		}
+	}
+	return modified
+}
+
+func (e *Engine) inspectTextSegment(sessionID, text, role string, cfg *config.Config, canaryOut *string) (string, []string, bool, int) {
 	isShadow := cfg.Core.Mode == "shadow"
 	var codes []string
 	intruded := false
@@ -269,8 +376,8 @@ func (e *Engine) inspectTextSegment(text, role string, cfg *config.Config, canar
 		}
 	}
 
-	// 4. Reversible PII & Secrets Vault masking
-	maskedText, piiCodes, maskedCount := e.vault.MaskText(workingText, cfg.Guards.PIIVault, isShadow)
+	// 4. Reversible PII & Secrets Vault masking (bound to sessionID)
+	maskedText, piiCodes, maskedCount := e.vault.MaskTextWithSession(sessionID, workingText, cfg.Guards.PIIVault, isShadow)
 	codes = append(codes, piiCodes...)
 	if !isShadow {
 		workingText = maskedText

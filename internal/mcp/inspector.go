@@ -184,7 +184,7 @@ func (ins *Inspector) inspectSingleRPCObject(rpcObj map[string]any, sessionID st
 				return true, true
 			}
 
-			inspRes := ins.engine.InspectJSONPayload(argsBytes, cfg)
+			inspRes := ins.engine.InspectJSONPayloadWithSession(argsBytes, sessionID, cfg)
 			for _, c := range inspRes.Codes {
 				res.addCode(c, inspRes.Severity == "INTRUSION_ALERT")
 			}
@@ -202,14 +202,14 @@ func (ins *Inspector) inspectSingleRPCObject(rpcObj map[string]any, sessionID st
 	// B. Inspect MCP Response / External Resource Content ("result.content" or "result.contents")
 	if resultObj, ok := rpcObj["result"].(map[string]any); ok && cfg.Network.MCP.SanitizeExternalResources {
 		if contents, ok := resultObj["contents"].([]any); ok {
-			if ins.sanitizeMCPContentArray(contents, cfg, res) {
+			if ins.sanitizeMCPContentArray(contents, sessionID, cfg, res) {
 				resultObj["contents"] = contents
 				rpcObj["result"] = resultObj
 				modified = true
 			}
 		}
 		if content, ok := resultObj["content"].([]any); ok {
-			if ins.sanitizeMCPContentArray(content, cfg, res) {
+			if ins.sanitizeMCPContentArray(content, sessionID, cfg, res) {
 				resultObj["content"] = content
 				rpcObj["result"] = resultObj
 				modified = true
@@ -220,7 +220,7 @@ func (ins *Inspector) inspectSingleRPCObject(rpcObj map[string]any, sessionID st
 	return modified, false
 }
 
-func (ins *Inspector) sanitizeMCPContentArray(items []any, cfg *config.Config, res *MCPInspectionResult) bool {
+func (ins *Inspector) sanitizeMCPContentArray(items []any, sessionID string, cfg *config.Config, res *MCPInspectionResult) bool {
 	isShadow := cfg.Core.Mode == "shadow"
 	modified := false
 
@@ -241,7 +241,7 @@ func (ins *Inspector) sanitizeMCPContentArray(items []any, cfg *config.Config, r
 			},
 		}
 		rawBytes, _ := marshalUnescaped(syntheticPayload)
-		insp := ins.engine.InspectJSONPayload(rawBytes, cfg)
+		insp := ins.engine.InspectJSONPayloadWithSession(rawBytes, sessionID, cfg)
 		for _, c := range insp.Codes {
 			res.addCode(c, insp.Severity == "INTRUSION_ALERT")
 		}

@@ -15,8 +15,9 @@ var (
 	// Standard WebAssembly binary magic header: \x00asm followed by version 1 (\x01\x00\x00\x00)
 	wasmMagicHeader = []byte{0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00}
 
-	ErrInvalidWasmBinary = errors.New("invalid WebAssembly binary header")
-	ErrPluginTimeout     = errors.New("plugin execution exceeded max_execution_time_ms budget")
+	ErrInvalidWasmBinary    = errors.New("invalid WebAssembly binary header")
+	ErrPluginTimeout        = errors.New("plugin execution exceeded max_execution_time_ms budget")
+	ErrWasmRuntimeNotLinked = errors.New("external Wasm bytecode runtime not linked; register a Go policy hook or fail open (JG-EXT-601)")
 )
 
 // PolicyHookFunc represents an isolated custom policy function executed inside the timeout sandbox.
@@ -125,9 +126,13 @@ func (s *Sandbox) runSingleModule(parentCtx context.Context, mod config.WasmModu
 				doneCh <- outcome{err: ErrInvalidWasmBinary}
 				return
 			}
+			// Do not silently pretend the .wasm bytecode was executed if no runtime/hook is bound:
+			// return ErrWasmRuntimeNotLinked so Execute() fails open and emits JG-EXT-601 warning.
+			doneCh <- outcome{err: ErrWasmRuntimeNotLinked}
+			return
 		}
 
-		doneCh <- outcome{data: input, err: nil}
+		doneCh <- outcome{data: input, err: ErrWasmRuntimeNotLinked}
 	}()
 
 	select {

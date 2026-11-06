@@ -46,6 +46,12 @@ func TestHybridStoreAESGCMAndRedisFailOpen(t *testing.T) {
 	if decrypted != "123.456.789-01" {
 		t.Errorf("expected decrypted value '123.456.789-01', got %q", decrypted)
 	}
+
+	// 4. Tamper with ciphertext in L1 cache and verify Get fails closed (never returning corrupted ciphertext)
+	store.setL1("token_tampered", "corrupted_base64_ciphertext", 60*time.Second)
+	if val, _, err := store.Get("token_tampered"); err == nil || val != "" {
+		t.Fatalf("SECURITY FAILURE: corrupted AES-GCM ciphertext did not fail closed (val=%q, err=%v)", val, err)
+	}
 }
 
 func BenchmarkAESGCMSealOpen(b *testing.B) {

@@ -14,7 +14,13 @@ import (
 	"github.com/andrewbraga1/jaguargate/internal/guards"
 )
 
-const piiOpenPrefix = "\x3cJG_PII_"
+const (
+	piiOpenPrefix   = "\x3cJG_PII_"
+	maxSSELineBytes = 1024 * 1024 // 1MB cap on un-newlined SSE buffer to prevent OOM DoS
+)
+
+// StreamCompleteFunc is invoked once when the SSE stream finishes or halts, reporting final telemetry.
+type StreamCompleteFunc func(status, severity string, codes []string, prunedTools int)
 
 // SSEInspector wraps an upstream HTTP response body (io.ReadCloser) to inspect Server-Sent Events
 // in real time using a Rune-Aware UTF-8 Sliding Holdback Window.
@@ -22,8 +28,10 @@ type SSEInspector struct {
 	upstream    io.ReadCloser
 	cfg         *config.Config
 	vault       *guards.PIIVault
+	sessionID   string
 	canaryToken string
 	trailers    http.Header
+	onComplete  StreamCompleteFunc
 
 	rawBuf      bytes.Buffer
 	outBuf      bytes.Buffer
@@ -35,6 +43,7 @@ type SSEInspector struct {
 	prunedTools int
 	halted      bool
 	eofReached  bool
+	reported    bool
 }
 
 // NewSSEInspector creates a streaming SSE inspector wrapping the upstream response body.
@@ -51,10 +60,15 @@ func NewSSEInspector(
 		status = "CLEAN"
 		severity = "NONE"
 	}
+	sessID := inbound.SessionID
+	if sessID == "" {
+		sessID = "default_session"
+	}
 	return &SSEInspector{
 		upstream:    upstream,
 		cfg:         cfg,
 		vault:       vault,
+		sessionID:   sessID,
 		canaryToken: inbound.CanaryToken,
 		trailers:    trailers,
 		codes:       slices.Clone(inbound.Codes),
@@ -62,6 +76,11 @@ func NewSSEInspector(
 		severity:    severity,
 		prunedTools: inbound.PrunedTools,
 	}
+}
+
+// SetOnComplete registers a callback executed once when the SSE stream terminates or is halted.
+func (s *SSEInspector) SetOnComplete(fn StreamCompleteFunc) {
+	s.onComplete = fn
 }
 
 // Read implements io.Reader, processing complete SSE lines and flushing sanitized tokens immediately.
@@ -95,8 +114,9 @@ func (s *SSEInspector) Read(p []byte) (int, error) {
 	return s.outBuf.Read(p)
 }
 
-// Close closes the underlying upstream body.
+// Close closes the underlying upstream body and ensures final telemetry is reported.
 func (s *SSEInspector) Close() error {
+	s.reportCompletion()
 	return s.upstream.Close()
 }
 
@@ -105,7 +125,7 @@ func (s *SSEInspector) processAvailableLines(flushAll bool) {
 		data := s.rawBuf.Bytes()
 		nlIdx := bytes.IndexByte(data, '\n')
 		if nlIdx == -1 {
-			if flushAll && len(data) > 0 {
+			if (flushAll && len(data) > 0) || len(data) >= maxSSELineBytes {
 				line := string(data)
 				s.rawBuf.Reset()
 				s.handleSSELine(line)
@@ -134,7 +154,7 @@ func (s *SSEInspector) handleSSELine(line string) {
 	// Check for stream completion marker: data: [DONE]
 	if payloadStr == "[DONE]" {
 		if s.holdback != "" && !s.halted {
-			cleaned, codes, leaked := guards.SanitizeOutputText(s.holdback, s.canaryToken, s.cfg, s.vault)
+			cleaned, codes, leaked := guards.SanitizeOutputTextWithSession(s.sessionID, s.holdback, s.canaryToken, s.cfg, s.vault)
 			s.holdback = ""
 			for _, c := range codes {
 				s.recordCode(c)
@@ -150,10 +170,12 @@ func (s *SSEInspector) handleSSELine(line string) {
 
 		s.emitWarningEventIfNeeded()
 		s.outBuf.WriteString(line)
+		s.populateTrailers()
+		s.reportCompletion()
 		return
 	}
 
-	// Parse JSON delta chunk (OpenAI / Ollama / LiteLLM SSE format)
+	// Parse JSON delta chunk (OpenAI / Anthropic / Ollama / LiteLLM SSE format)
 	var eventObj map[string]any
 	if err := json.Unmarshal([]byte(payloadStr), &eventObj); err != nil {
 		outText, shouldEmit := s.inspectStreamFragment(payloadStr)
@@ -171,6 +193,7 @@ func (s *SSEInspector) handleSSELine(line string) {
 	isShadow := s.cfg.Core.Mode == "shadow"
 	modified := false
 
+	// 1. OpenAI / LiteLLM / vLLM format: choices[].delta.content & choices[].delta.tool_calls
 	if choices, ok := eventObj["choices"].([]any); ok {
 		for i, chItem := range choices {
 			chMap, ok := chItem.(map[string]any)
@@ -178,7 +201,7 @@ func (s *SSEInspector) handleSSELine(line string) {
 				continue
 			}
 			if deltaMap, ok := chMap["delta"].(map[string]any); ok {
-				// 1. Inspect streaming token text inside delta.content
+				// 1a. Inspect streaming token text inside delta.content
 				if tokenStr, ok := deltaMap["content"].(string); ok && tokenStr != "" {
 					safeText, shouldEmit := s.inspectStreamFragment(tokenStr)
 					if s.halted {
@@ -190,14 +213,14 @@ func (s *SSEInspector) handleSSELine(line string) {
 					}
 				}
 
-				// 2. Inspect streaming delta.tool_calls against whitelist
+				// 1b. Inspect streaming delta.tool_calls against whitelist & domain rules
 				if rawTools, ok := deltaMap["tool_calls"].([]any); ok && len(rawTools) > 0 && s.cfg.Whitelist.EnforceToolWhitelist {
 					keptTools, toolCodes, pruned := guards.SanitizeToolCallsSlice(rawTools, s.cfg.Whitelist, isShadow)
 					s.prunedTools += pruned
 					for _, c := range toolCodes {
 						s.recordCode(c)
 					}
-					if !isShadow && pruned > 0 {
+					if !isShadow && (pruned > 0 || len(toolCodes) > 0) {
 						modified = true
 						if len(keptTools) > 0 {
 							deltaMap["tool_calls"] = keptTools
@@ -211,6 +234,48 @@ func (s *SSEInspector) handleSSELine(line string) {
 			choices[i] = chMap
 		}
 		eventObj["choices"] = choices
+	}
+
+	// 2. Anthropic SSE format: delta.text
+	if deltaMap, ok := eventObj["delta"].(map[string]any); ok {
+		if tokenStr, ok := deltaMap["text"].(string); ok && tokenStr != "" {
+			safeText, shouldEmit := s.inspectStreamFragment(tokenStr)
+			if s.halted {
+				return
+			}
+			if !isShadow && (!shouldEmit || safeText != tokenStr) {
+				deltaMap["text"] = safeText
+				eventObj["delta"] = deltaMap
+				modified = true
+			}
+		}
+	}
+
+	// 3. Ollama / Custom SSE formats: message.content, response, or token fields
+	if msgMap, ok := eventObj["message"].(map[string]any); ok {
+		if tokenStr, ok := msgMap["content"].(string); ok && tokenStr != "" {
+			safeText, shouldEmit := s.inspectStreamFragment(tokenStr)
+			if s.halted {
+				return
+			}
+			if !isShadow && (!shouldEmit || safeText != tokenStr) {
+				msgMap["content"] = safeText
+				eventObj["message"] = msgMap
+				modified = true
+			}
+		}
+	}
+	for _, topField := range []string{"response", "token", "text"} {
+		if tokenStr, ok := eventObj[topField].(string); ok && tokenStr != "" {
+			safeText, shouldEmit := s.inspectStreamFragment(tokenStr)
+			if s.halted {
+				return
+			}
+			if !isShadow && (!shouldEmit || safeText != tokenStr) {
+				eventObj[topField] = safeText
+				modified = true
+			}
+		}
 	}
 
 	if modified {
@@ -238,7 +303,7 @@ func (s *SSEInspector) inspectStreamFragment(fragment string) (string, bool) {
 	combined := s.holdback + string(validBytes)
 	s.holdback = ""
 
-	cleaned, codes, leaked := guards.SanitizeOutputText(combined, s.canaryToken, s.cfg, s.vault)
+	cleaned, codes, leaked := guards.SanitizeOutputTextWithSession(s.sessionID, combined, s.canaryToken, s.cfg, s.vault)
 	for _, c := range codes {
 		s.recordCode(c)
 	}
@@ -276,6 +341,7 @@ func (s *SSEInspector) haltOnCanaryLeak() {
 	s.emitWarningEventIfNeeded()
 	s.outBuf.WriteString("data: [DONE]\n\n")
 	s.populateTrailers()
+	s.reportCompletion()
 }
 
 func (s *SSEInspector) emitSyntheticDeltaChunk(text string) {
@@ -320,7 +386,7 @@ func (s *SSEInspector) emitWarningEventIfNeeded() {
 
 func (s *SSEInspector) finalizeStream() {
 	if s.holdback != "" && !s.halted {
-		cleaned, codes, leaked := guards.SanitizeOutputText(s.holdback, s.canaryToken, s.cfg, s.vault)
+		cleaned, codes, leaked := guards.SanitizeOutputTextWithSession(s.sessionID, s.holdback, s.canaryToken, s.cfg, s.vault)
 		s.holdback = ""
 		for _, c := range codes {
 			s.recordCode(c)
@@ -334,6 +400,24 @@ func (s *SSEInspector) finalizeStream() {
 		}
 	}
 	s.populateTrailers()
+	s.reportCompletion()
+}
+
+func (s *SSEInspector) reportCompletion() {
+	if s.reported {
+		return
+	}
+	s.reported = true
+	if len(s.codes) > 0 && s.status == "CLEAN" {
+		if s.cfg != nil && s.cfg.Core.Mode == "shadow" {
+			s.status = "SHADOW_FLAGGED"
+		} else {
+			s.status = "SANITIZED"
+		}
+	}
+	if s.onComplete != nil {
+		s.onComplete(s.status, s.severity, s.codes, s.prunedTools)
+	}
 }
 
 func (s *SSEInspector) populateTrailers() {
@@ -421,9 +505,24 @@ func splitHoldbackSuffix(text, canary string, maxRunes int) (string, string) {
 		}
 	}
 
+	// Also hold back any partial prefix of open markers (even 1-2 chars like "!" of "![" or "[" of "[JG-CANARY:")
+	partialPrefixes := []string{piiOpenPrefix, "[JG-CANARY:", "!["}
+	for _, pref := range partialPrefixes {
+		maxP := min(len(pref)-1, len(tail))
+		for k := maxP; k >= 1; k-- {
+			if strings.HasSuffix(tail, pref[:k]) {
+				idx := len(tail) - k
+				if earliestHoldIdx == -1 || idx < earliestHoldIdx {
+					earliestHoldIdx = idx
+				}
+				break
+			}
+		}
+	}
+
 	if canary != "" {
 		maxK := min(len(canary)-1, len(tail))
-		for k := maxK; k >= 3; k-- {
+		for k := maxK; k >= 1; k-- {
 			if strings.HasSuffix(tail, canary[:k]) {
 				idx := len(tail) - k
 				if earliestHoldIdx == -1 || idx < earliestHoldIdx {

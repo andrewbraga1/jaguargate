@@ -97,7 +97,7 @@ jgate check
 jgate bote
 
 # Inicia o gateway de segurança
-jgate start -c configs/jaguargate.yaml
+jgate serve -c configs/jaguargate.yaml
 ```
 
 ---

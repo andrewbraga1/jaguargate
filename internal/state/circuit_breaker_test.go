@@ -27,9 +27,9 @@ func TestCircuitBreakerCanonicalLoopAndTokenBudget(t *testing.T) {
 		t.Fatal("call 3 should not trip loop breaker")
 	}
 
-	// Call 4 (identical canonical JSON) MUST trip the loop breaker (JG-CFG-201)
-	if !cb.CheckToolCallLoop("sess-1", "query_db", `{"id":42,"table":"users"}`, cfg) {
-		t.Fatal("expected 4th identical canonical tool call to trip loop circuit breaker!")
+	// Call 4 (identical canonical JSON with reversed key order) MUST trip the loop breaker (JG-CFG-201)
+	if !cb.CheckToolCallLoop("sess-1", "query_db", `{"table":"users","id":42}`, cfg) {
+		t.Fatal("expected 4th identical canonical tool call (even with reversed JSON key order) to trip loop circuit breaker!")
 	}
 
 	// Different arguments on the same tool must NOT trip the breaker
