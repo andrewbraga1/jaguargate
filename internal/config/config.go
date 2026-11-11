@@ -52,8 +52,11 @@ type UnixSocketConfig struct {
 }
 
 type GRPCIngressConfig struct {
-	Enabled    bool   `yaml:"enabled" json:"enabled"`
-	ListenAddr string `yaml:"listen_addr" json:"listen_addr"`
+	Enabled      bool     `yaml:"enabled" json:"enabled"`
+	ListenAddr   string   `yaml:"listen_addr" json:"listen_addr"`
+	AuthToken    string   `yaml:"auth_token" json:"auth_token"`
+	RequireAuth  bool     `yaml:"require_auth" json:"require_auth"`
+	AllowedRoles []string `yaml:"allowed_roles" json:"allowed_roles"`
 }
 
 type EgressConfig struct {
@@ -86,12 +89,18 @@ type CircuitBreakerConfig struct {
 }
 
 type GuardsConfig struct {
+	PromptInjection PromptInjectionConfig `yaml:"prompt_injection" json:"prompt_injection"`
 	Spotlighting    SpotlightingConfig    `yaml:"spotlighting" json:"spotlighting"`
 	CanaryTokens    CanaryTokensConfig    `yaml:"canary_tokens" json:"canary_tokens"`
 	Deobfuscation   DeobfuscationConfig   `yaml:"deobfuscation" json:"deobfuscation"`
 	Multimodal      MultimodalConfig      `yaml:"multimodal" json:"multimodal"`
 	PIIVault        PIIVaultConfig        `yaml:"pii_vault" json:"pii_vault"`
 	OutputSanitizer OutputSanitizerConfig `yaml:"output_sanitizer" json:"output_sanitizer"`
+}
+
+type PromptInjectionConfig struct {
+	Enabled        bool     `yaml:"enabled" json:"enabled"`
+	CustomPatterns []string `yaml:"custom_patterns" json:"custom_patterns"`
 }
 
 type SpotlightingConfig struct {
@@ -122,10 +131,36 @@ type MultimodalConfig struct {
 }
 
 type PIIVaultConfig struct {
-	Enabled         bool              `yaml:"enabled" json:"enabled"`
-	RestoreOnOutput bool              `yaml:"restore_on_output" json:"restore_on_output"`
-	TTLSeconds      int               `yaml:"ttl_seconds" json:"ttl_seconds"`
-	Entities        PIIEntitiesConfig `yaml:"entities" json:"entities"`
+	Enabled          bool                  `yaml:"enabled" json:"enabled"`
+	RestoreOnOutput  bool                  `yaml:"restore_on_output" json:"restore_on_output"`
+	TTLSeconds       int                   `yaml:"ttl_seconds" json:"ttl_seconds"`
+	Entities         PIIEntitiesConfig     `yaml:"entities" json:"entities"`
+	CustomPatterns   []CustomPatternConfig `yaml:"custom_patterns" json:"custom_patterns"`
+	PatternOverrides PIIPatternOverrides   `yaml:"pattern_overrides,omitempty" json:"pattern_overrides,omitempty"`
+}
+
+type CustomPatternConfig struct {
+	Name     string `yaml:"name" json:"name"`
+	Regex    string `yaml:"regex" json:"regex"`
+	IsSecret bool   `yaml:"is_secret" json:"is_secret"`
+	Enabled  *bool  `yaml:"enabled,omitempty" json:"enabled,omitempty"`
+}
+
+func (c CustomPatternConfig) IsEnabled() bool {
+	if c.Enabled == nil {
+		return true
+	}
+	return *c.Enabled
+}
+
+type PIIPatternOverrides struct {
+	CPF        string `yaml:"cpf,omitempty" json:"cpf,omitempty"`
+	CNPJ       string `yaml:"cnpj,omitempty" json:"cnpj,omitempty"`
+	CreditCard string `yaml:"credit_card,omitempty" json:"credit_card,omitempty"`
+	Email      string `yaml:"email,omitempty" json:"email,omitempty"`
+	AWSKeys    string `yaml:"aws_keys,omitempty" json:"aws_keys,omitempty"`
+	APISecrets string `yaml:"api_secrets,omitempty" json:"api_secrets,omitempty"`
+	JWTTokens  string `yaml:"jwt_tokens,omitempty" json:"jwt_tokens,omitempty"`
 }
 
 type PIIEntitiesConfig struct {
@@ -176,9 +211,13 @@ type TelemetryConfig struct {
 }
 
 type LoggingConfig struct {
-	Format           string `yaml:"format" json:"format"`
-	Level            string `yaml:"level" json:"level"`
-	ZeroTrustPrompts bool   `yaml:"zero_trust_prompts" json:"zero_trust_prompts"`
+	Format               string   `yaml:"format" json:"format"`
+	Level                string   `yaml:"level" json:"level"`
+	ZeroTrustPrompts     bool     `yaml:"zero_trust_prompts" json:"zero_trust_prompts"`
+	ZeroTrustRedaction   bool     `yaml:"zero_trust_redaction" json:"zero_trust_redaction"`
+	RedactionPlaceholder string   `yaml:"redaction_placeholder" json:"redaction_placeholder"`
+	CustomPatterns       []string `yaml:"custom_patterns" json:"custom_patterns"`
+	SensitiveFields      []string `yaml:"sensitive_fields" json:"sensitive_fields"`
 }
 
 type WarningFlagsConfig struct {
@@ -256,6 +295,10 @@ func DefaultConfig() Config {
 			},
 		},
 		Guards: GuardsConfig{
+			PromptInjection: PromptInjectionConfig{
+				Enabled:        true,
+				CustomPatterns: nil,
+			},
 			Spotlighting: SpotlightingConfig{
 				Enabled:          true,
 				DynamicTagPrefix: "jg_untrusted",
@@ -292,6 +335,7 @@ func DefaultConfig() Config {
 					APISecrets: true,
 					JWTTokens:  true,
 				},
+				CustomPatterns: nil,
 			},
 			OutputSanitizer: OutputSanitizerConfig{
 				SlidingWindowRunes:           64,
@@ -312,9 +356,11 @@ func DefaultConfig() Config {
 		},
 		Telemetry: TelemetryConfig{
 			Logging: LoggingConfig{
-				Format:           "json",
-				Level:            "info",
-				ZeroTrustPrompts: true,
+				Format:               "json",
+				Level:                "info",
+				ZeroTrustPrompts:     true,
+				ZeroTrustRedaction:   true,
+				RedactionPlaceholder: "***[JG-REDACTED]***",
 			},
 			WarningFlags: WarningFlagsConfig{
 				EmitHTTPHeaders:          true,
@@ -342,6 +388,25 @@ func (c *Config) ApplyPreset() {
 	case "strict":
 		c.Core.Mode = "hard_block"
 		c.Whitelist.EnforceToolWhitelist = true
+		// In strict mode ("maximum armor"), wildcard "*" is removed so only explicitly declared tools are permitted
+		if slices.Contains(c.Whitelist.AllowedTools, "*") {
+			var filtered []string
+			for _, t := range c.Whitelist.AllowedTools {
+				if t != "*" {
+					filtered = append(filtered, t)
+				}
+			}
+			c.Whitelist.AllowedTools = filtered
+		}
+		if slices.Contains(c.Whitelist.AllowedMCPServers, "*") {
+			var filtered []string
+			for _, s := range c.Whitelist.AllowedMCPServers {
+				if s != "*" {
+					filtered = append(filtered, s)
+				}
+			}
+			c.Whitelist.AllowedMCPServers = filtered
+		}
 	case "balanced", "":
 		if c.Core.Preset == "" {
 			c.Core.Preset = "balanced"
@@ -352,6 +417,14 @@ func (c *Config) ApplyPreset() {
 	}
 	if strings.TrimSpace(c.Core.Language) == "" {
 		c.Core.Language = "en"
+	}
+	if c.Telemetry.Logging.ZeroTrustRedaction && !c.Telemetry.Logging.ZeroTrustPrompts {
+		c.Telemetry.Logging.ZeroTrustPrompts = true
+	} else if c.Telemetry.Logging.ZeroTrustPrompts && !c.Telemetry.Logging.ZeroTrustRedaction {
+		c.Telemetry.Logging.ZeroTrustRedaction = true
+	}
+	if c.Telemetry.Logging.RedactionPlaceholder == "" {
+		c.Telemetry.Logging.RedactionPlaceholder = "***[JG-REDACTED]***"
 	}
 }
 

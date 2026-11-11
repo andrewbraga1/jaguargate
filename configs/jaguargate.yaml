@@ -50,6 +50,11 @@ network:
     grpc:
       enabled: false
       listen_addr: "127.0.0.1:4011"
+      # [EN] Mandatory Bearer token / API key validation for gRPC/RPC callers
+      # [PT] Validação obrigatória de token Bearer / chave de API para clientes gRPC/RPC
+      require_auth: true
+      auth_token: "${JAGUARGATE_GRPC_AUTH_TOKEN}"
+      allowed_roles: []
 
   egress:
     # [EN] Default target AI provider (e.g., Ollama, LiteLLM, OpenAI, vLLM)
@@ -71,6 +76,14 @@ network:
 # 3. OWASP GUARDS & MULTIMODAL HYGIENE / ESCUDO OWASP E HIGIENE MULTIMODAL
 # ------------------------------------------------------------------------------
 guards:
+  prompt_injection:
+    # [EN] Direct & Indirect Prompt Injection shield (built-in EN/PT-BR RE2 rules)
+    # [PT] Escudo contra injeção direta e indireta de prompt (regras RE2 lineares EN/PT-BR)
+    enabled: true
+    # [EN] Additional custom intrusion patterns / keywords for enterprise policies
+    # [PT] Expressões regulares adicionais para políticas corporativas customizadas
+    custom_patterns: []
+
   deobfuscation:
     enabled: true
     decode_base64: true
@@ -122,9 +135,18 @@ guards:
       credit_card: true
       email: false
       aws_keys: true
-      api_Secrets: true
+      api_secrets: true
       jwt_tokens: true
+    # [EN] Custom enterprise regexes for proprietary tokens, IDs or keys
+    # [PT] Padrões corporativos adicionais para tokens, crachás ou IDs proprietários
     custom_patterns: []
+    # - name: "CORP_BADGE"
+    #   regex: '\bBADGE-[A-Z0-9]{8}\b'
+    #   is_secret: false
+    #   enabled: true
+    # [EN] Optional regex overrides for default entities (e.g., unformatted CPF \b\d{11}\b)
+    # [PT] Sobrescrita opcional de regex para entidades padrão (ex: CPF sem pontuação)
+    pattern_overrides: {}
 
   output_sanitizer:
     block_untrusted_markdown_images: true
@@ -173,6 +195,8 @@ telemetry:
     # [PT] Mascaramento Zero-Trust obrigatório: segredos nunca são gravados em texto puro
     zero_trust_redaction: true
     redaction_placeholder: "***[JG-REDACTED]***"
+    custom_patterns: []
+    sensitive_fields: []
 
   webhooks:
     enabled: false

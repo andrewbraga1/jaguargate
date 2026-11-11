@@ -12,7 +12,7 @@ RUN go mod download
 # Copy source and compile a stripped, 100% static binary (zero libc dependency)
 COPY . .
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
-    go build -ldflags="-s -w" -o /out/jgate ./cmd/jgate
+    go build -trimpath -ldflags="-s -w" -o /out/jgate ./cmd/jgate
 
 # ==============================================================================
 # Stage 2: Minimal Hardened Distroless Runtime (~12MB, Non-Root, No Shell)
@@ -21,8 +21,8 @@ FROM gcr.io/distroless/static-debian12:nonroot
 
 WORKDIR /app
 
-COPY --from=builder /out/jgate /app/jgate
-COPY jaguargate.yaml /app/jaguargate.yaml
+COPY --from=builder --chown=nonroot:nonroot /out/jgate /app/jgate
+COPY --chown=nonroot:nonroot jaguargate.yaml /app/jaguargate.yaml
 
 USER nonroot:nonroot
 

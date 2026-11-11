@@ -1,6 +1,7 @@
 package transport
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"net"
@@ -198,5 +199,117 @@ whitelist:
 	}
 	if upstreamCalled != 0 {
 		t.Fatalf("SECURITY FAILURE: upstream LLM was called (%d times) despite session exceeding token budget!", upstreamCalled)
+	}
+}
+
+func TestProxyUpstreamResponseOverflowDetection(t *testing.T) {
+	// Upstream responds with a giant 11MB payload
+	hugeBody := bytes.Repeat([]byte("A"), 11*1024*1024)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(hugeBody)
+	}))
+	defer upstream.Close()
+
+	tmpDir := t.TempDir()
+	cfgPath := filepath.Join(tmpDir, "jaguargate.yaml")
+	yamlCfg := `
+core:
+  version: "1.0"
+  preset: "balanced"
+network:
+  ingress:
+    http:
+      enabled: true
+      listen_addr: "127.0.0.1:0"
+      max_payload_mb: 1 # Ingress max is 1MB, so maxRespBytes will be min 10MB
+  egress:
+    upstream_url: "` + upstream.URL + `"
+`
+	if err := os.WriteFile(cfgPath, []byte(yamlCfg), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	mgr, err := config.NewManager(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = mgr.Close() }()
+
+	logger := telemetry.NewZeroTrustLogger(io.Discard, "error", true, true, "***")
+	gw, err := NewGatewayServer(mgr, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	proxyServer := httptest.NewServer(gw.Handler())
+	defer proxyServer.Close()
+
+	req, _ := http.NewRequest(http.MethodPost, proxyServer.URL+"/v1/chat/completions", strings.NewReader(`{"messages":[{"role":"user","content":"hi"}]}`))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("expected HTTP 502 Bad Gateway when upstream exceeds size ceiling, got %d", resp.StatusCode)
+	}
+	if !strings.Contains(resp.Header.Get("X-JaguarGate-Codes"), "JG-CFG-202") {
+		t.Errorf("expected JG-CFG-202 code on payload overflow, got %q", resp.Header.Get("X-JaguarGate-Codes"))
+	}
+}
+
+func TestGRPCAuthAndStatusFraming(t *testing.T) {
+	gw := &GatewayServer{}
+	baseHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Reached-Handler", "true")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	})
+
+	grpcCfg := config.GRPCIngressConfig{
+		Enabled:     true,
+		RequireAuth: true,
+		AuthToken:   "secret-enterprise-token-12345",
+	}
+
+	rpcHandler := gw.buildRPCHandler(baseHandler, grpcCfg)
+
+	// 1. Test unauthenticated gRPC call (content-type: application/grpc)
+	reqGRPCUnauth, _ := http.NewRequest(http.MethodPost, "/com.corp.AIService/Infer", strings.NewReader("dummy-grpc-body"))
+	reqGRPCUnauth.Header.Set("Content-Type", "application/grpc")
+	recGRPCUnauth := httptest.NewRecorder()
+	rpcHandler.ServeHTTP(recGRPCUnauth, reqGRPCUnauth)
+
+	if recGRPCUnauth.Header().Get("Grpc-Status") != "16" {
+		t.Errorf("expected Grpc-Status 16 (UNAUTHENTICATED), got %q", recGRPCUnauth.Header().Get("Grpc-Status"))
+	}
+	if !strings.Contains(recGRPCUnauth.Header().Get("X-JaguarGate-Codes"), "JG-SEC-401") {
+		t.Errorf("expected JG-SEC-401 for unauthenticated gRPC call, got %q", recGRPCUnauth.Header().Get("X-JaguarGate-Codes"))
+	}
+	if recGRPCUnauth.Header().Get("X-Reached-Handler") == "true" {
+		t.Errorf("SECURITY FAILURE: unauthenticated gRPC request reached upstream handler!")
+	}
+
+	// 2. Test unauthenticated JSON/REST caller on RPC port
+	reqRESTUnauth, _ := http.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader("{}"))
+	reqRESTUnauth.Header.Set("Content-Type", "application/json")
+	recRESTUnauth := httptest.NewRecorder()
+	rpcHandler.ServeHTTP(recRESTUnauth, reqRESTUnauth)
+
+	if recRESTUnauth.Code != http.StatusUnauthorized {
+		t.Errorf("expected HTTP 401 Unauthorized for unauthenticated REST caller, got %d", recRESTUnauth.Code)
+	}
+
+	// 3. Test authenticated gRPC caller with Bearer token in metadata
+	reqGRPCAuth, _ := http.NewRequest(http.MethodPost, "/com.corp.AIService/Infer", strings.NewReader("dummy-grpc-body"))
+	reqGRPCAuth.Header.Set("Content-Type", "application/grpc")
+	reqGRPCAuth.Header.Set("Authorization", "Bearer secret-enterprise-token-12345")
+	recGRPCAuth := httptest.NewRecorder()
+	rpcHandler.ServeHTTP(recGRPCAuth, reqGRPCAuth)
+
+	if recGRPCAuth.Header().Get("X-Reached-Handler") != "true" {
+		t.Errorf("expected authenticated gRPC request to reach handler successfully")
 	}
 }

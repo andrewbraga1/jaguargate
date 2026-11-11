@@ -66,7 +66,15 @@ func (ins *Inspector) InspectPayload(body []byte, sessionID, mcpServerHeader str
 	// 1. Validate MCP Target Server Whitelist (JG-CFG-102) if configured
 	if len(cfg.Whitelist.AllowedMCPServers) > 0 && mcpServerHeader != "" {
 		if !isMCPServerAllowed(mcpServerHeader, cfg.Whitelist.AllowedMCPServers) {
-			res.addCode("JG-CFG-102", false)
+			res.addCode("JG-CFG-102", true)
+			if !isShadow && cfg.Core.Mode == "hard_block" {
+				res.Status = "BLOCKED"
+				res.Blocked = true
+				res.Severity = "INTRUSION_ALERT"
+				errPayload := []byte(fmt.Sprintf(`{"jsonrpc":"2.0","error":{"code":-32600,"message":"JaguarGate: MCP server %q is not authorized by security policy (JG-CFG-102)"}}`, mcpServerHeader))
+				res.ModifiedBody = errPayload
+				return res
+			}
 		}
 	}
 

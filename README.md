@@ -18,11 +18,14 @@ Traditional security proxies treat AI traffic like static web pages: if a single
 
 **JaguarGate** is a resilient, sub-millisecond sidecar gateway built in pure Go (`CGO_ENABLED=0`) designed for **LLMs**, **Autonomous Agents** (AgentScope, LangChain, CrewAI, LiteLLM), and **MCP (Model Context Protocol)** servers:
 
-* 🛡️ **Graceful Degradation (Selective Pass-Through):** If an agent calls 3 tools in parallel and 1 is unauthorized, JaguarGate surgically prunes only the unauthorized tool call, keeps the request alive (`HTTP 200`), and attaches lightweight **Warning Flags** (`X-JaguarGate-*`).
-* 🚀 **Tri-Transport Architecture:** Standard **HTTP/REST** (`:4010`) for zero-code integration, **Unix Domain Sockets (UDS)** for near-zero kernel-level latency with local models (e.g., Ollama), and **gRPC** for high-throughput microservices.
-* 🌊 **Rune-Aware Streaming Inspection (SSE):** Validates token-by-token responses in real time using a UTF-8 safe sliding window buffer without delaying Time-To-First-Token (TTFT).
-* 🔐 **Reversible PII & Secrets Vault:** Masks sensitive data (CPF, CNPJ, Credit Cards, API Keys) with safe pseudonyms before leaving your infrastructure and restores them on the way back if authorized.
-* 🔌 **MCP Guardrail & Wasm Extensibility:** Protects local (`stdio`) and remote (`HTTP/SSE`) MCP servers and supports sandboxed **WebAssembly (`wazero`)** community plugins.
+* 🛡️ **Graceful Degradation (Selective Pass-Through):** If an agent executes 3 tool calls in parallel and 1 is unauthorized, JaguarGate surgically prunes only the forbidden call, keeps the request alive (`HTTP 200`), and injects lightweight **Warning Flags** (`X-JaguarGate-*`).
+* 🧩 **Fully Decoupled Enterprise Rules:** Organizations can toggle built-in patterns (`CPF`, `CNPJ`, `CreditCard`, `Email`, `AWSKeys`, `APISecrets`, `JWT`) via YAML/JSON, override regexes with `pattern_overrides`, or register custom company patterns (`custom_patterns`) with zero code changes.
+* 🚀 **Tri-Transport Ingestion:** Standard **HTTP/REST** (`:4010`) for zero-code integration, **Unix Domain Sockets (UDS)** for near-zero kernel-level latency with local models (e.g., Ollama), and **gRPC/RPC** (`:4011`) with mandatory metadata Bearer token validation and HTTP/2 `Grpc-Status: 16 (UNAUTHENTICATED)` framing.
+* 🌊 **Cross-Chunk Streaming Inspection (SSE):** Reassembles fragmented tool call arguments and validates UTF-8 safe sliding window buffers across OpenAI, Anthropic, and Ollama formats without delaying Time-To-First-Token (TTFT).
+* 🔐 **Reversible PII & Secrets Vault:** Scopes masked pseudonyms strictly to the caller `sessionID` with 128-bit entropy (`<JG_PII_{LABEL}_{HEX}>`) and restores them on output without leaking data between tenants.
+* 🔏 **Extensible Zero-Trust Logging:** Redacts secrets and PII from application logs using an extensible, thread-safe linear-time engine (`slog`) with native CRLF injection neutralization (CWE-117 / GoSec G706).
+* 🔌 **MCP Guardrail & Recursive Firewall:** Inspeciona deeply nested JSON-RPC 2.0 payloads (`tools/call`, `resources/read`) with recursion depth caps (`JG-CFG-203`) and sibling field coverage to prevent prompt injection via external tools.
+* 🔄 **SHA-256 Canonical Circuit Breaker:** Detects and halts infinite agent loops in $O(1)$ time by fingerprinting canonical tool signatures (`tool_name + sorted_json_args`).
 
 ---
 
@@ -36,7 +39,7 @@ flowchart TD
         HTTP["HTTP/REST (:4010)"]
         UDS["Unix Socket (/tmp/jaguargate.sock)"]
         GRPC["gRPC (:4011)"]
-        MCP["MCP Interceptor (Stdio / SSE)"]
+        MCP["MCP Interceptor (Stdio / SSE JSON-RPC)"]
     end
 
     subgraph L2["Layer 2: Multimodal Triage & Deobfuscation"]
@@ -44,26 +47,26 @@ flowchart TD
         Deob["Memory Deobfuscator (Base64 / Hex / Invisible Unicode)"]
     end
 
-    subgraph L3["Layer 3: Core OWASP Engine & Resilient Whitelist"]
+    subgraph L3["Layer 3: Core OWASP Engine & Enterprise Whitelist"]
         Spot["Dynamic Crypto Spotlighting & Canary Tokens"]
-        Vault["Reversible PII & Secrets Vault"]
+        Vault["Reversible PII & Secrets Vault + Custom Regex"]
         Tools["Selective Tool Call & MCP Firewall"]
         Modes["Modes: Shadow | Sanitize & Warn | Hard Block"]
     end
 
-    subgraph L4["Layer 4: Hybrid State (L1/L2) & Wasm Sandbox"]
+    subgraph L4["Layer 4: Hybrid State (L1/L2) & Wasm Interface"]
         State["L1 Lock-Free RAM (atomic.Pointer) + L2 AES-GCM Redis"]
         Loop["SHA-256 Canonical Loop Circuit Breaker"]
-        Wasm["Pure-Go Wasm Plugin Sandbox (wazero < 2ms)"]
+        Wasm["Wasm Plugin Interface (Header Verification & Fail-Open Fallback)"]
     end
 
     subgraph L5["Layer 5: Real-Time Streaming & Zero-Trust Telemetry"]
         Slide["Rune-Aware UTF-8 Sliding Window Buffer (SSE)"]
-        Flags["Warning Flags (HTTP Headers / Trailers / SSE Event)"]
-        Logs["Zero-Trust Redacted Logger (slog) & OTel"]
+        Flags["Warning Flags (HTTP Headers / Trailers / SSE Events)"]
+        Logs["Zero-Trust Redacted Logger (slog) & CRLF Sanitizer"]
     end
 
-    subgraph L6["Layer 6: Bilingual Governance & Built-in Red Teaming"]
+    subgraph L6["Layer 6: Bilingual Governance & Red Teaming"]
         CLI["CLI: jgate check | jgate doctor | jgate pounce (bote)"]
     end
 
@@ -76,77 +79,263 @@ flowchart TD
 
 ---
 
-## 🚀 3-Line Quickstart (Zero-Code Configuration)
+## 💻 CLI Commands & Usage
 
-Beginners don't need to write complex regex rules. A complete `jaguargate.yaml` requires only **3 lines**:
+JaguarGate ships with a unified, bilingual CLI (`jgate`) designed for developers and CI/CD automation:
+
+| Command | Alias | Purpose |
+| :--- | :--- | :--- |
+| `jgate check` | — | Validates the syntax, schema contracts, and invariants of `jaguargate.yaml`. |
+| `jgate doctor` | — | Runs diagnostic checks on network bindings, upstream reachability, permissions, and Redis connectivity. |
+| `jgate pounce` | `jgate bote` | Executes the built-in OWASP Top 10 Red-Teaming battery ($< 2.5\text{ms}$ execution). |
+| `jgate serve` | `jgate start` | Starts the multi-transport gateway with atomic hot-reload and Zero-Trust telemetry. |
+
+### Running the Gateway
+
+```bash
+# 1. Validate your configuration file
+jgate check -c configs/jaguargate.yaml
+
+# 2. Run the security audit & simulated attack battery
+jgate pounce
+
+# 3. Start the gateway server
+jgate serve -c configs/jaguargate.yaml
+```
+
+### Directing Agent Traffic to JaguarGate
+
+Set your AI client or framework `BASE_URL` to JaguarGate's local port (`:4010`):
+
+#### cURL Example
+```bash
+curl http://127.0.0.1:4010/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer sk-your-api-key" \
+  -d '{
+    "model": "gpt-4o",
+    "messages": [
+      {"role": "system", "content": "You are a customer assistant."},
+      {"role": "user", "content": "Client CPF is 123.456.789-01. Please summarize."}
+    ]
+  }'
+```
+
+#### Python OpenAI SDK Example
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://127.0.0.1:4010/v1",  # Route via JaguarGate
+    api_key="your-api-key"
+)
+
+response = client.chat.completions.create(
+    model="gpt-4o",
+    messages=[
+        {"role": "user", "content": "Here is my internal badge BADGE-ALPHA01"}
+    ]
+)
+print(response.choices[0].message.content)
+```
+
+---
+
+## ⚙️ Configuration Contract (`jaguargate.yaml`)
+
+### Minimal Setup (3 Lines)
+
+A valid configuration requires only the `core` block; all other sections inherit secure defaults from your preset:
 
 ```yaml
 core:
   version: "1.0"
   language: "en"         # "en" or "pt-BR"
-  preset: "balanced"     # "permissive" (learning) | "balanced" (recommended) | "strict" (maximum armor)
+  preset: "balanced"     # "permissive" (shadow) | "balanced" (sanitize & warn) | "strict" (hard block)
 ```
 
-Point your SDK or agent's `BASE_URL` to `http://localhost:4010/v1` and start JaguarGate:
+### Full Enterprise Configuration
 
-```bash
-# Validate configuration syntax
-jgate check
+For full control over custom corporate regexes, entity overrides, logging rules, and whitelist boundaries:
 
-# Run built-in diagnostic and simulated OWASP attack battery ("The Jaguar's Pounce")
-jgate pounce
+```yaml
+core:
+  version: "1.0"
+  language: "en" # "en" | "pt-BR"
+  preset: "balanced"
+  mode: "sanitize_and_warn" # "shadow" | "sanitize_and_warn" | "hard_block"
 
-# Start the gateway
-jgate serve -c configs/jaguargate.yaml
+network:
+  ingress:
+    http:
+      enabled: true
+      listen_addr: "127.0.0.1:4010"
+      read_timeout_ms: 30000
+      write_timeout_ms: 120000
+    unix_socket:
+      enabled: false
+      socket_path: "/tmp/jaguargate.sock"
+      socket_mode: "0600"
+  egress:
+    upstream_url: "http://127.0.0.1:11434" # Ollama, vLLM, LiteLLM, or OpenAI
+
+guards:
+  # 1. Direct & Indirect Prompt Injection Defense
+  prompt_injection:
+    enabled: true
+    # Add company-specific intrusion phrases or restricted commands
+    custom_patterns:
+      - '(?i)exfiltrate\s+customer\s+database'
+      - '(?i)superadmin_bypass_token'
+
+  # 2. Deobfuscation (Invisible Unicode & Nested Base64/Hex Smuggling)
+  deobfuscation:
+    enabled: true
+    decode_base64: true
+    decode_hex: true
+    strip_invisible_unicode: true
+    max_decode_depth: 2
+
+  # 3. Multimodal Media Sanitization
+  multimodal:
+    bypass_regex_on_media: true
+    strip_exif_xmp_metadata: true
+    verify_magic_bytes: true
+
+  # 4. Reversible PII & Secrets Vault
+  pii_vault:
+    enabled: true
+    restore_on_output: true
+    ttl_seconds: 300
+    entities:
+      cpf: true
+      cnpj: true
+      credit_card: true
+      email: false
+      aws_keys: true
+      api_secrets: true
+      jwt_tokens: true
+    # Custom corporate regexes for employee IDs, internal tokens, or proprietary badges
+    custom_patterns:
+      - name: "CORP_BADGE"
+        regex: '\bBADGE-[A-Z0-9]{8}\b'
+        is_secret: false
+        enabled: true
+      - name: "INTERNAL_TOKEN"
+        regex: '\bcorp_sec_[a-f0-9]{32}\b'
+        is_secret: true
+        enabled: true
+    # Override standard entity patterns for regional variations
+    pattern_overrides:
+      cpf: '\b\d{11}\b' # Allows unformatted 11-digit CPFs
+
+whitelist:
+  enforce_tool_whitelist: false
+  allowed_tools:
+    - "search_knowledge_base"
+    - "get_weather"
+  allowed_domains:
+    - "*.internal.corp"
+    - "api.github.com"
+  circuit_breaker:
+    max_identical_tool_calls: 3
+    window_seconds: 120
+    max_tokens_per_session: 32000
+
+telemetry:
+  logging:
+    level: "info"
+    format: "json"
+    zero_trust_redaction: true
+    redaction_placeholder: "***[JG-REDACTED]***"
+    # Additional scrubbers for log streams
+    custom_patterns:
+      - '\bCORP-SECRET-[0-9]{6}\b'
+    # Mask specific JSON keys in application logs
+    sensitive_fields:
+      - "client_secret"
+      - "master_key"
+      - "user_password"
 ```
 
 ---
 
-## 🌐 Language Configuration (`en` Default | `pt-BR`)
+## 🌐 Bilingual Interface (`en` Default | `pt-BR`)
 
-**[EN]** By default, JaguarGate outputs all CLI tables (`jgate doctor`, `jgate pounce`, `jgate check`) and operational logs in **English (`en`)** to maintain clean, single-language parsing in CI/CD pipelines and SIEM platforms. Users can switch the entire interface to **Portuguese (`pt-BR`)** via any of the three methods below:
+JaguarGate outputs all CLI tables and logs in **English (`en`)** by default for standard observability and CI/CD pipelines. Switch to **Portuguese (`pt-BR`)** anytime:
 
-1. **CLI Flag (Per-Command Override):**
+1. **CLI Flag:**
    ```bash
-   ./jgate doctor --lang pt-BR
-   ./jgate pounce --lang pt-BR
+   jgate doctor --lang pt-BR
+   jgate pounce --lang pt-BR
    ```
-2. **Environment Variable (Docker / Kubernetes / CI):**
+2. **Environment Variable:**
    ```bash
    export JAGUARGATE_LANG="pt-BR"
-   ./jgate serve -c jaguargate.yaml
+   jgate serve -c configs/jaguargate.yaml
    ```
-3. **Configuration File (`jaguargate.yaml`):**
+3. **Configuration File:**
    ```yaml
    core:
-     version: "1.0"
-     preset: "balanced"
-     language: "pt-BR" # Default: "en"
+     language: "pt-BR"
    ```
+
+---
+
+## 🎯 Protocol & Provider Support Matrix
+
+| Protocol / Model Family | Ingress Transport | Non-Streaming Output | Streaming (SSE) | Tool Call Governance |
+| :--- | :--- | :---: | :---: | :--- |
+| **OpenAI / LiteLLM / vLLM** | HTTP (`:4010`), UDS, gRPC (`:4011`) | Full (`choices[].message`) | Full (`choices[].delta`) | Full (Cross-chunk reassembly & domain checks) |
+| **Anthropic (Messages API)** | HTTP (`:4010`), UDS, gRPC (`:4011`) | Full (`content[].text` & `content[].tool_use`) | Full (`delta.text`) | Full (`tool_use` pruned with benign refusal) |
+| **Ollama** | HTTP (`:4010`), UDS (Zero-Latency) | Full (`message.content`, `response`) | Full (`message.content`, `response`) | Full (`tool_calls` validated against Whitelist) |
+| **MCP (Model Context Protocol)** | Stdio & HTTP/SSE (JSON-RPC 2.0) | Full (`result.content`, `resources/read`) | — | Full (Recursive traversal & depth $\le 8$ cap) |
 
 ---
 
 ## 📊 OWASP LLM & Agentic Top 10 Coverage
 
-| OWASP Threat | JaguarGate Defense Mechanism | Default Behavior (`sanitize_and_warn`) |
+| OWASP Threat | JaguarGate Defense Mechanism | Resilient Behavior (`sanitize_and_warn`) |
 | :--- | :--- | :--- |
-| **LLM01: Prompt Injection** | Base64/Hex deobfuscation + Dynamic Cryptographic Spotlighting tags | Neutralizes injection payload; forwards clean context + `JG-SEC-401` |
-| **LLM02: Sensitive Info Disclosure** | Reversible PII & Secrets Vault (in-memory or AES-GCM Redis) | Replaces secret with `<JG_PII_TOKEN>` + `JG-PII-301` |
-| **LLM05: Improper Output Handling** | Markdown image tracker blocker & script sanitizer | Strips malicious links in real-time SSE stream + `JG-SEC-502` |
-| **LLM06: Excessive Agency** | Selective Tool Call & MCP Whitelist Firewall | Prunes unauthorized tool calls without crashing HTTP 200 + `JG-CFG-101` |
-| **LLM07: System Prompt Leakage** | Invisible Canary Token injection & sliding-window detector | Immediately truncates leaked stream + `JG-SEC-501` |
-| **LLM10: Unbounded Consumption** | Canonical SHA-256 Agent Loop Circuit Breaker & token caps | Halts repetitive identical tool loops gracefully + `JG-CFG-201` |
+| **LLM01: Prompt Injection** | RE2 Linear Engine + Custom Signatures + Cryptographic Spotlighting | Neutralizes injection payload; forwards sanitized context + `JG-SEC-401` |
+| **LLM02: Sensitive Info Disclosure** | Reversible PII & Secrets Vault (Session-Isolated + Custom Regex) | Replaces entity with `<JG_PII_{LABEL}_{HEX}>` + `JG-PII-301`/`JG-PII-302` |
+| **LLM05: Improper Output Handling** | Markdown tracker blocker & executable script sanitizer | Strips malicious links in real-time SSE stream + `JG-SEC-502` |
+| **LLM06: Excessive Agency** | Selective Tool Call & MCP JSON-RPC 2.0 Firewall | Prunes unwhitelisted tool calls without breaking `HTTP 200` + `JG-CFG-101` |
+| **LLM07: System Prompt Leakage** | Invisible Canary Token injection & sliding-window detector | Immediately cuts off leaked SSE transmission + `JG-SEC-501` |
+| **LLM10: Unbounded Consumption** | Canonical SHA-256 Agent Loop Breaker & session token budgets | Halts repetitive identical tool calls gracefully + `JG-CFG-201` |
 
 ---
 
-## 🗺️ Project Roadmap & Milestones
+## 🧪 Security Verification & Red-Teaming Battery
 
-- [x] **Milestone 0 (`v0.1.0-spec`):** Configuration Contract (`YAML`/`JSON`), Compact Warning Flag Taxonomy (`JG-*`) & Bilingual Catalog (`EN`/`PT-BR`).
-- [ ] **Milestone 1 (`v0.2.0-core`):** Lock-Free Config Engine (`atomic.Pointer`), Buffer Recycling (`sync.Pool`), Zero-Trust Redacted Logger & Base Proxy (HTTP + UDS).
-- [ ] **Milestone 2 (`v0.4.0-input-guards`):** Pre-compiled RE2 Engine, Deobfuscator, Multimodal EXIF Hygiene, Dynamic Spotlighting & Local PII Vault.
-- [ ] **Milestone 3 (`v0.6.0-streaming-tools`):** Rune-Aware UTF-8 Sliding Window SSE Inspector, Selective Tool Call Firewall & HTTP Trailers/SSE Warnings.
-- [ ] **Milestone 4 (`v0.8.0-scale-mcp`):** Distributed L1/L2 State (Redis/Valkey AES-GCM), SHA-256 Loop Breaker, gRPC Transport & MCP Guardrail.
-- [ ] **Milestone 5 (`v1.0.0-release`):** Pure-Go Wasm Sandbox (`wazero`), OpenTelemetry Exporter, Rate-Limited Webhooks & CLI (`jgate doctor` / `jgate pounce`).
+Every release passes static and dynamic verification with zero CVEs and race detector validation:
+
+```bash
+# Run unit and race tests
+go test -race ./...
+
+# Run simulated OWASP attack battery
+jgate pounce
+```
+
+```
+===========================================================================================================
+  JAGUARGATE RED-TEAMING SUITE (jgate pounce) — SECURITY AUDIT REPORT
+===========================================================================================================
+ID      | CATEGORY     | SIMULATED ATTACK SCENARIO                       | TRIGGERED FLAGS       | LAT.   | STATUS
+-----------------------------------------------------------------------------------------------------------
+VEC-01  | OWASP-LLM01  | Direct Prompt Injection Neutralization          | JG-SEC-401            |  136µs | PASS  
+VEC-02  | OWASP-OBFUSC | Invisible Unicode + Base64 Smuggling Defense    | JG-SEC-402,JG-SEC-401 |  255µs | PASS  
+VEC-03  | MULTIMODAL   | Binary JPEG EXIF Hidden Payload Stripping       | JG-SEC-403            |    2µs | PASS  
+VEC-04  | OWASP-LLM02  | Reversible PII Vault (CPF + Alphanumeric CNPJ + Secret) | JG-PII-301,JG-PII-302 |  109µs | PASS  
+VEC-05  | OWASP-LLM06  | Selective Unauthorized Tool Call Pruning        | JG-CFG-101            |   42µs | PASS  
+VEC-06  | AGENT-LOOP   | O(1) SHA-256 Canonical Agent Loop Circuit Breaker | JG-CFG-201            |   17µs | PASS  
+VEC-07  | MCP-GUARD    | MCP JSON-RPC 2.0 Untrusted Server & Tool Firewall | JG-CFG-102,JG-CFG-101 |   22µs | PASS  
+VEC-08  | SSE-STREAM   | Real-Time SSE Canary Leak Stream Truncation     | JG-SEC-501            |   76µs | PASS  
+-----------------------------------------------------------------------------------------------------------
+  VERDICT: PASSED (8/8 Attack Vectors Neutralized) | Total Suite Duration: 692µs
+===========================================================================================================
+```
 
 ---
 

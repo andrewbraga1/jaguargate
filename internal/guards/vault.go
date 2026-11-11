@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"regexp"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -20,8 +21,51 @@ var (
 	reVaultAWSKey     = regexp.MustCompile(`\bAKIA[0-9A-Z]{16}\b`)
 	reVaultAPISecret  = regexp.MustCompile(`\b(?:sk-[A-Za-z0-9_-]{16,}|ghp_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{10,})\b`)
 	reVaultJWT        = regexp.MustCompile(`\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b`)
-	reVaultToken      = regexp.MustCompile(`\x3cJG_PII_[A-Z]+_[0-9a-f]{8,32}\x3e`)
+	reVaultToken      = regexp.MustCompile(`\x3cJG_PII_[A-Z0-9_]+_[0-9a-f]{8,32}\x3e`)
 )
+
+var customRegexCache sync.Map
+
+func getOrCompileRegex(pattern string) (*regexp.Regexp, error) {
+	if v, ok := customRegexCache.Load(pattern); ok {
+		return v.(*regexp.Regexp), nil
+	}
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		return nil, err
+	}
+	customRegexCache.Store(pattern, re)
+	return re, nil
+}
+
+func resolvePattern(override string, fallback *regexp.Regexp) *regexp.Regexp {
+	trimmed := strings.TrimSpace(override)
+	if trimmed == "" {
+		return fallback
+	}
+	re, err := getOrCompileRegex(trimmed)
+	if err != nil {
+		return fallback
+	}
+	return re
+}
+
+func sanitizeLabel(name string) string {
+	name = strings.ToUpper(strings.TrimSpace(name))
+	if name == "" {
+		return "CUSTOM"
+	}
+	var b strings.Builder
+	for _, r := range name {
+		if (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' {
+			b.WriteRune(r)
+		}
+	}
+	if b.Len() == 0 {
+		return "CUSTOM"
+	}
+	return b.String()
+}
 
 const maxVaultEntries = 16384
 
@@ -103,26 +147,46 @@ func (v *PIIVault) MaskTextWithSession(sessionID, input string, cfg config.PIIVa
 		})
 	}
 
+	cpfRe := resolvePattern(cfg.PatternOverrides.CPF, reVaultCPF)
+	cnpjRe := resolvePattern(cfg.PatternOverrides.CNPJ, reVaultCNPJ)
+	cardRe := resolvePattern(cfg.PatternOverrides.CreditCard, reVaultCreditCard)
+	emailRe := resolvePattern(cfg.PatternOverrides.Email, reVaultEmail)
+	awsRe := resolvePattern(cfg.PatternOverrides.AWSKeys, reVaultAWSKey)
+	secretRe := resolvePattern(cfg.PatternOverrides.APISecrets, reVaultAPISecret)
+	jwtRe := resolvePattern(cfg.PatternOverrides.JWTTokens, reVaultJWT)
+
 	if cfg.Entities.CPF {
-		replaceEntity(reVaultCPF, "CPF", false)
+		replaceEntity(cpfRe, "CPF", false)
 	}
 	if cfg.Entities.CNPJ {
-		replaceEntity(reVaultCNPJ, "CNPJ", false)
+		replaceEntity(cnpjRe, "CNPJ", false)
 	}
 	if cfg.Entities.CreditCard {
-		replaceEntity(reVaultCreditCard, "CARD", false)
+		replaceEntity(cardRe, "CARD", false)
 	}
 	if cfg.Entities.Email {
-		replaceEntity(reVaultEmail, "EMAIL", false)
+		replaceEntity(emailRe, "EMAIL", false)
 	}
 	if cfg.Entities.AWSKeys {
-		replaceEntity(reVaultAWSKey, "AWSKEY", true)
+		replaceEntity(awsRe, "AWSKEY", true)
 	}
 	if cfg.Entities.APISecrets {
-		replaceEntity(reVaultAPISecret, "SECRET", true)
+		replaceEntity(secretRe, "SECRET", true)
 	}
 	if cfg.Entities.JWTTokens {
-		replaceEntity(reVaultJWT, "JWT", true)
+		replaceEntity(jwtRe, "JWT", true)
+	}
+
+	for _, cp := range cfg.CustomPatterns {
+		if !cp.IsEnabled() || strings.TrimSpace(cp.Regex) == "" {
+			continue
+		}
+		re, err := getOrCompileRegex(cp.Regex)
+		if err != nil {
+			continue
+		}
+		label := sanitizeLabel(cp.Name)
+		replaceEntity(re, label, cp.IsSecret)
 	}
 
 	var codes []string

@@ -45,15 +45,16 @@ func (m *Manager) Get() *Config {
 
 // LoadFromFile parses YAML or JSON, expands ${ENV_VAR}, applies 12-Factor overrides, presets, and validates.
 func LoadFromFile(filePath string) (*Config, error) {
-	rawBytes, err := os.ReadFile(filePath)
+	cleanPath := filepath.Clean(filePath)
+	rawBytes, err := os.ReadFile(cleanPath)
 	if err != nil {
-		return nil, fmt.Errorf("read config %s: %w", filePath, err)
+		return nil, fmt.Errorf("read config %s: %w", cleanPath, err)
 	}
 
 	expanded := interpolateEnvVars(string(rawBytes))
 	cfg := DefaultConfig()
 
-	ext := strings.ToLower(filepath.Ext(filePath))
+	ext := strings.ToLower(filepath.Ext(cleanPath))
 	switch ext {
 	case ".json":
 		if err := json.Unmarshal([]byte(expanded), &cfg); err != nil {

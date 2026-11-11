@@ -98,11 +98,9 @@ func (e *Engine) InspectJSONPayloadWithSession(body []byte, sessionID string, cf
 
 	modified := false
 	isShadow := cfg.Core.Mode == "shadow"
-	hasStandardLLMFields := false
 
 	// 1. Selective Tool Whitelist on top-level "tools" definition array if present
 	if rawTools, ok := payload["tools"].([]any); ok {
-		hasStandardLLMFields = true
 		if cfg.Whitelist.EnforceToolWhitelist {
 			keptTools, toolCodes, pruned := SanitizeToolCallsSlice(rawTools, cfg.Whitelist, isShadow)
 			res.PrunedTools += pruned
@@ -122,7 +120,6 @@ func (e *Engine) InspectJSONPayloadWithSession(body []byte, sessionID string, cf
 
 	// 2. Inspect standard "messages" array (OpenAI / Ollama / Anthropic / LiteLLM format)
 	if rawMsgs, ok := payload["messages"].([]any); ok {
-		hasStandardLLMFields = true
 		systemFound := false
 		for i, item := range rawMsgs {
 			msgMap, ok := item.(map[string]any)
@@ -211,7 +208,6 @@ func (e *Engine) InspectJSONPayloadWithSession(body []byte, sessionID string, cf
 
 	// 3. Support single "prompt" field (Ollama /api/generate or completions endpoint)
 	if promptStr, ok := payload["prompt"].(string); ok {
-		hasStandardLLMFields = true
 		cleaned, codes, intruded, masked := e.inspectTextSegment(sessionID, promptStr, "user", cfg, &res.CanaryToken)
 		res.MaskedCount += masked
 		for _, c := range codes {
@@ -223,10 +219,39 @@ func (e *Engine) InspectJSONPayloadWithSession(body []byte, sessionID string, cf
 		}
 	}
 
-	// 4. Support arbitrary structured JSON objects (e.g., MCP params.arguments or custom agent payloads)
-	if !hasStandardLLMFields {
-		if e.inspectArbitraryJSONMap(payload, sessionID, cfg, &res, 0) {
-			modified = true
+	// 4. Inspect any arbitrary or sibling structured JSON fields (e.g., MCP params.arguments or custom agent payloads)
+	for k, v := range payload {
+		if k == "tools" || k == "messages" || k == "prompt" {
+			continue
+		}
+		switch val := v.(type) {
+		case string:
+			cleaned, codes, intruded, masked := e.inspectTextSegment(sessionID, val, "user", cfg, &res.CanaryToken)
+			res.MaskedCount += masked
+			for _, c := range codes {
+				res.addCode(c, intruded)
+			}
+			if len(cfg.Whitelist.AllowedDomains) > 0 {
+				domCleaned, domViolated := sanitizeDomainsInText(cleaned, cfg.Whitelist.AllowedDomains, isShadow)
+				if domViolated {
+					res.addCode("JG-CFG-103", false)
+					cleaned = domCleaned
+				}
+			}
+			if !isShadow && cleaned != val {
+				payload[k] = cleaned
+				modified = true
+			}
+		case map[string]any:
+			if e.inspectArbitraryJSONMap(val, sessionID, cfg, &res, 1) {
+				payload[k] = val
+				modified = true
+			}
+		case []any:
+			if e.inspectArbitraryJSONSlice(val, sessionID, cfg, &res, 1) {
+				payload[k] = val
+				modified = true
+			}
 		}
 	}
 
@@ -245,6 +270,10 @@ const maxJSONInspectionDepth = 8
 
 func (e *Engine) inspectArbitraryJSONMap(m map[string]any, sessionID string, cfg *config.Config, res *InspectionResult, depth int) bool {
 	if depth > maxJSONInspectionDepth {
+		res.addCode("JG-CFG-203", false)
+		if cfg.Core.Mode == "hard_block" {
+			res.Severity = "INTRUSION_ALERT"
+		}
 		return false
 	}
 	isShadow := cfg.Core.Mode == "shadow"
@@ -286,6 +315,10 @@ func (e *Engine) inspectArbitraryJSONMap(m map[string]any, sessionID string, cfg
 
 func (e *Engine) inspectArbitraryJSONSlice(s []any, sessionID string, cfg *config.Config, res *InspectionResult, depth int) bool {
 	if depth > maxJSONInspectionDepth {
+		res.addCode("JG-CFG-203", false)
+		if cfg.Core.Mode == "hard_block" {
+			res.Severity = "INTRUSION_ALERT"
+		}
 		return false
 	}
 	isShadow := cfg.Core.Mode == "shadow"
@@ -352,7 +385,7 @@ func (e *Engine) inspectTextSegment(sessionID, text, role string, cfg *config.Co
 
 	hiddenInjection := false
 	for _, hidden := range deob.DecodedPayloads {
-		if rePromptInjection.MatchString(hidden) {
+		if e.matchesPromptInjection(hidden, cfg.Guards.PromptInjection) {
 			hiddenInjection = true
 			break
 		}
@@ -364,11 +397,11 @@ func (e *Engine) inspectTextSegment(sessionID, text, role string, cfg *config.Co
 	}
 
 	// 3. Direct & Indirect Prompt Injection check (RE2 O(n))
-	if rePromptInjection.MatchString(workingText) || hiddenInjection {
+	if e.matchesPromptInjection(workingText, cfg.Guards.PromptInjection) || hiddenInjection {
 		codes = append(codes, "JG-SEC-401")
 		intruded = true
 		if !isShadow {
-			workingText = rePromptInjection.ReplaceAllString(workingText, "[JG-NEUTRALIZED-INJECTION]")
+			workingText = e.neutralizePromptInjection(workingText, cfg.Guards.PromptInjection)
 			if hiddenInjection {
 				workingText = reBase64Candidate.ReplaceAllString(workingText, "[JG-NEUTRALIZED-ENCODING]")
 				workingText = reHexCandidate.ReplaceAllString(workingText, "[JG-NEUTRALIZED-ENCODING]")
@@ -464,4 +497,40 @@ func marshalJSONUnescaped(v any) ([]byte, error) {
 		raw = raw[:len(raw)-1]
 	}
 	return bytes.Clone(raw), nil
+}
+
+func (e *Engine) matchesPromptInjection(text string, cfg config.PromptInjectionConfig) bool {
+	if !cfg.Enabled && len(cfg.CustomPatterns) == 0 {
+		return false
+	}
+	if cfg.Enabled && rePromptInjection.MatchString(text) {
+		return true
+	}
+	for _, pat := range cfg.CustomPatterns {
+		trimmed := strings.TrimSpace(pat)
+		if trimmed == "" {
+			continue
+		}
+		if re, err := getOrCompileRegex(trimmed); err == nil && re.MatchString(text) {
+			return true
+		}
+	}
+	return false
+}
+
+func (e *Engine) neutralizePromptInjection(text string, cfg config.PromptInjectionConfig) string {
+	out := text
+	if cfg.Enabled {
+		out = rePromptInjection.ReplaceAllString(out, "[JG-NEUTRALIZED-INJECTION]")
+	}
+	for _, pat := range cfg.CustomPatterns {
+		trimmed := strings.TrimSpace(pat)
+		if trimmed == "" {
+			continue
+		}
+		if re, err := getOrCompileRegex(trimmed); err == nil {
+			out = re.ReplaceAllString(out, "[JG-NEUTRALIZED-INJECTION]")
+		}
+	}
+	return out
 }

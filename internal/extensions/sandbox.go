@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"path/filepath"
 	"slices"
 	"time"
 
@@ -117,7 +118,8 @@ func (s *Sandbox) runSingleModule(parentCtx context.Context, mod config.WasmModu
 
 		// Verify Wasm module file from disk if path is specified
 		if mod.Path != "" {
-			rawWasm, err := os.ReadFile(mod.Path)
+			cleanPath := filepath.Clean(mod.Path)
+			rawWasm, err := os.ReadFile(cleanPath)
 			if err != nil {
 				doneCh <- outcome{err: err}
 				return

@@ -80,12 +80,9 @@ func runServe(cfgPath, langOverride string) {
 		snap.Core.Language = langOverride
 	}
 
-	logger := telemetry.NewZeroTrustLogger(
+	logger := telemetry.NewZeroTrustLoggerWithConfig(
 		os.Stdout,
-		snap.Telemetry.Logging.Level,
-		strings.EqualFold(snap.Telemetry.Logging.Format, "json"),
-		snap.Telemetry.Logging.ZeroTrustPrompts,
-		"***[JG-REDACTED]***",
+		snap.Telemetry.Logging,
 	)
 
 	_ = mgr.StartHotReload(

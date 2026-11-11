@@ -21,7 +21,10 @@
       },
       "grpc": {
         "enabled": false,
-        "listen_addr": "127.0.0.1:4011"
+        "listen_addr": "127.0.0.1:4011",
+        "require_auth": true,
+        "auth_token": "${JAGUARGATE_GRPC_AUTH_TOKEN}",
+        "allowed_roles": []
       }
     },
     "egress": {
@@ -38,6 +41,10 @@
     }
   },
   "guards": {
+    "prompt_injection": {
+      "enabled": true,
+      "custom_patterns": []
+    },
     "deobfuscation": {
       "enabled": true,
       "decode_base64": true,
@@ -79,7 +86,8 @@
         "api_secrets": true,
         "jwt_tokens": true
       },
-      "custom_patterns": []
+      "custom_patterns": [],
+      "pattern_overrides": {}
     },
     "output_sanitizer": {
       "block_untrusted_markdown_images": true,
@@ -119,7 +127,9 @@
       "level": "info",
       "format": "json",
       "zero_trust_redaction": true,
-      "redaction_placeholder": "***[JG-REDACTED]***"
+      "redaction_placeholder": "***[JG-REDACTED]***",
+      "custom_patterns": [],
+      "sensitive_fields": []
     },
     "webhooks": {
       "enabled": false,

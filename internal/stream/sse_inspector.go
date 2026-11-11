@@ -22,6 +22,13 @@ const (
 // StreamCompleteFunc is invoked once when the SSE stream finishes or halts, reporting final telemetry.
 type StreamCompleteFunc func(status, severity string, codes []string, prunedTools int)
 
+type streamToolCallTracker struct {
+	toolName   string
+	isPruned   bool
+	rawArgs    strings.Builder
+	domainFail bool
+}
+
 // SSEInspector wraps an upstream HTTP response body (io.ReadCloser) to inspect Server-Sent Events
 // in real time using a Rune-Aware UTF-8 Sliding Holdback Window.
 type SSEInspector struct {
@@ -33,17 +40,19 @@ type SSEInspector struct {
 	trailers    http.Header
 	onComplete  StreamCompleteFunc
 
-	rawBuf      bytes.Buffer
-	outBuf      bytes.Buffer
-	holdback    string // Rune-safe holdback buffer for cross-chunk tokens
-	utf8Rem     []byte // Holds incomplete multi-byte UTF-8 sequences split across TCP reads
-	codes       []string
-	status      string
-	severity    string
-	prunedTools int
-	halted      bool
-	eofReached  bool
-	reported    bool
+	rawBuf       bytes.Buffer
+	outBuf       bytes.Buffer
+	holdback     string // Rune-safe holdback buffer for cross-chunk tokens
+	utf8Rem      []byte // Holds incomplete multi-byte UTF-8 sequences split across TCP reads
+	codes        []string
+	status       string
+	severity     string
+	prunedTools  int
+	halted       bool
+	eofReached   bool
+	reported     bool
+	isAnthropic  bool
+	toolTrackers map[int]*streamToolCallTracker
 }
 
 // NewSSEInspector creates a streaming SSE inspector wrapping the upstream response body.
@@ -71,10 +80,11 @@ func NewSSEInspector(
 		sessionID:   sessID,
 		canaryToken: inbound.CanaryToken,
 		trailers:    trailers,
-		codes:       slices.Clone(inbound.Codes),
-		status:      status,
-		severity:    severity,
-		prunedTools: inbound.PrunedTools,
+		codes:        slices.Clone(inbound.Codes),
+		status:       status,
+		severity:     severity,
+		prunedTools:  inbound.PrunedTools,
+		toolTrackers: make(map[int]*streamToolCallTracker),
 	}
 }
 
@@ -150,6 +160,7 @@ func (s *SSEInspector) handleSSELine(line string) {
 	}
 
 	payloadStr := strings.TrimSpace(rawPayload)
+	isShadow := s.cfg != nil && s.cfg.Core.Mode == "shadow"
 
 	// Check for stream completion marker: data: [DONE]
 	if payloadStr == "[DONE]" {
@@ -163,7 +174,7 @@ func (s *SSEInspector) handleSSELine(line string) {
 				s.haltOnCanaryLeak()
 				return
 			}
-			if cleaned != "" {
+			if !isShadow && cleaned != "" {
 				s.emitSyntheticDeltaChunk(cleaned)
 			}
 		}
@@ -190,7 +201,13 @@ func (s *SSEInspector) handleSSELine(line string) {
 		return
 	}
 
-	isShadow := s.cfg.Core.Mode == "shadow"
+	if _, ok := eventObj["delta"].(map[string]any); ok && eventObj["choices"] == nil {
+		s.isAnthropic = true
+	}
+	if typeStr, _ := eventObj["type"].(string); strings.HasPrefix(typeStr, "content_block_") || typeStr == "message_start" {
+		s.isAnthropic = true
+	}
+
 	modified := false
 
 	// 1. OpenAI / LiteLLM / vLLM format: choices[].delta.content & choices[].delta.tool_calls
@@ -213,14 +230,87 @@ func (s *SSEInspector) handleSSELine(line string) {
 					}
 				}
 
-				// 1b. Inspect streaming delta.tool_calls against whitelist & domain rules
-				if rawTools, ok := deltaMap["tool_calls"].([]any); ok && len(rawTools) > 0 && s.cfg.Whitelist.EnforceToolWhitelist {
-					keptTools, toolCodes, pruned := guards.SanitizeToolCallsSlice(rawTools, s.cfg.Whitelist, isShadow)
-					s.prunedTools += pruned
-					for _, c := range toolCodes {
-						s.recordCode(c)
+				// 1b. Inspect streaming delta.tool_calls across fragmented chunks
+				if rawTools, ok := deltaMap["tool_calls"].([]any); ok && len(rawTools) > 0 {
+					var keptTools []any
+					toolsMutated := false
+					for _, rawTool := range rawTools {
+						toolMap, ok := rawTool.(map[string]any)
+						if !ok {
+							keptTools = append(keptTools, rawTool)
+							continue
+						}
+
+						tcIdx := 0
+						if idxVal, ok := toolMap["index"].(float64); ok {
+							tcIdx = int(idxVal)
+						}
+
+						tracker, exists := s.toolTrackers[tcIdx]
+						if !exists {
+							tracker = &streamToolCallTracker{}
+							s.toolTrackers[tcIdx] = tracker
+						}
+
+						fnMap, _ := toolMap["function"].(map[string]any)
+						if fnMap != nil {
+							if nameStr, ok := fnMap["name"].(string); ok && nameStr != "" {
+								tracker.toolName = nameStr
+								if s.cfg.Whitelist.EnforceToolWhitelist && !guards.IsToolAllowed(nameStr, s.cfg.Whitelist.AllowedTools) {
+									if !tracker.isPruned {
+										tracker.isPruned = true
+										s.prunedTools++
+										s.recordCode("JG-CFG-101")
+									}
+								}
+							}
+
+							if argsChunk, ok := fnMap["arguments"].(string); ok && argsChunk != "" {
+								tracker.rawArgs.WriteString(argsChunk)
+							}
+						}
+
+						if tracker.isPruned {
+							toolsMutated = true
+							if isShadow {
+								keptTools = append(keptTools, toolMap)
+							}
+							continue
+						}
+
+						// Check domain rules on complete accumulated arguments string
+						if len(s.cfg.Whitelist.AllowedDomains) > 0 && fnMap != nil {
+							accumulated := tracker.rawArgs.String()
+							_, violated := guards.SanitizeDomainsInText(accumulated, s.cfg.Whitelist.AllowedDomains, isShadow)
+							if violated || tracker.domainFail {
+								if !tracker.domainFail {
+									tracker.domainFail = true
+									s.recordCode("JG-CFG-103")
+								}
+								if !isShadow {
+									if argsChunk, ok := fnMap["arguments"].(string); ok && argsChunk != "" {
+										cleanedChunk, vChunk := guards.SanitizeDomainsInText(argsChunk, s.cfg.Whitelist.AllowedDomains, isShadow)
+										if vChunk {
+											fnMap["arguments"] = cleanedChunk
+											toolMap["function"] = fnMap
+											toolsMutated = true
+										} else if tracker.domainFail {
+											tailOnly := stripDomainTail(argsChunk)
+											if tailOnly != argsChunk {
+												fnMap["arguments"] = tailOnly
+												toolMap["function"] = fnMap
+												toolsMutated = true
+											}
+										}
+									}
+								}
+							}
+						}
+
+						keptTools = append(keptTools, toolMap)
 					}
-					if !isShadow && (pruned > 0 || len(toolCodes) > 0) {
+
+					if toolsMutated || len(keptTools) != len(rawTools) {
 						modified = true
 						if len(keptTools) > 0 {
 							deltaMap["tool_calls"] = keptTools
@@ -345,6 +435,22 @@ func (s *SSEInspector) haltOnCanaryLeak() {
 }
 
 func (s *SSEInspector) emitSyntheticDeltaChunk(text string) {
+	if s.isAnthropic {
+		chunk := map[string]any{
+			"type":  "content_block_delta",
+			"index": 0,
+			"delta": map[string]any{
+				"type": "text_delta",
+				"text": text,
+			},
+		}
+		if b, err := json.Marshal(chunk); err == nil {
+			s.outBuf.WriteString("data: ")
+			s.outBuf.Write(b)
+			s.outBuf.WriteString("\n\n")
+		}
+		return
+	}
 	chunk := map[string]any{
 		"choices": []any{
 			map[string]any{
@@ -542,4 +648,12 @@ func splitHoldbackSuffix(text, canary string, maxRunes int) (string, string) {
 	holdPart := tail[earliestHoldIdx:]
 
 	return prefixHead + safeTail, holdPart
+}
+
+func stripDomainTail(fragment string) string {
+	idx := strings.IndexAny(fragment, "\"' ,}]")
+	if idx == -1 {
+		return ""
+	}
+	return fragment[idx:]
 }

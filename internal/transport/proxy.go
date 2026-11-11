@@ -197,9 +197,21 @@ func NewGatewayServer(cfgMgr *config.Manager, logger *slog.Logger) (*GatewayServ
 
 			if resp.Body != nil {
 				maxRespBytes := max(int64(10), activeCfg.Network.Ingress.HTTP.MaxPayloadMB) * 1024 * 1024
-				rawResp, err := io.ReadAll(io.LimitReader(resp.Body, maxRespBytes))
+				rawResp, err := io.ReadAll(io.LimitReader(resp.Body, maxRespBytes+1))
 				_ = resp.Body.Close()
 				if err == nil {
+					if int64(len(rawResp)) > maxRespBytes {
+						resp.StatusCode = http.StatusBadGateway
+						resp.Header.Set("X-JaguarGate-Status", "BLOCKED")
+						resp.Header.Set("X-JaguarGate-Severity", "INTRUSION_ALERT")
+						resp.Header.Set("X-JaguarGate-Codes", "JG-CFG-202")
+						errMsg := []byte(`{"error":{"code":"upstream_response_too_large","message":"JaguarGate: Upstream response payload exceeded configured size limit (JG-CFG-202)"}}`)
+						resp.Body = io.NopCloser(bytes.NewReader(errMsg))
+						resp.ContentLength = int64(len(errMsg))
+						resp.Header.Set("Content-Type", "application/json")
+						resp.Header.Set("Content-Length", strconv.Itoa(len(errMsg)))
+						return nil
+					}
 					sessionID := inboundRes.SessionID
 					if activeCfg.Network.MCP.Enabled && mcp.IsJSONRPCPayload(rawResp) {
 						mcpRes := mcpInspector.InspectPayload(rawResp, sessionID, "", activeCfg)
@@ -539,6 +551,7 @@ func (s *GatewayServer) Start(ctx context.Context) error {
 			ReadHeaderTimeout: 5 * time.Second,
 			ReadTimeout:       readTimeout,
 			WriteTimeout:      writeTimeout,
+			IdleTimeout:       60 * time.Second,
 		}
 		wg.Add(1)
 		go func() {
@@ -575,6 +588,7 @@ func (s *GatewayServer) Start(ctx context.Context) error {
 			ReadHeaderTimeout: 5 * time.Second,
 			ReadTimeout:       readTimeout,
 			WriteTimeout:      writeTimeout,
+			IdleTimeout:       60 * time.Second,
 		}
 		wg.Add(1)
 		go func() {
@@ -590,10 +604,11 @@ func (s *GatewayServer) Start(ctx context.Context) error {
 	if cfg.Network.Ingress.GRPC.Enabled && cfg.Network.Ingress.GRPC.ListenAddr != "" {
 		s.rpcServer = &http.Server{
 			Addr:              cfg.Network.Ingress.GRPC.ListenAddr,
-			Handler:           handler,
+			Handler:           s.buildRPCHandler(handler, cfg.Network.Ingress.GRPC),
 			ReadHeaderTimeout: 5 * time.Second,
 			ReadTimeout:       readTimeout,
 			WriteTimeout:      writeTimeout,
+			IdleTimeout:       60 * time.Second,
 		}
 		wg.Add(1)
 		go func() {
@@ -611,6 +626,9 @@ func (s *GatewayServer) Start(ctx context.Context) error {
 			Addr:              cfg.Telemetry.OpenTelemetry.PrometheusListen,
 			Handler:           metricsMux,
 			ReadHeaderTimeout: 5 * time.Second,
+			ReadTimeout:       5 * time.Second,
+			WriteTimeout:      10 * time.Second,
+			IdleTimeout:       60 * time.Second,
 		}
 		wg.Add(1)
 		go func() {
@@ -688,4 +706,58 @@ func extractSessionID(r *http.Request) string {
 		return host
 	}
 	return "default_session"
+}
+
+func (s *GatewayServer) buildRPCHandler(baseHandler http.Handler, grpcCfg config.GRPCIngressConfig) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		isGRPC := strings.HasPrefix(strings.ToLower(r.Header.Get("Content-Type")), "application/grpc")
+
+		if grpcCfg.RequireAuth {
+			// Extract token from metadata or HTTP headers
+			token := ""
+			authHeader := r.Header.Get("Authorization")
+			if authHeader != "" {
+				if after, ok := strings.CutPrefix(authHeader, "Bearer "); ok {
+					token = strings.TrimSpace(after)
+				} else {
+					token = strings.TrimSpace(authHeader)
+				}
+			}
+			if token == "" {
+				token = strings.TrimSpace(r.Header.Get("grpc-metadata-authorization"))
+			}
+			if token == "" {
+				token = strings.TrimSpace(r.Header.Get("X-API-Key"))
+			}
+
+			expectedToken := strings.TrimSpace(grpcCfg.AuthToken)
+			if expectedToken != "" && token != expectedToken {
+				if isGRPC {
+					// Comply with standard gRPC over HTTP/2 status framing
+					w.Header().Set("Content-Type", "application/grpc")
+					w.Header().Set("Trailer", "Grpc-Status, Grpc-Message, X-JaguarGate-Codes")
+					w.Header().Set("X-JaguarGate-Status", "BLOCKED")
+					w.Header().Set("X-JaguarGate-Severity", "INTRUSION_ALERT")
+					w.Header().Set("X-JaguarGate-Codes", "JG-SEC-401")
+					w.WriteHeader(http.StatusOK)
+					w.Header().Set("Grpc-Status", "16") // 16 = UNAUTHENTICATED
+					w.Header().Set("Grpc-Message", "JaguarGate: RPC / gRPC caller is unauthenticated (JG-SEC-401)")
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				w.Header().Set("X-JaguarGate-Status", "BLOCKED")
+				w.Header().Set("X-JaguarGate-Severity", "INTRUSION_ALERT")
+				w.Header().Set("X-JaguarGate-Codes", "JG-SEC-401")
+				w.WriteHeader(http.StatusUnauthorized)
+				_, _ = w.Write([]byte(`{"error":{"code":"unauthenticated","message":"JaguarGate: RPC / gRPC caller is unauthenticated (JG-SEC-401)"}}`))
+				return
+			}
+		}
+
+		if isGRPC {
+			w.Header().Set("Trailer", "Grpc-Status, Grpc-Message, X-JaguarGate-Status, X-JaguarGate-Codes")
+		}
+
+		baseHandler.ServeHTTP(w, r)
+	})
 }
