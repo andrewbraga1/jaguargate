@@ -656,6 +656,9 @@ func (s *GatewayServer) Start(ctx context.Context) error {
 		if s.metricsServer != nil {
 			_ = s.metricsServer.Shutdown(shutdownCtx)
 		}
+		if s.sandbox != nil {
+			_ = s.sandbox.Close(shutdownCtx)
+		}
 		if s.udsPath != "" {
 			_ = os.Remove(s.udsPath)
 		}

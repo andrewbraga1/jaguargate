@@ -54,10 +54,10 @@ flowchart TD
         Modes["Modos: Shadow | Sanitize & Warn | Hard Block"]
     end
 
-    subgraph L4["Camada 4: Estado Híbrido (L1/L2) & Interface Wasm"]
+    subgraph L4["Camada 4: Estado Híbrido (L1/L2) & Sandbox Wasm"]
         State["L1 RAM Lock-Free (atomic.Pointer) + L2 Redis AES-GCM"]
         Loop["Disjuntor de Loops por Hash SHA-256 Canônico"]
-        Wasm["Interface de Plugins Wasm (Validação de Cabeçalho & Fail-Open)"]
+        Wasm["Sandbox Wasm (Runtime Pure-Go wazero & Fallback Fail-Open)"]
     end
 
     subgraph L5["Camada 5: Streaming em Tempo Real & Telemetria Zero-Trust"]

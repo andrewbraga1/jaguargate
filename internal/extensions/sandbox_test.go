@@ -2,6 +2,7 @@ package extensions
 
 import (
 	"context"
+	"os"
 	"slices"
 	"testing"
 	"time"
@@ -45,6 +46,89 @@ func TestSandboxWasmMagicBytesAndTimeoutFailOpen(t *testing.T) {
 	}
 	if string(res.ModifiedPayload) != string(original) {
 		t.Fatalf("Fail-Open violated: original payload was altered despite timeout: %s", string(res.ModifiedPayload))
+	}
+}
+
+func TestSandboxWazeroExecutionAndModuleCompilation(t *testing.T) {
+	ctx := context.Background()
+	sb := NewSandbox()
+	defer func() { _ = sb.Close(ctx) }()
+
+	// 1. Valid minimal 8-byte WebAssembly binary
+	validEmptyWasm := []byte{0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00}
+	wasmFile, err := os.CreateTemp("", "test_plugin_*.wasm")
+	if err != nil {
+		t.Fatalf("failed to create temp wasm file: %v", err)
+	}
+	defer os.Remove(wasmFile.Name())
+
+	if _, err := wasmFile.Write(validEmptyWasm); err != nil {
+		t.Fatalf("failed to write wasm file: %v", err)
+	}
+	_ = wasmFile.Close()
+
+	cfg := config.WasmPluginsConfig{
+		Enabled:            true,
+		MaxExecutionTimeMs: 100,
+		Modules: []config.WasmModuleEntry{
+			{Name: "valid_wasm_plugin", Path: wasmFile.Name()},
+		},
+	}
+
+	payload := []byte(`{"model":"gpt-4o","messages":[{"role":"user","content":"ping"}]}`)
+	res := sb.Execute(ctx, payload, cfg)
+
+	if res.TimedOut {
+		t.Fatal("valid wasm module unexpectedly timed out")
+	}
+	if len(res.WarningCodes) > 0 {
+		t.Fatalf("expected 0 warning codes on valid wasm execution, got %v", res.WarningCodes)
+	}
+	if string(res.ModifiedPayload) != string(payload) {
+		t.Fatalf("expected unmodified payload on passthrough, got %s", string(res.ModifiedPayload))
+	}
+
+	// 2. Second execution tests the compiled module cache (getOrCompile)
+	resCached := sb.Execute(ctx, payload, cfg)
+	if len(resCached.WarningCodes) > 0 {
+		t.Fatalf("expected 0 warning codes on cached wasm execution, got %v", resCached.WarningCodes)
+	}
+
+	// 3. Test invalid Wasm binary triggers fail-open with JG-EXT-601
+	corruptedFile, err := os.CreateTemp("", "corrupt_plugin_*.wasm")
+	if err != nil {
+		t.Fatalf("failed to create temp file: %v", err)
+	}
+	defer os.Remove(corruptedFile.Name())
+	_, _ = corruptedFile.WriteString("NOT_WASM_BINARY_DATA")
+	_ = corruptedFile.Close()
+
+	badCfg := config.WasmPluginsConfig{
+		Enabled:            true,
+		MaxExecutionTimeMs: 100,
+		Modules: []config.WasmModuleEntry{
+			{Name: "corrupt_wasm", Path: corruptedFile.Name()},
+		},
+	}
+	resCorrupt := sb.Execute(ctx, payload, badCfg)
+	if !slices.Contains(resCorrupt.WarningCodes, "JG-EXT-601") {
+		t.Errorf("expected JG-EXT-601 on corrupted wasm binary, got %v", resCorrupt.WarningCodes)
+	}
+	if string(resCorrupt.ModifiedPayload) != string(payload) {
+		t.Fatalf("fail-open violated on corrupt wasm: %s", string(resCorrupt.ModifiedPayload))
+	}
+
+	// 4. Test non-existent file triggers fail-open with JG-EXT-601
+	missingCfg := config.WasmPluginsConfig{
+		Enabled:            true,
+		MaxExecutionTimeMs: 100,
+		Modules: []config.WasmModuleEntry{
+			{Name: "missing_wasm", Path: "/non/existent/path/plugin.wasm"},
+		},
+	}
+	resMissing := sb.Execute(ctx, payload, missingCfg)
+	if !slices.Contains(resMissing.WarningCodes, "JG-EXT-601") {
+		t.Errorf("expected JG-EXT-601 on missing wasm file, got %v", resMissing.WarningCodes)
 	}
 }
 
