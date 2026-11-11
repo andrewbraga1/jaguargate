@@ -131,19 +131,46 @@ func (e *Engine) InspectJSONPayloadWithSession(body []byte, sessionID string, cf
 				systemFound = true
 			}
 
-			// Selective Tool Call pruning inside message history if present
-			if msgTools, ok := msgMap["tool_calls"].([]any); ok && cfg.Whitelist.EnforceToolWhitelist {
-				keptMsgTools, toolCodes, pruned := SanitizeToolCallsSlice(msgTools, cfg.Whitelist, isShadow)
-				res.PrunedTools += pruned
-				for _, c := range toolCodes {
-					res.addCode(c, false)
+			// Selective Tool Call pruning and PII masking inside message history if present (OpenAI format)
+			if msgTools, ok := msgMap["tool_calls"].([]any); ok {
+				if cfg.Whitelist.EnforceToolWhitelist {
+					keptMsgTools, toolCodes, pruned := SanitizeToolCallsSlice(msgTools, cfg.Whitelist, isShadow)
+					res.PrunedTools += pruned
+					for _, c := range toolCodes {
+						res.addCode(c, false)
+					}
+					if !isShadow && (pruned > 0 || len(toolCodes) > 0) {
+						modified = true
+						if len(keptMsgTools) > 0 {
+							msgMap["tool_calls"] = keptMsgTools
+							msgTools = keptMsgTools
+						} else {
+							delete(msgMap, "tool_calls")
+							msgTools = nil
+						}
+					}
 				}
-				if !isShadow && (pruned > 0 || len(toolCodes) > 0) {
-					modified = true
-					if len(keptMsgTools) > 0 {
-						msgMap["tool_calls"] = keptMsgTools
-					} else {
-						delete(msgMap, "tool_calls")
+
+				// JG-01: Apply PII Vault masking to function arguments in historical tool calls
+				for _, tcItem := range msgTools {
+					if tcMap, ok := tcItem.(map[string]any); ok {
+						if fnMap, ok := tcMap["function"].(map[string]any); ok {
+							if argsStr, ok := fnMap["arguments"].(string); ok {
+								cleanedArgs, argsCodes, argsIntruded, argsMasked := e.inspectTextSegment(sessionID, argsStr, role, cfg, &res.CanaryToken)
+								res.MaskedCount += argsMasked
+								for _, c := range argsCodes {
+									res.addCode(c, argsIntruded)
+								}
+								if !isShadow && cleanedArgs != argsStr {
+									fnMap["arguments"] = cleanedArgs
+									modified = true
+								}
+							} else if argsObj, ok := fnMap["arguments"].(map[string]any); ok {
+								if e.inspectArbitraryJSONMap(argsObj, sessionID, cfg, &res, 1) {
+									modified = true
+								}
+							}
+						}
 					}
 				}
 			}
@@ -166,6 +193,8 @@ func (e *Engine) InspectJSONPayloadWithSession(body []byte, sessionID string, cf
 					if !ok {
 						continue
 					}
+					partType, _ := partMap["type"].(string)
+
 					if txt, ok := partMap["text"].(string); ok {
 						cleaned, codes, intruded, masked := e.inspectTextSegment(sessionID, txt, role, cfg, &res.CanaryToken)
 						res.MaskedCount += masked
@@ -177,6 +206,45 @@ func (e *Engine) InspectJSONPayloadWithSession(body []byte, sessionID string, cf
 							modified = true
 						}
 					}
+
+					// JG-01: Anthropic tool_use (content[].tool_use.input)
+					if partType == "tool_use" {
+						if inputMap, ok := partMap["input"].(map[string]any); ok {
+							if e.inspectArbitraryJSONMap(inputMap, sessionID, cfg, &res, 1) {
+								modified = true
+							}
+						} else if inputStr, ok := partMap["input"].(string); ok {
+							cleanedInput, codes, intruded, masked := e.inspectTextSegment(sessionID, inputStr, role, cfg, &res.CanaryToken)
+							res.MaskedCount += masked
+							for _, c := range codes {
+								res.addCode(c, intruded)
+							}
+							if !isShadow && cleanedInput != inputStr {
+								partMap["input"] = cleanedInput
+								modified = true
+							}
+						}
+					}
+
+					// JG-01: Anthropic tool_result (content[].tool_result.content)
+					if partType == "tool_result" {
+						if resContentStr, ok := partMap["content"].(string); ok {
+							cleanedRes, codes, intruded, masked := e.inspectTextSegment(sessionID, resContentStr, role, cfg, &res.CanaryToken)
+							res.MaskedCount += masked
+							for _, c := range codes {
+								res.addCode(c, intruded)
+							}
+							if !isShadow && cleanedRes != resContentStr {
+								partMap["content"] = cleanedRes
+								modified = true
+							}
+						} else if resContentArr, ok := partMap["content"].([]any); ok {
+							if e.inspectArbitraryJSONSlice(resContentArr, sessionID, cfg, &res, 1) {
+								modified = true
+							}
+						}
+					}
+
 					if imgObj, ok := partMap["image_url"].(map[string]any); ok {
 						if urlStr, ok := imgObj["url"].(string); ok && multimodal.IsDataURI(urlStr) {
 							mRes := multimodal.SanitizeDataURI(urlStr, cfg.Guards.Multimodal)
@@ -269,14 +337,22 @@ func (e *Engine) InspectJSONPayloadWithSession(body []byte, sessionID string, cf
 const maxJSONInspectionDepth = 8
 
 func (e *Engine) inspectArbitraryJSONMap(m map[string]any, sessionID string, cfg *config.Config, res *InspectionResult, depth int) bool {
+	isShadow := cfg.Core.Mode == "shadow"
 	if depth > maxJSONInspectionDepth {
 		res.addCode("JG-CFG-203", false)
 		if cfg.Core.Mode == "hard_block" {
 			res.Severity = "INTRUSION_ALERT"
+			return false
+		}
+		if !isShadow {
+			// In balanced / sanitize_and_warn: redact uninspected deep subtree so unmasked PII/secrets never leak
+			for k := range m {
+				m[k] = "[JG-DEPTH-EXCEEDED-REDACTED]"
+			}
+			return true
 		}
 		return false
 	}
-	isShadow := cfg.Core.Mode == "shadow"
 	modified := false
 
 	for k, v := range m {
@@ -314,14 +390,22 @@ func (e *Engine) inspectArbitraryJSONMap(m map[string]any, sessionID string, cfg
 }
 
 func (e *Engine) inspectArbitraryJSONSlice(s []any, sessionID string, cfg *config.Config, res *InspectionResult, depth int) bool {
+	isShadow := cfg.Core.Mode == "shadow"
 	if depth > maxJSONInspectionDepth {
 		res.addCode("JG-CFG-203", false)
 		if cfg.Core.Mode == "hard_block" {
 			res.Severity = "INTRUSION_ALERT"
+			return false
+		}
+		if !isShadow {
+			// In balanced / sanitize_and_warn: redact uninspected deep subtree so unmasked PII/secrets never leak
+			for i := range s {
+				s[i] = "[JG-DEPTH-EXCEEDED-REDACTED]"
+			}
+			return true
 		}
 		return false
 	}
-	isShadow := cfg.Core.Mode == "shadow"
 	modified := false
 
 	for i, item := range s {

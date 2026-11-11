@@ -1,6 +1,7 @@
 package stream
 
 import (
+	"fmt"
 	"io"
 	"net/http"
 	"slices"
@@ -297,6 +298,206 @@ func TestSSEFragmentedToolCallsAcrossChunksAndDomainDetection(t *testing.T) {
 	// 3. Verify evil.example is replaced with blocked domain in output
 	if strings.Contains(output, "il.example/exfil") {
 		t.Errorf("SECURITY FAILURE: fragmented forbidden domain survived in SSE output:\n%s", output)
+	}
+}
+
+func TestAnthropicStreamingToolUseAndDomainSanitization(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.ApplyPreset()
+	cfg.Whitelist.EnforceToolWhitelist = true
+	cfg.Whitelist.AllowedTools = []string{"safe_tool"}
+	cfg.Whitelist.AllowedDomains = []string{"*.trusted.com"}
+
+	anthropicSSE := "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tool_bad\",\"name\":\"drop_db\"}}\n\n" +
+		"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"force\\\":true}\"}}\n\n" +
+		"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tool_ok\",\"name\":\"safe_tool\"}}\n\n" +
+		"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"url\\\":\\\"https://ev\"}}\n\n" +
+		"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"il.example/path\\\"}\"}}\n\n" +
+		"data: [DONE]\n\n"
+
+	vault := guards.NewPIIVault()
+	insp := NewSSEInspector(
+		io.NopCloser(strings.NewReader(anthropicSSE)),
+		&cfg,
+		vault,
+		guards.InspectionResult{Status: "CLEAN", SessionID: "sess-anthropic-sse"},
+		nil,
+	)
+
+	outBytes, err := io.ReadAll(insp)
+	if err != nil {
+		t.Fatalf("failed to read Anthropic SSE stream: %v", err)
+	}
+	outStr := string(outBytes)
+
+	// 1. Unauthorized tool 'drop_db' must be pruned (JG-CFG-101) and suppressed from stream
+	if !slices.Contains(insp.codes, "JG-CFG-101") {
+		t.Errorf("expected JG-CFG-101 for unauthorized Anthropic tool, got %v", insp.codes)
+	}
+	if strings.Contains(outStr, "drop_db") {
+		t.Errorf("SECURITY FAILURE (JG-03): unauthorized Anthropic tool 'drop_db' survived in stream:\n%s", outStr)
+	}
+	if strings.Contains(outStr, `"force":true`) {
+		t.Errorf("SECURITY FAILURE (JG-03): pruned tool arguments survived in stream:\n%s", outStr)
+	}
+
+	// 2. Fragmented domain violation must be detected (JG-CFG-103) and stripped
+	if !slices.Contains(insp.codes, "JG-CFG-103") {
+		t.Errorf("expected JG-CFG-103 for fragmented forbidden domain in Anthropic tool, got %v", insp.codes)
+	}
+	if strings.Contains(outStr, "evil.example") {
+		t.Errorf("SECURITY FAILURE (JG-03): forbidden domain survived in Anthropic tool stream:\n%s", outStr)
+	}
+}
+
+func TestOllamaNDJSONStreamingInspection(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.ApplyPreset()
+	cfg.Whitelist.EnforceToolWhitelist = true
+	cfg.Whitelist.AllowedTools = []string{"get_weather", "search_knowledge_base"}
+	cfg.Whitelist.AllowedDomains = []string{"*.yourdomain.com"}
+
+	// Scenario 1: Ollama /api/chat NDJSON stream containing 2 tool calls (1 forbidden tool, 1 allowed tool with disallowed domain)
+	ollamaToolNDJSON := `{"model":"llama3.2","message":{"role":"assistant","content":"","tool_calls":[{"function":{"name":"drop_production_db","arguments":{"force":true}}},{"function":{"name":"search_knowledge_base","arguments":{"url":"https://evil-exfil.com/data"}}}]},"done":false}` + "\n" +
+		`{"model":"llama3.2","message":{"role":"assistant","content":"","tool_calls":[{"function":{"name":"get_weather","arguments":{"city":"Sorocaba"}}}]},"done":true}` + "\n"
+
+	vault := guards.NewPIIVault()
+	inspTool := NewSSEInspector(
+		io.NopCloser(strings.NewReader(ollamaToolNDJSON)),
+		&cfg,
+		vault,
+		guards.InspectionResult{Status: "CLEAN", SessionID: "sess-ollama-ndjson"},
+		nil,
+	)
+
+	outBytes, err := io.ReadAll(inspTool)
+	if err != nil {
+		t.Fatalf("failed to read Ollama NDJSON stream: %v", err)
+	}
+	outStr := string(outBytes)
+
+	// 1a. Forbidden tool must be pruned (JG-CFG-101)
+	if !slices.Contains(inspTool.codes, "JG-CFG-101") {
+		t.Errorf("expected JG-CFG-101 in Ollama NDJSON tool stream, got %v", inspTool.codes)
+	}
+	if strings.Contains(outStr, "drop_production_db") {
+		t.Errorf("SECURITY FAILURE (JG-03): forbidden tool survived in Ollama NDJSON stream:\n%s", outStr)
+	}
+
+	// 1b. Forbidden domain must be sanitized (JG-CFG-103)
+	if !slices.Contains(inspTool.codes, "JG-CFG-103") {
+		t.Errorf("expected JG-CFG-103 in Ollama NDJSON tool stream, got %v", inspTool.codes)
+	}
+	if strings.Contains(outStr, "evil-exfil.com") {
+		t.Errorf("SECURITY FAILURE (JG-03): forbidden domain survived in Ollama NDJSON tool stream:\n%s", outStr)
+	}
+
+	// 1c. Allowed tool must remain intact
+	if !strings.Contains(outStr, "get_weather") {
+		t.Errorf("allowed tool get_weather was improperly removed from Ollama NDJSON stream:\n%s", outStr)
+	}
+
+	// Scenario 2: Ollama /api/generate NDJSON stream with Canary Leak (JG-SEC-501)
+	canary := "jg_cnry_ollama_987654321"
+	ollamaCanaryNDJSON := fmt.Sprintf("{\"model\":\"llama3.2\",\"response\":\"Inicio de resposta: %s\",\"done\":false}\n{\"model\":\"llama3.2\",\"response\":\" ESTE DADO NUNCA DEVE SER TRANSMITIDO\",\"done\":false}\n", canary)
+
+	inspCanary := NewSSEInspector(
+		io.NopCloser(strings.NewReader(ollamaCanaryNDJSON)),
+		&cfg,
+		vault,
+		guards.InspectionResult{Status: "CLEAN", CanaryToken: canary, SessionID: "sess-ollama-canary"},
+		nil,
+	)
+
+	canaryOutBytes, err := io.ReadAll(inspCanary)
+	if err != nil {
+		t.Fatalf("failed to read Ollama canary stream: %v", err)
+	}
+	canaryOutStr := string(canaryOutBytes)
+
+	if !slices.Contains(inspCanary.codes, "JG-SEC-501") {
+		t.Errorf("expected JG-SEC-501 in Ollama NDJSON canary leak, got %v", inspCanary.codes)
+	}
+	if strings.Contains(canaryOutStr, canary) {
+		t.Errorf("SECURITY FAILURE (JG-03): canary token leaked in Ollama NDJSON stream:\n%s", canaryOutStr)
+	}
+	if strings.Contains(canaryOutStr, "ESTE DADO NUNCA DEVE SER TRANSMITIDO") {
+		t.Errorf("SECURITY FAILURE (JG-03): post-canary data leaked in Ollama NDJSON stream:\n%s", canaryOutStr)
+	}
+
+	// Scenario 3: Ollama NDJSON Split PII Vault Token Restoration
+	maskedPrompt, _, _ := vault.MaskTextWithSession("sess-ollama-pii", "CPF 123.456.789-01", cfg.Guards.PIIVault, false)
+	tokenStart := strings.Index(maskedPrompt, piiOpenPrefix)
+	if tokenStart == -1 {
+		t.Fatalf("expected masked token in %q", maskedPrompt)
+	}
+	piiToken := maskedPrompt[tokenStart:]
+	half1 := piiToken[:8]
+	half2 := piiToken[8:]
+
+	ollamaPIINDJSON := fmt.Sprintf("{\"model\":\"llama3.2\",\"response\":\"Seu documento é %s\",\"done\":false}\n{\"model\":\"llama3.2\",\"response\":\"%s com sucesso.\",\"done\":true}\n", half1, half2)
+
+	inspPII := NewSSEInspector(
+		io.NopCloser(strings.NewReader(ollamaPIINDJSON)),
+		&cfg,
+		vault,
+		guards.InspectionResult{Status: "CLEAN", SessionID: "sess-ollama-pii"},
+		nil,
+	)
+
+	piiOutBytes, err := io.ReadAll(inspPII)
+	if err != nil {
+		t.Fatalf("failed to read Ollama PII stream: %v", err)
+	}
+	piiOutStr := string(piiOutBytes)
+
+	if !strings.Contains(piiOutStr, "123.456.789-01") {
+		t.Errorf("expected split PII token to be restored in Ollama NDJSON stream, got:\n%s", piiOutStr)
+	}
+}
+
+func TestSSETrackerMemoryBoundsAndLimits(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.ApplyPreset()
+
+	// 1. Tool call exceeding maxToolArgsBytes (256 KB)
+	hugeChunk := strings.Repeat("A", 300*1024)
+	streamPayload := fmt.Sprintf("data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"test_tool\",\"arguments\":\"%s\"}}]}}]}\n\ndata: [DONE]\n\n", hugeChunk)
+
+	vault := guards.NewPIIVault()
+	insp := NewSSEInspector(
+		io.NopCloser(strings.NewReader(streamPayload)),
+		&cfg,
+		vault,
+		guards.InspectionResult{Status: "CLEAN", SessionID: "sess-limit-test"},
+		nil,
+	)
+
+	_, _ = io.ReadAll(insp)
+
+	if !slices.Contains(insp.codes, "JG-CFG-202") {
+		t.Errorf("SECURITY FAILURE (JG-05): expected JG-CFG-202 for tool arguments exceeding maxToolArgsBytes, got %v", insp.codes)
+	}
+
+	// 2. Exceeding maxTrackersPerStream (35 distinct indices > 32)
+	var multiTrackers strings.Builder
+	for i := 0; i < 35; i++ {
+		multiTrackers.WriteString(fmt.Sprintf("data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":%d,\"function\":{\"name\":\"tool_%d\",\"arguments\":\"{}\"}}]}}]}\n\n", i, i))
+	}
+	multiTrackers.WriteString("data: [DONE]\n\n")
+
+	inspMulti := NewSSEInspector(
+		io.NopCloser(strings.NewReader(multiTrackers.String())),
+		&cfg,
+		vault,
+		guards.InspectionResult{Status: "CLEAN", SessionID: "sess-limit-trackers"},
+		nil,
+	)
+
+	_, _ = io.ReadAll(inspMulti)
+
+	if !slices.Contains(inspMulti.codes, "JG-CFG-202") {
+		t.Errorf("SECURITY FAILURE (JG-05): expected JG-CFG-202 for stream exceeding maxTrackersPerStream, got %v", inspMulti.codes)
 	}
 }
 

@@ -145,7 +145,22 @@ func (ins *Inspector) InspectPayload(body []byte, sessionID, mcpServerHeader str
 	}
 
 	res.finalize(cfg.Core.Mode)
-	if modified && !isShadow && !res.Blocked {
+	if res.Blocked && !isShadow {
+		blockedErr := map[string]any{
+			"jsonrpc": "2.0",
+			"error": map[string]any{
+				"code":    -32600,
+				"message": "JaguarGate: MCP security policy blocked request or response",
+				"data":    res.Codes,
+			},
+		}
+		if idVal, hasID := rpcObj["id"]; hasID {
+			blockedErr["id"] = idVal
+		}
+		if b, err := marshalUnescaped(blockedErr); err == nil {
+			res.ModifiedBody = b
+		}
+	} else if modified && !isShadow {
 		if b, err := marshalUnescaped(rpcObj); err == nil {
 			res.ModifiedBody = b
 		}
@@ -221,6 +236,22 @@ func (ins *Inspector) inspectSingleRPCObject(rpcObj map[string]any, sessionID st
 				resultObj["content"] = content
 				rpcObj["result"] = resultObj
 				modified = true
+			}
+		}
+		// JG-02: Support MCP 2024-11-05 result.structuredContent inspection
+		if structContent, ok := resultObj["structuredContent"]; ok {
+			scBytes, _ := marshalUnescaped(structContent)
+			insp := ins.engine.InspectJSONPayloadWithSession(scBytes, sessionID, cfg)
+			for _, c := range insp.Codes {
+				res.addCode(c, insp.Severity == "INTRUSION_ALERT")
+			}
+			if !isShadow && !bytes.Equal(insp.ModifiedBody, scBytes) {
+				var cleanedSC any
+				if err := json.Unmarshal(insp.ModifiedBody, &cleanedSC); err == nil {
+					resultObj["structuredContent"] = cleanedSC
+					rpcObj["result"] = resultObj
+					modified = true
+				}
 			}
 		}
 	}

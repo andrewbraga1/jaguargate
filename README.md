@@ -284,12 +284,12 @@ JaguarGate outputs all CLI tables and logs in **English (`en`)** by default for 
 
 ## 🎯 Protocol & Provider Support Matrix
 
-| Protocol / Model Family | Ingress Transport | Non-Streaming Output | Streaming (SSE) | Tool Call Governance |
-| :--- | :--- | :---: | :---: | :--- |
-| **OpenAI / LiteLLM / vLLM** | HTTP (`:4010`), UDS, gRPC (`:4011`) | Full (`choices[].message`) | Full (`choices[].delta`) | Full (Cross-chunk reassembly & domain checks) |
-| **Anthropic (Messages API)** | HTTP (`:4010`), UDS, gRPC (`:4011`) | Full (`content[].text` & `content[].tool_use`) | Full (`delta.text`) | Full (`tool_use` pruned with benign refusal) |
-| **Ollama** | HTTP (`:4010`), UDS (Zero-Latency) | Full (`message.content`, `response`) | Full (`message.content`, `response`) | Full (`tool_calls` validated against Whitelist) |
-| **MCP (Model Context Protocol)** | Stdio & HTTP/SSE (JSON-RPC 2.0) | Full (`result.content`, `resources/read`) | — | Full (Recursive traversal & depth $\le 8$ cap) |
+| Protocol / Model Family | Ingress Transport | Non-Streaming Output | Streaming (SSE / NDJSON) | Tool Call Governance |
+| :--- | :--- | :--- | :--- | :--- |
+| **OpenAI / LiteLLM / vLLM** | HTTP (`:4010`), UDS, gRPC (`:4011`) | Structural (`choices[].message`) | SSE (`choices[].delta.content`) | Cross-chunk reassembly (`delta.tool_calls`), arguments PII masking & domain checks |
+| **Anthropic (Messages API)** | HTTP (`:4010`), UDS, gRPC (`:4011`) | Structural (`content[].text` & `content[].tool_use`) | SSE (`delta.text`, `content_block_start`, `content_block_delta`) | `tool_use` pruned with benign refusal; `input_json_delta` domain & memory bounded |
+| **Ollama** | HTTP (`:4010`), UDS (Zero-Latency) | Structural (`message.content`, top-level `response`) | SSE & NDJSON (`message.content`, `response`, `message.tool_calls`) | Native `message.tool_calls` validated against Whitelist & domain policy |
+| **MCP (Model Context Protocol)** | Stdio & HTTP/SSE (JSON-RPC 2.0) | Structural (`result.content`, `result.structuredContent`, `resources/read`) | — | Recursive traversal, depth $\le 8$ cap with redaction, and HTTP 403 hard-block |
 
 ---
 

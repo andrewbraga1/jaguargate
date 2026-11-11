@@ -22,6 +22,11 @@ const (
 // StreamCompleteFunc is invoked once when the SSE stream finishes or halts, reporting final telemetry.
 type StreamCompleteFunc func(status, severity string, codes []string, prunedTools int)
 
+const (
+	maxTrackersPerStream = 32
+	maxToolArgsBytes     = 256 * 1024 // 256 KB per tool call to prevent unbounded memory exhaustion
+)
+
 type streamToolCallTracker struct {
 	toolName   string
 	isPruned   bool
@@ -52,6 +57,7 @@ type SSEInspector struct {
 	eofReached   bool
 	reported     bool
 	isAnthropic  bool
+	isNDJSON     bool
 	toolTrackers map[int]*streamToolCallTracker
 }
 
@@ -152,9 +158,15 @@ func (s *SSEInspector) processAvailableLines(flushAll bool) {
 func (s *SSEInspector) handleSSELine(line string) {
 	trimmed := strings.TrimSpace(line)
 
-	// Modern Go (1.20+): single-pass prefix check and slice cut via strings.CutPrefix
+	// Single-pass prefix check: support standard SSE ("data: ...") and Ollama NDJSON ("{...}")
 	rawPayload, isDataLine := strings.CutPrefix(trimmed, "data:")
-	if trimmed == "" || !isDataLine {
+	isNDJSON := false
+	if !isDataLine && strings.HasPrefix(trimmed, "{") {
+		rawPayload = trimmed
+		isNDJSON = true
+		s.isNDJSON = true
+	}
+	if trimmed == "" || (!isDataLine && !isNDJSON) {
 		s.outBuf.WriteString(line)
 		return
 	}
@@ -194,9 +206,14 @@ func (s *SSEInspector) handleSSELine(line string) {
 			return
 		}
 		if shouldEmit {
-			s.outBuf.WriteString("data: ")
-			s.outBuf.WriteString(outText)
-			s.outBuf.WriteByte('\n')
+			if isNDJSON {
+				s.outBuf.WriteString(outText)
+				s.outBuf.WriteByte('\n')
+			} else {
+				s.outBuf.WriteString("data: ")
+				s.outBuf.WriteString(outText)
+				s.outBuf.WriteByte('\n')
+			}
 		}
 		return
 	}
@@ -248,8 +265,13 @@ func (s *SSEInspector) handleSSELine(line string) {
 
 						tracker, exists := s.toolTrackers[tcIdx]
 						if !exists {
-							tracker = &streamToolCallTracker{}
-							s.toolTrackers[tcIdx] = tracker
+							if len(s.toolTrackers) >= maxTrackersPerStream {
+								s.recordCode("JG-CFG-202")
+								tracker = &streamToolCallTracker{isPruned: true}
+							} else {
+								tracker = &streamToolCallTracker{}
+								s.toolTrackers[tcIdx] = tracker
+							}
 						}
 
 						fnMap, _ := toolMap["function"].(map[string]any)
@@ -266,7 +288,13 @@ func (s *SSEInspector) handleSSELine(line string) {
 							}
 
 							if argsChunk, ok := fnMap["arguments"].(string); ok && argsChunk != "" {
-								tracker.rawArgs.WriteString(argsChunk)
+								if tracker.rawArgs.Len()+len(argsChunk) > maxToolArgsBytes {
+									s.recordCode("JG-CFG-202")
+									tracker.isPruned = true
+									toolsMutated = true
+								} else {
+									tracker.rawArgs.WriteString(argsChunk)
+								}
 							}
 						}
 
@@ -341,6 +369,89 @@ func (s *SSEInspector) handleSSELine(line string) {
 		}
 	}
 
+	// 2b. Anthropic SSE format: content_block_start with tool_use (JG-03)
+	if typeStr, _ := eventObj["type"].(string); typeStr == "content_block_start" {
+		idx := 0
+		if fIdx, ok := eventObj["index"].(float64); ok {
+			idx = int(fIdx)
+		}
+		if cbMap, ok := eventObj["content_block"].(map[string]any); ok {
+			if cbType, _ := cbMap["type"].(string); cbType == "tool_use" {
+				toolName, _ := cbMap["name"].(string)
+				tracker := &streamToolCallTracker{toolName: toolName}
+				if s.cfg.Whitelist.EnforceToolWhitelist && !guards.IsToolAllowed(toolName, s.cfg.Whitelist.AllowedTools) {
+					tracker.isPruned = true
+					s.prunedTools++
+					s.recordCode("JG-CFG-101")
+				}
+				if len(s.toolTrackers) >= maxTrackersPerStream {
+					s.recordCode("JG-CFG-202")
+					tracker.isPruned = true
+				}
+				s.toolTrackers[idx] = tracker
+
+				if tracker.isPruned && !isShadow {
+					return
+				}
+			}
+		}
+	}
+
+	// 2c. Anthropic SSE format: content_block_delta with input_json_delta (JG-03)
+	if typeStr, _ := eventObj["type"].(string); typeStr == "content_block_delta" {
+		idx := 0
+		if fIdx, ok := eventObj["index"].(float64); ok {
+			idx = int(fIdx)
+		}
+		if deltaMap, ok := eventObj["delta"].(map[string]any); ok {
+			if deltaType, _ := deltaMap["type"].(string); deltaType == "input_json_delta" {
+				tracker, exists := s.toolTrackers[idx]
+				if exists && tracker.isPruned && !isShadow {
+					return
+				}
+				if partialJSON, ok := deltaMap["partial_json"].(string); ok && partialJSON != "" {
+					if exists {
+						if tracker.rawArgs.Len()+len(partialJSON) > maxToolArgsBytes {
+							s.recordCode("JG-CFG-202")
+							tracker.isPruned = true
+							if !isShadow {
+								return
+							}
+						} else {
+							tracker.rawArgs.WriteString(partialJSON)
+						}
+
+						if len(s.cfg.Whitelist.AllowedDomains) > 0 {
+							accumulated := tracker.rawArgs.String()
+							_, violated := guards.SanitizeDomainsInText(accumulated, s.cfg.Whitelist.AllowedDomains, isShadow)
+							if violated || tracker.domainFail {
+								if !tracker.domainFail {
+									tracker.domainFail = true
+									s.recordCode("JG-CFG-103")
+								}
+								if !isShadow {
+									cleanedChunk, vChunk := guards.SanitizeDomainsInText(partialJSON, s.cfg.Whitelist.AllowedDomains, isShadow)
+									if vChunk {
+										deltaMap["partial_json"] = cleanedChunk
+										eventObj["delta"] = deltaMap
+										modified = true
+									} else if tracker.domainFail {
+										tailOnly := stripDomainTail(partialJSON)
+										if tailOnly != partialJSON {
+											deltaMap["partial_json"] = tailOnly
+											eventObj["delta"] = deltaMap
+											modified = true
+										}
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
 	// 3. Ollama / Custom SSE formats: message.content, response, or token fields
 	if msgMap, ok := eventObj["message"].(map[string]any); ok {
 		if tokenStr, ok := msgMap["content"].(string); ok && tokenStr != "" {
@@ -352,6 +463,37 @@ func (s *SSEInspector) handleSSELine(line string) {
 				msgMap["content"] = safeText
 				eventObj["message"] = msgMap
 				modified = true
+			}
+		}
+		if rawTools, ok := msgMap["tool_calls"].([]any); ok && len(rawTools) > 0 {
+			keptTools, toolCodes, pruned := guards.SanitizeToolCallsSlice(rawTools, s.cfg.Whitelist, isShadow)
+			s.prunedTools += pruned
+			for _, c := range toolCodes {
+				s.recordCode(c)
+			}
+			if !isShadow && (pruned > 0 || len(toolCodes) > 0) {
+				modified = true
+				if len(keptTools) > 0 {
+					msgMap["tool_calls"] = keptTools
+				} else {
+					delete(msgMap, "tool_calls")
+				}
+				eventObj["message"] = msgMap
+			}
+		}
+	}
+	if rawTools, ok := eventObj["tool_calls"].([]any); ok && len(rawTools) > 0 {
+		keptTools, toolCodes, pruned := guards.SanitizeToolCallsSlice(rawTools, s.cfg.Whitelist, isShadow)
+		s.prunedTools += pruned
+		for _, c := range toolCodes {
+			s.recordCode(c)
+		}
+		if !isShadow && (pruned > 0 || len(toolCodes) > 0) {
+			modified = true
+			if len(keptTools) > 0 {
+				eventObj["tool_calls"] = keptTools
+			} else {
+				delete(eventObj, "tool_calls")
 			}
 		}
 	}
@@ -370,9 +512,14 @@ func (s *SSEInspector) handleSSELine(line string) {
 
 	if modified {
 		if encoded, err := json.Marshal(eventObj); err == nil {
-			s.outBuf.WriteString("data: ")
-			s.outBuf.Write(encoded)
-			s.outBuf.WriteByte('\n')
+			if isNDJSON {
+				s.outBuf.Write(encoded)
+				s.outBuf.WriteByte('\n')
+			} else {
+				s.outBuf.WriteString("data: ")
+				s.outBuf.Write(encoded)
+				s.outBuf.WriteByte('\n')
+			}
 			return
 		}
 	}
@@ -429,12 +576,25 @@ func (s *SSEInspector) haltOnCanaryLeak() {
 	}
 
 	s.emitWarningEventIfNeeded()
-	s.outBuf.WriteString("data: [DONE]\n\n")
+	if !s.isNDJSON {
+		s.outBuf.WriteString("data: [DONE]\n\n")
+	}
 	s.populateTrailers()
 	s.reportCompletion()
 }
 
 func (s *SSEInspector) emitSyntheticDeltaChunk(text string) {
+	if s.isNDJSON {
+		chunk := map[string]any{
+			"response": text,
+			"done":     s.halted,
+		}
+		if b, err := json.Marshal(chunk); err == nil {
+			s.outBuf.Write(b)
+			s.outBuf.WriteByte('\n')
+		}
+		return
+	}
 	if s.isAnthropic {
 		chunk := map[string]any{
 			"type":  "content_block_delta",
@@ -482,6 +642,14 @@ func (s *SSEInspector) emitWarningEventIfNeeded() {
 		"severity":     s.severity,
 		"codes":        s.codes,
 		"pruned_tools": s.prunedTools,
+	}
+	if s.isNDJSON {
+		ndjsonWarn := map[string]any{"warning": warnPayload}
+		if b, err := json.Marshal(ndjsonWarn); err == nil {
+			s.outBuf.Write(b)
+			s.outBuf.WriteByte('\n')
+		}
+		return
 	}
 	if b, err := json.Marshal(warnPayload); err == nil {
 		s.outBuf.WriteString("event: jaguargate.warning\ndata: ")

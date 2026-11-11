@@ -123,9 +123,10 @@ func NewGatewayServer(cfgMgr *config.Manager, logger *slog.Logger) (*GatewayServ
 			}
 
 			contentType := resp.Header.Get("Content-Type")
-			isSSE := strings.Contains(strings.ToLower(contentType), "text/event-stream")
+			lowerCT := strings.ToLower(contentType)
+			isStreaming := strings.Contains(lowerCT, "text/event-stream") || strings.Contains(lowerCT, "application/x-ndjson")
 
-			if isSSE && resp.Body != nil {
+			if isStreaming && resp.Body != nil {
 				resp.Header.Set("X-Accel-Buffering", "no")
 				resp.Header.Set("Cache-Control", "no-cache, no-transform")
 				resp.Header.Del("Content-Length")
@@ -201,12 +202,34 @@ func NewGatewayServer(cfgMgr *config.Manager, logger *slog.Logger) (*GatewayServ
 								inboundRes.Codes = append(inboundRes.Codes, c)
 							}
 						}
-						rawResp = mcpRes.ModifiedBody
+						if mcpRes.Blocked {
+							resp.StatusCode = http.StatusForbidden
+							resp.Header.Set("X-JaguarGate-Status", "BLOCKED")
+							resp.Header.Set("X-JaguarGate-Severity", "INTRUSION_ALERT")
+							if len(inboundRes.Codes) > 0 {
+								resp.Header.Set("X-JaguarGate-Codes", strings.Join(inboundRes.Codes, ","))
+							}
+							blockedBody := mcpRes.ModifiedBody
+							if len(blockedBody) == 0 {
+								blockedBody = []byte(`{"error":{"code":"mcp_blocked","message":"JaguarGate: MCP response blocked by security policy"}}`)
+							}
+							resp.Body = io.NopCloser(bytes.NewReader(blockedBody))
+							resp.ContentLength = int64(len(blockedBody))
+							resp.Header.Set("Content-Type", "application/json")
+							resp.Header.Set("Content-Length", strconv.Itoa(len(blockedBody)))
+							return nil
+						}
+						if len(mcpRes.ModifiedBody) > 0 {
+							rawResp = mcpRes.ModifiedBody
+						}
 					} else if activeCfg.Whitelist.CircuitBreaker.MaxIdenticalToolCalls > 0 {
 						rawResp = filterLLMResponseToolLoops(rawResp, sessionID, circuitBreaker, activeCfg, &inboundRes)
 					}
 
 					outRes := guardEngine.SanitizeOutputJSON(rawResp, inboundRes, activeCfg)
+					if outRes.Status == "BLOCKED" {
+						resp.StatusCode = http.StatusForbidden
+					}
 					gatewayUs := max(1, inboundUs+time.Since(outboundStart).Microseconds())
 					resp.Header.Set("X-JaguarGate-Latency-Us", strconv.FormatInt(gatewayUs, 10))
 

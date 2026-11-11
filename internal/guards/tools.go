@@ -60,8 +60,8 @@ func SanitizeToolCallsSlice(rawTools []any, cfg config.WhitelistConfig, isShadow
 		}
 
 		// Inspect tool arguments for unauthorized external domains
-		if fnMap, ok := toolMap["function"].(map[string]any); ok {
-			if argsStr, ok := fnMap["arguments"].(string); ok && len(cfg.AllowedDomains) > 0 {
+		if fnMap, ok := toolMap["function"].(map[string]any); ok && len(cfg.AllowedDomains) > 0 {
+			if argsStr, ok := fnMap["arguments"].(string); ok {
 				cleanedArgs, violated := sanitizeDomainsInText(argsStr, cfg.AllowedDomains, isShadow)
 				if violated {
 					if !slices.Contains(codes, "JG-CFG-103") {
@@ -70,6 +70,22 @@ func SanitizeToolCallsSlice(rawTools []any, cfg config.WhitelistConfig, isShadow
 					if !isShadow {
 						fnMap["arguments"] = cleanedArgs
 						toolMap["function"] = fnMap
+					}
+				}
+			} else if argsMap, ok := fnMap["arguments"].(map[string]any); ok {
+				if argsBytes, err := json.Marshal(argsMap); err == nil {
+					cleanedArgs, violated := sanitizeDomainsInText(string(argsBytes), cfg.AllowedDomains, isShadow)
+					if violated {
+						if !slices.Contains(codes, "JG-CFG-103") {
+							codes = append(codes, "JG-CFG-103")
+						}
+						if !isShadow {
+							var newMap map[string]any
+							if json.Unmarshal([]byte(cleanedArgs), &newMap) == nil {
+								fnMap["arguments"] = newMap
+							}
+							toolMap["function"] = fnMap
+						}
 					}
 				}
 			}
@@ -284,6 +300,21 @@ func (e *Engine) SanitizeOutputJSON(body []byte, inboundRes InspectionResult, cf
 			}
 		}
 		payload["message"] = msgMap
+	}
+
+	// JG-03: Also support Ollama native "/api/generate" top-level "response" string
+	if respStr, ok := payload["response"].(string); ok && respStr != "" {
+		cleaned, codes, leaked := SanitizeOutputTextWithSession(sessionID, respStr, inboundRes.CanaryToken, cfg, e.vault)
+		if leaked {
+			out.CanaryLeaked = true
+		}
+		for _, c := range codes {
+			out.addOutputCode(c)
+		}
+		if !isShadow && cleaned != respStr {
+			payload["response"] = cleaned
+			modified = true
+		}
 	}
 
 	// Also support Anthropic Messages API format: top-level "content" array with text & tool_use blocks

@@ -425,6 +425,72 @@ func TestMCPSiblingFieldsInspectionAndDepthLimit(t *testing.T) {
 	if !slices.Contains(resDeep.Codes, "JG-CFG-203") {
 		t.Errorf("expected JG-CFG-203 for JSON recursion depth exceeding 8, got %v", resDeep.Codes)
 	}
+	if strings.Contains(string(resDeep.ModifiedBody), "nested") {
+		t.Errorf("SECURITY FAILURE (JG-04): uninspected deep subtree was not redacted from payload:\n%s", string(resDeep.ModifiedBody))
+	}
+	if !strings.Contains(string(resDeep.ModifiedBody), "[JG-DEPTH-EXCEEDED-REDACTED]") {
+		t.Errorf("expected [JG-DEPTH-EXCEEDED-REDACTED] in modified body, got:\n%s", string(resDeep.ModifiedBody))
+	}
+}
+
+func TestMessageHistoryToolArgumentsPIIMasking(t *testing.T) {
+	vault := NewPIIVault()
+	engine := NewEngine(vault)
+	cfg := config.DefaultConfig()
+	cfg.ApplyPreset()
+
+	payload := []byte(`{
+		"model": "gpt-4o",
+		"messages": [
+			{
+				"role": "assistant",
+				"tool_calls": [
+					{
+						"id": "call_1",
+						"type": "function",
+						"function": {
+							"name": "query_database",
+							"arguments": "{\"tax_id\": \"123.456.789-01\", \"token\": \"sk-proj-secret123456789012345\"}"
+						}
+					}
+				]
+			},
+			{
+				"role": "user",
+				"content": [
+					{
+						"type": "tool_use",
+						"name": "process_client",
+						"input": {
+							"cpf": "123.456.789-01"
+						}
+					},
+					{
+						"type": "tool_result",
+						"content": "Client with CPF 123.456.789-01 was verified."
+					}
+				]
+			}
+		]
+	}`)
+
+	res := engine.InspectJSONPayloadWithSession(payload, "sess-history-test", &cfg)
+
+	// In balanced mode, PII and Secrets in tool call history and tool_use/tool_result must be masked
+	modifiedStr := string(res.ModifiedBody)
+
+	if strings.Contains(modifiedStr, "123.456.789-01") {
+		t.Fatalf("SECURITY FAILURE (JG-01): CPF in message tool history survived unmasked:\n%s", modifiedStr)
+	}
+	if strings.Contains(modifiedStr, "sk-proj-secret123456789012345") {
+		t.Fatalf("SECURITY FAILURE (JG-01): OpenAI API key in message tool history survived unmasked:\n%s", modifiedStr)
+	}
+	if !strings.Contains(modifiedStr, "<JG_PII_CPF_") {
+		t.Errorf("expected masked PII token <JG_PII_CPF_ in tool history arguments, got:\n%s", modifiedStr)
+	}
+	if !strings.Contains(modifiedStr, "<JG_PII_SECRET_") {
+		t.Errorf("expected masked secret token <JG_PII_SECRET_ in tool history arguments, got:\n%s", modifiedStr)
+	}
 }
 
 func TestAnthropicNonStreamingOutputSanitization(t *testing.T) {
@@ -500,6 +566,62 @@ func TestAnthropicNonStreamingOutputSanitization(t *testing.T) {
 	}
 	if strings.Contains(string(outRes.ModifiedBody), "evil.com") {
 		t.Errorf("SECURITY FAILURE: untrusted domain survived in Anthropic tool input:\n%s", string(outRes.ModifiedBody))
+	}
+}
+
+func TestOllamaNativeGenerateResponseField(t *testing.T) {
+	vault := NewPIIVault()
+	engine := NewEngine(vault)
+	cfg := config.DefaultConfig()
+	cfg.ApplyPreset()
+
+	// Mask CPF first in prompt
+	maskedPrompt, _, _ := vault.MaskTextWithSession("sess-ollama-gen", "Cliente 123.456.789-01", cfg.Guards.PIIVault, false)
+	tokenOpen := strings.Index(maskedPrompt, "<JG_PII_CPF_")
+	tokenClose := strings.Index(maskedPrompt[tokenOpen:], ">") + tokenOpen + 1
+	piiToken := maskedPrompt[tokenOpen:tokenClose]
+
+	// Simulate Ollama native /api/generate non-streaming response body
+	ollamaResp := []byte(fmt.Sprintf(`{
+		"model": "llama3.2",
+		"created_at": "2026-11-11T12:00:00Z",
+		"response": "O CPF do titular é %s e o token de canary é jg_cnry_ollama123456.",
+		"done": true
+	}`, piiToken))
+
+	inboundRes := InspectionResult{
+		Status:      "CLEAN",
+		SessionID:   "sess-ollama-gen",
+		CanaryToken: "jg_cnry_ollama123456",
+	}
+
+	outRes := engine.SanitizeOutputJSON(ollamaResp, inboundRes, &cfg)
+
+	// 1. Canary leak detection in /api/generate response field
+	if !outRes.CanaryLeaked {
+		t.Errorf("SECURITY FAILURE (JG-03): Canary token leak in Ollama /api/generate response field was not detected!")
+	}
+	if !slices.Contains(outRes.Codes, "JG-SEC-501") {
+		t.Errorf("expected JG-SEC-501 for canary leak in Ollama response field, got %v", outRes.Codes)
+	}
+
+	// 2. PII restoration in clean /api/generate response field (no canary leak)
+	ollamaCleanResp := []byte(fmt.Sprintf(`{
+		"model": "llama3.2",
+		"created_at": "2026-11-11T12:00:00Z",
+		"response": "O CPF do titular é %s e está regular.",
+		"done": true
+	}`, piiToken))
+
+	inboundClean := InspectionResult{
+		Status:      "CLEAN",
+		SessionID:   "sess-ollama-gen",
+		CanaryToken: "jg_cnry_different_token",
+	}
+
+	outClean := engine.SanitizeOutputJSON(ollamaCleanResp, inboundClean, &cfg)
+	if !strings.Contains(string(outClean.ModifiedBody), "123.456.789-01") {
+		t.Errorf("expected PII token to be restored to clean CPF in Ollama response field, got:\n%s", string(outClean.ModifiedBody))
 	}
 }
 
