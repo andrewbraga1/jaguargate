@@ -54,6 +54,61 @@ func TestHybridStoreAESGCMAndRedisFailOpen(t *testing.T) {
 	}
 }
 
+func TestHybridStoreMultiInstanceAndValidation(t *testing.T) {
+	// 1. Missing key for redis must fail
+	_, err := NewHybridStore(config.StateStoreConfig{
+		Driver:       "redis",
+		RedisURL:     "redis://127.0.0.1:6379",
+		AESGCMKeyEnv: "NON_EXISTENT_ENV_KEY",
+	})
+	if err == nil {
+		t.Fatal("expected error when redis driver is configured without a valid key in env")
+	}
+
+	// 2. Multi-instance simulation: two independent instances sharing the same key
+	t.Setenv("SHARED_CLUSTER_AES_KEY", "super-secret-production-cluster-key-32b!")
+	inst1, err := NewHybridStore(config.StateStoreConfig{
+		Driver:       "memory",
+		AESGCMKeyEnv: "SHARED_CLUSTER_AES_KEY",
+	})
+	if err != nil {
+		t.Fatalf("inst1 creation failed: %v", err)
+	}
+
+	inst2, err := NewHybridStore(config.StateStoreConfig{
+		Driver:       "memory",
+		AESGCMKeyEnv: "SHARED_CLUSTER_AES_KEY",
+	})
+	if err != nil {
+		t.Fatalf("inst2 creation failed: %v", err)
+	}
+
+	// Instance 1 encrypts
+	cipherText, err := inst1.Encrypt("session_secret_data_42")
+	if err != nil {
+		t.Fatalf("inst1 encryption failed: %v", err)
+	}
+
+	// Instance 2 decrypts
+	plainText, err := inst2.Decrypt(cipherText)
+	if err != nil {
+		t.Fatalf("inst2 decryption failed: %v", err)
+	}
+	if plainText != "session_secret_data_42" {
+		t.Errorf("expected 'session_secret_data_42', got %q", plainText)
+	}
+
+	// Instance 3 with different key must fail to decrypt
+	t.Setenv("DIFFERENT_CLUSTER_AES_KEY", "different-secret-key-that-will-fail!!")
+	inst3, _ := NewHybridStore(config.StateStoreConfig{
+		Driver:       "memory",
+		AESGCMKeyEnv: "DIFFERENT_CLUSTER_AES_KEY",
+	})
+	if _, err := inst3.Decrypt(cipherText); err == nil {
+		t.Fatal("expected inst3 with different key to fail decryption")
+	}
+}
+
 func BenchmarkAESGCMSealOpen(b *testing.B) {
 	b.Setenv("BENCH_AES_KEY", "jaguargate-benchmark-aes-256-gcm-secret-key")
 	store, err := NewHybridStore(config.StateStoreConfig{

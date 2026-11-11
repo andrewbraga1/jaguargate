@@ -1,0 +1,30 @@
+services:
+  jaguargate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: jaguargate:latest
+    container_name: jaguargate
+    restart: unless-stopped
+    ports:
+      - "4010:4010"
+      - "9091:9091"
+    environment:
+      - JAGUARGATE_LISTEN_ADDR=0.0.0.0:4010
+      - JAGUARGATE_UPSTREAM_URL=http://ollama:11434
+      - JAGUARGATE_MODE=sanitize_and_warn
+      - JAGUARGATE_PRESET=balanced
+    depends_on:
+      - ollama
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+
+volumes:
+  ollama_data:

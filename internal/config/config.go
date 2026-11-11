@@ -445,5 +445,13 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("invalid network.egress.upstream_url %q: %w", c.Network.Egress.UpstreamURL, err)
 		}
 	}
+	if strings.EqualFold(c.Extensions.StateStore.Driver, "redis") {
+		if strings.TrimSpace(c.Extensions.StateStore.AESGCMKeyEnv) == "" {
+			return errors.New("extensions.state_store: driver 'redis' requires aes_gcm_key_env pointing to an environment variable with a shared encryption key")
+		}
+		if strings.TrimSpace(c.Extensions.StateStore.RedisURL) == "" {
+			return errors.New("extensions.state_store: driver 'redis' requires redis_url")
+		}
+	}
 	return nil
 }

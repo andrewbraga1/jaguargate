@@ -26,6 +26,8 @@ COPY --chown=nonroot:nonroot jaguargate.yaml /app/jaguargate.yaml
 
 USER nonroot:nonroot
 
+ENV JAGUARGATE_LISTEN_ADDR="0.0.0.0:4010"
+
 EXPOSE 4010 9091
 
 ENTRYPOINT ["/app/jgate"]

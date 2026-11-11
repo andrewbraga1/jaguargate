@@ -60,16 +60,13 @@ func NewHybridStore(cfg config.StateStoreConfig) (*HybridStore, error) {
 		s.driver = "memory"
 	}
 
-	// Initialize optional AES-256-GCM cipher if key environment variable is set or driver is redis
+	// Initialize AES-256-GCM cipher if key environment variable is set or driver is redis
 	rawKey := ""
 	if cfg.AESGCMKeyEnv != "" {
 		rawKey = os.Getenv(cfg.AESGCMKeyEnv)
 	}
-	if rawKey == "" && s.driver == "redis" {
-		// Fallback ephemeral per-process key so Redis data is never stored in plaintext
-		var randomSeed [32]byte
-		_, _ = rand.Read(randomSeed[:])
-		rawKey = string(randomSeed[:])
+	if s.driver == "redis" && rawKey == "" {
+		return nil, fmt.Errorf("redis state store requires non-empty shared encryption key via environment variable %q", cfg.AESGCMKeyEnv)
 	}
 	if rawKey != "" {
 		aead, err := newAES256GCM(rawKey)
