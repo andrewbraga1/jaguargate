@@ -46,6 +46,7 @@ type GatewayServer struct {
 	circuitBreaker *state.CircuitBreaker
 	guardEngine    *guards.Engine
 	mcpInspector   *mcp.Inspector
+	dynTransport   *dynamicTransport
 	proxy          *httputil.ReverseProxy
 	httpServer     *http.Server
 	udsServer      *http.Server
@@ -84,27 +85,7 @@ func NewGatewayServer(cfgMgr *config.Manager, logger *slog.Logger) (*GatewayServ
 		KeepAlive: 30 * time.Second,
 	}
 
-	customTransport := &http.Transport{
-		Proxy:                 http.ProxyFromEnvironment,
-		DialContext:           dialer.DialContext,
-		ForceAttemptHTTP2:     true,
-		MaxIdleConns:          snap.Network.Egress.KeepAlivePoolSize,
-		MaxIdleConnsPerHost:   snap.Network.Egress.KeepAlivePoolSize,
-		IdleConnTimeout:       time.Duration(snap.Network.Egress.IdleConnTimeoutSec) * time.Second,
-		TLSHandshakeTimeout:   5 * time.Second,
-		ExpectContinueTimeout: 1 * time.Second,
-		TLSClientConfig: &tls.Config{
-			InsecureSkipVerify: !snap.Network.Egress.TLSVerify,
-			MinVersion:         tls.VersionTLS12,
-		},
-	}
-
-	if snap.Network.Egress.UpstreamUnixSocket != "" {
-		sockPath := snap.Network.Egress.UpstreamUnixSocket
-		customTransport.DialContext = func(ctx context.Context, _, _ string) (net.Conn, error) {
-			return dialer.DialContext(ctx, "unix", sockPath)
-		}
-	}
+	dynTransport := newDynamicTransport(cfgMgr, dialer)
 
 	rp := &httputil.ReverseProxy{
 		Rewrite: func(pr *httputil.ProxyRequest) {
@@ -121,7 +102,7 @@ func NewGatewayServer(cfgMgr *config.Manager, logger *slog.Logger) (*GatewayServ
 			pr.SetURL(activeTarget)
 			pr.Out.Host = activeTarget.Host
 		},
-		Transport:     customTransport,
+		Transport:     dynTransport,
 		FlushInterval: -1, // Immediate token-by-token flush for SSE streaming
 		BufferPool:    bufPool,
 		ModifyResponse: func(resp *http.Response) error {
@@ -290,6 +271,7 @@ func NewGatewayServer(cfgMgr *config.Manager, logger *slog.Logger) (*GatewayServ
 		circuitBreaker: circuitBreaker,
 		guardEngine:    guardEngine,
 		mcpInspector:   mcpInspector,
+		dynTransport:   dynTransport,
 		proxy:          rp,
 	}, nil
 }
@@ -659,6 +641,9 @@ func (s *GatewayServer) Start(ctx context.Context) error {
 		if s.sandbox != nil {
 			_ = s.sandbox.Close(shutdownCtx)
 		}
+		if s.dynTransport != nil {
+			s.dynTransport.CloseIdleConnections()
+		}
 		if s.udsPath != "" {
 			_ = os.Remove(s.udsPath)
 		}
@@ -763,4 +748,110 @@ func (s *GatewayServer) buildRPCHandler(baseHandler http.Handler, grpcCfg config
 
 		baseHandler.ServeHTTP(w, r)
 	})
+}
+
+// dynamicTransport wraps http.Transport, dynamically reloading TLS, Unix socket, and connection pool
+// configurations atomically per request snapshot without requiring a server restart (JG-HOT-RELOAD).
+type dynamicTransport struct {
+	mu        sync.RWMutex
+	cfgMgr    *config.Manager
+	dialer    *net.Dialer
+	cacheKey  string
+	transport *http.Transport
+}
+
+func newDynamicTransport(cfgMgr *config.Manager, dialer *net.Dialer) *dynamicTransport {
+	dt := &dynamicTransport{
+		cfgMgr: cfgMgr,
+		dialer: dialer,
+	}
+	snap := cfgMgr.Get()
+	dt.updateTransportLocked(snap)
+	return dt
+}
+
+func (dt *dynamicTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	reqCfg, ok := req.Context().Value(ctxConfigSnapKey{}).(*config.Config)
+	if !ok || reqCfg == nil {
+		reqCfg = dt.cfgMgr.Get()
+	}
+
+	key := fmt.Sprintf("%v:%s:%d:%d",
+		reqCfg.Network.Egress.TLSVerify,
+		reqCfg.Network.Egress.UpstreamUnixSocket,
+		reqCfg.Network.Egress.KeepAlivePoolSize,
+		reqCfg.Network.Egress.IdleConnTimeoutSec,
+	)
+
+	dt.mu.RLock()
+	currentKey := dt.cacheKey
+	t := dt.transport
+	dt.mu.RUnlock()
+
+	if currentKey != key {
+		dt.mu.Lock()
+		if dt.cacheKey != key {
+			if dt.transport != nil {
+				dt.transport.CloseIdleConnections()
+			}
+			dt.updateTransportLocked(reqCfg)
+		}
+		t = dt.transport
+		dt.mu.Unlock()
+	}
+
+	return t.RoundTrip(req)
+}
+
+func (dt *dynamicTransport) updateTransportLocked(cfg *config.Config) {
+	poolSize := cfg.Network.Egress.KeepAlivePoolSize
+	if poolSize <= 0 {
+		poolSize = 100
+	}
+	idleTimeout := cfg.Network.Egress.IdleConnTimeoutSec
+	if idleTimeout <= 0 {
+		idleTimeout = 90
+	}
+
+	t := &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           dt.dialer.DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          poolSize,
+		MaxIdleConnsPerHost:   poolSize,
+		IdleConnTimeout:       time.Duration(idleTimeout) * time.Second,
+		TLSHandshakeTimeout:   5 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: !cfg.Network.Egress.TLSVerify,
+			MinVersion:         tls.VersionTLS12,
+		},
+	}
+	if cfg.Network.Egress.UpstreamUnixSocket != "" {
+		sockPath := cfg.Network.Egress.UpstreamUnixSocket
+		t.DialContext = func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return dt.dialer.DialContext(ctx, "unix", sockPath)
+		}
+	}
+	dt.transport = t
+	dt.cacheKey = fmt.Sprintf("%v:%s:%d:%d",
+		cfg.Network.Egress.TLSVerify,
+		cfg.Network.Egress.UpstreamUnixSocket,
+		cfg.Network.Egress.KeepAlivePoolSize,
+		cfg.Network.Egress.IdleConnTimeoutSec,
+	)
+}
+
+func (dt *dynamicTransport) CloseIdleConnections() {
+	dt.mu.Lock()
+	defer dt.mu.Unlock()
+	if dt.transport != nil {
+		dt.transport.CloseIdleConnections()
+	}
+}
+
+func (dt *dynamicTransport) getCachedKey() string {
+	dt.mu.RLock()
+	defer dt.mu.RUnlock()
+	return dt.cacheKey
 }

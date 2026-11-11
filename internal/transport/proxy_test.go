@@ -313,3 +313,128 @@ func TestGRPCAuthAndStatusFraming(t *testing.T) {
 		t.Errorf("expected authenticated gRPC request to reach handler successfully")
 	}
 }
+
+func TestDynamicTransportHotReload(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfgPath := filepath.Join(tmpDir, "jgate_hotreload.yaml")
+	_ = os.WriteFile(cfgPath, []byte(`
+core:
+  version: "1.0"
+  preset: "balanced"
+network:
+  ingress:
+    http:
+      enabled: true
+      listen_addr: "127.0.0.1:0"
+  egress:
+    upstream_url: "http://127.0.0.1:11434"
+    tls_verify: true
+    keep_alive_pool_size: 50
+    idle_conn_timeout_sec: 30
+`), 0600)
+
+	mgr, err := config.NewManager(cfgPath)
+	if err != nil {
+		t.Fatalf("failed to create config manager: %v", err)
+	}
+	defer mgr.Close()
+
+	dialer := &net.Dialer{Timeout: 5 * time.Second}
+	dt := newDynamicTransport(mgr, dialer)
+	defer dt.CloseIdleConnections()
+
+	initKey := dt.getCachedKey()
+	expectedInit := "true::50:30"
+	if initKey != expectedInit {
+		t.Fatalf("expected initial cache key %q, got %q", expectedInit, initKey)
+	}
+
+	// 1. Simulate mock upstream
+	mockUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer mockUpstream.Close()
+
+	// 2. Send request with modified snapshot attached to context (TLSVerify=false, custom pool)
+	modifiedSnap := *mgr.Get()
+	modifiedSnap.Network.Egress.TLSVerify = false
+	modifiedSnap.Network.Egress.KeepAlivePoolSize = 80
+	modifiedSnap.Network.Egress.IdleConnTimeoutSec = 45
+
+	req, _ := http.NewRequest(http.MethodGet, mockUpstream.URL, nil)
+	ctx := context.WithValue(req.Context(), ctxConfigSnapKey{}, &modifiedSnap)
+	req = req.WithContext(ctx)
+
+	resp, err := dt.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("RoundTrip failed through dynamicTransport: %v", err)
+	}
+	_ = resp.Body.Close()
+
+	newKey := dt.getCachedKey()
+	expectedNew := "false::80:45"
+	if newKey != expectedNew {
+		t.Fatalf("expected dynamically updated cache key %q, got %q", expectedNew, newKey)
+	}
+}
+
+func BenchmarkGatewayEndToEndThroughput(b *testing.B) {
+	// 1. Mock upstream server returning typical LLM completion
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"Hello from upstream LLM"}}]}`))
+	}))
+	defer upstream.Close()
+
+	tmpDir := b.TempDir()
+	cfgPath := filepath.Join(tmpDir, "jgate_bench.yaml")
+	_ = os.WriteFile(cfgPath, []byte(`
+core:
+  version: "1.0"
+  preset: "balanced"
+whitelist:
+  circuit_breaker:
+    max_tokens_per_session: 1000000000
+    max_identical_tool_calls: 1000000
+network:
+  ingress:
+    http:
+      enabled: true
+      listen_addr: "127.0.0.1:0"
+  egress:
+    upstream_url: "`+upstream.URL+`"
+`), 0600)
+
+	mgr, err := config.NewManager(cfgPath)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer mgr.Close()
+
+	logger := telemetry.NewZeroTrustLoggerWithConfig(io.Discard, config.LoggingConfig{})
+	gw, err := NewGatewayServer(mgr, logger)
+	if err != nil {
+		b.Fatal(err)
+	}
+	handler := gw.Handler()
+
+	payload := []byte(`{"model":"gpt-4o","messages":[{"role":"user","content":"Run compliance query"}]}`)
+
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		var iter uint64
+		for pb.Next() {
+			iter++
+			req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(payload))
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("X-Session-ID", "bench-session")
+			w := httptest.NewRecorder()
+			handler.ServeHTTP(w, req)
+			if w.Code != http.StatusOK {
+				b.Fatalf("unexpected HTTP status %d (body: %s)", w.Code, w.Body.String())
+			}
+		}
+	})
+}
