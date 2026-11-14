@@ -55,10 +55,12 @@ type SSEInspector struct {
 	prunedTools  int
 	halted       bool
 	eofReached   bool
-	reported     bool
-	isAnthropic  bool
-	isNDJSON     bool
-	toolTrackers map[int]*streamToolCallTracker
+	reported         bool
+	isAnthropic      bool
+	isNDJSON         bool
+	ollamaFormat     string // "chat" (/api/chat) or "generate" (/api/generate)
+	pendingEventLine string // Buffers "event: ..." line until corresponding data: is validated
+	toolTrackers     map[int]*streamToolCallTracker
 }
 
 // NewSSEInspector creates a streaming SSE inspector wrapping the upstream response body.
@@ -166,7 +168,16 @@ func (s *SSEInspector) handleSSELine(line string) {
 		isNDJSON = true
 		s.isNDJSON = true
 	}
+	// Buffer event: line to pair atomically with data: line (prevents orphan event headers on pruned tools)
+	if strings.HasPrefix(trimmed, "event:") {
+		s.pendingEventLine = line
+		return
+	}
 	if trimmed == "" || (!isDataLine && !isNDJSON) {
+		if s.pendingEventLine != "" {
+			s.outBuf.WriteString(s.pendingEventLine)
+			s.pendingEventLine = ""
+		}
 		s.outBuf.WriteString(line)
 		return
 	}
@@ -192,6 +203,10 @@ func (s *SSEInspector) handleSSELine(line string) {
 		}
 
 		s.emitWarningEventIfNeeded()
+		if s.pendingEventLine != "" {
+			s.outBuf.WriteString(s.pendingEventLine)
+			s.pendingEventLine = ""
+		}
 		s.outBuf.WriteString(line)
 		s.populateTrailers()
 		s.reportCompletion()
@@ -206,6 +221,10 @@ func (s *SSEInspector) handleSSELine(line string) {
 			return
 		}
 		if shouldEmit {
+			if s.pendingEventLine != "" {
+				s.outBuf.WriteString(s.pendingEventLine)
+				s.pendingEventLine = ""
+			}
 			if isNDJSON {
 				s.outBuf.WriteString(outText)
 				s.outBuf.WriteByte('\n')
@@ -384,13 +403,19 @@ func (s *SSEInspector) handleSSELine(line string) {
 					s.prunedTools++
 					s.recordCode("JG-CFG-101")
 				}
-				if len(s.toolTrackers) >= maxTrackersPerStream {
-					s.recordCode("JG-CFG-202")
-					tracker.isPruned = true
+				if _, exists := s.toolTrackers[idx]; !exists {
+					if len(s.toolTrackers) >= maxTrackersPerStream {
+						s.recordCode("JG-CFG-202")
+						tracker.isPruned = true
+					} else {
+						s.toolTrackers[idx] = tracker
+					}
+				} else {
+					s.toolTrackers[idx] = tracker
 				}
-				s.toolTrackers[idx] = tracker
 
 				if tracker.isPruned && !isShadow {
+					s.pendingEventLine = ""
 					return
 				}
 			}
@@ -406,7 +431,12 @@ func (s *SSEInspector) handleSSELine(line string) {
 		if deltaMap, ok := eventObj["delta"].(map[string]any); ok {
 			if deltaType, _ := deltaMap["type"].(string); deltaType == "input_json_delta" {
 				tracker, exists := s.toolTrackers[idx]
+				if !exists && len(s.toolTrackers) >= maxTrackersPerStream && !isShadow {
+					s.pendingEventLine = ""
+					return
+				}
 				if exists && tracker.isPruned && !isShadow {
+					s.pendingEventLine = ""
 					return
 				}
 				if partialJSON, ok := deltaMap["partial_json"].(string); ok && partialJSON != "" {
@@ -415,6 +445,7 @@ func (s *SSEInspector) handleSSELine(line string) {
 							s.recordCode("JG-CFG-202")
 							tracker.isPruned = true
 							if !isShadow {
+								s.pendingEventLine = ""
 								return
 							}
 						} else {
@@ -449,6 +480,31 @@ func (s *SSEInspector) handleSSELine(line string) {
 					}
 				}
 			}
+		}
+	}
+
+	// 2d. Anthropic SSE format: content_block_stop (R3)
+	if typeStr, _ := eventObj["type"].(string); typeStr == "content_block_stop" {
+		idx := 0
+		if fIdx, ok := eventObj["index"].(float64); ok {
+			idx = int(fIdx)
+		}
+		tracker, exists := s.toolTrackers[idx]
+		if (exists && tracker.isPruned) || (!exists && len(s.toolTrackers) >= maxTrackersPerStream) {
+			if !isShadow {
+				s.pendingEventLine = ""
+				return
+			}
+		}
+	}
+
+	// Track Ollama NDJSON format (/api/chat vs /api/generate) (R4)
+	if isNDJSON {
+		if _, hasMsg := eventObj["message"]; hasMsg {
+			s.ollamaFormat = "chat"
+		}
+		if _, hasResp := eventObj["response"]; hasResp {
+			s.ollamaFormat = "generate"
 		}
 	}
 
@@ -510,8 +566,40 @@ func (s *SSEInspector) handleSSELine(line string) {
 		}
 	}
 
+	// In Ollama NDJSON, if this chunk marks done: true, flush any trailing holdback into this chunk directly (R4)
+	if isNDJSON {
+		if doneVal, ok := eventObj["done"].(bool); ok && doneVal {
+			if s.holdback != "" && !s.halted {
+				cleaned, codes, leaked := guards.SanitizeOutputTextWithSession(s.sessionID, s.holdback, s.canaryToken, s.cfg, s.vault)
+				s.holdback = ""
+				for _, c := range codes {
+					s.recordCode(c)
+				}
+				if leaked {
+					s.haltOnCanaryLeak()
+					return
+				}
+				if cleaned != "" {
+					if msgMap, ok := eventObj["message"].(map[string]any); ok {
+						curContent, _ := msgMap["content"].(string)
+						msgMap["content"] = curContent + cleaned
+						eventObj["message"] = msgMap
+						modified = true
+					} else if curResp, ok := eventObj["response"].(string); ok {
+						eventObj["response"] = curResp + cleaned
+						modified = true
+					}
+				}
+			}
+		}
+	}
+
 	if modified {
 		if encoded, err := json.Marshal(eventObj); err == nil {
+			if s.pendingEventLine != "" {
+				s.outBuf.WriteString(s.pendingEventLine)
+				s.pendingEventLine = ""
+			}
 			if isNDJSON {
 				s.outBuf.Write(encoded)
 				s.outBuf.WriteByte('\n')
@@ -524,6 +612,10 @@ func (s *SSEInspector) handleSSELine(line string) {
 		}
 	}
 
+	if s.pendingEventLine != "" {
+		s.outBuf.WriteString(s.pendingEventLine)
+		s.pendingEventLine = ""
+	}
 	s.outBuf.WriteString(line)
 }
 
@@ -576,7 +668,20 @@ func (s *SSEInspector) haltOnCanaryLeak() {
 	}
 
 	s.emitWarningEventIfNeeded()
-	if !s.isNDJSON {
+	if s.isAnthropic {
+		errEvent := map[string]any{
+			"type": "error",
+			"error": map[string]any{
+				"type":    "invalid_request_error",
+				"message": "JaguarGate: System Prompt Leak Halted (JG-SEC-501)",
+			},
+		}
+		if b, err := json.Marshal(errEvent); err == nil {
+			s.outBuf.WriteString("event: error\ndata: ")
+			s.outBuf.Write(b)
+			s.outBuf.WriteString("\n\n")
+		}
+	} else if !s.isNDJSON {
 		s.outBuf.WriteString("data: [DONE]\n\n")
 	}
 	s.populateTrailers()
@@ -585,14 +690,7 @@ func (s *SSEInspector) haltOnCanaryLeak() {
 
 func (s *SSEInspector) emitSyntheticDeltaChunk(text string) {
 	if s.isNDJSON {
-		chunk := map[string]any{
-			"response": text,
-			"done":     s.halted,
-		}
-		if b, err := json.Marshal(chunk); err == nil {
-			s.outBuf.Write(b)
-			s.outBuf.WriteByte('\n')
-		}
+		s.emitSyntheticNDJSONChunk(text, s.halted)
 		return
 	}
 	if s.isAnthropic {
@@ -605,7 +703,7 @@ func (s *SSEInspector) emitSyntheticDeltaChunk(text string) {
 			},
 		}
 		if b, err := json.Marshal(chunk); err == nil {
-			s.outBuf.WriteString("data: ")
+			s.outBuf.WriteString("event: content_block_delta\ndata: ")
 			s.outBuf.Write(b)
 			s.outBuf.WriteString("\n\n")
 		}
@@ -623,6 +721,29 @@ func (s *SSEInspector) emitSyntheticDeltaChunk(text string) {
 		s.outBuf.WriteString("data: ")
 		s.outBuf.Write(b)
 		s.outBuf.WriteString("\n\n")
+	}
+}
+
+func (s *SSEInspector) emitSyntheticNDJSONChunk(text string, isDone bool) {
+	var chunk map[string]any
+	if s.ollamaFormat == "chat" {
+		chunk = map[string]any{
+			"model": "jaguargate",
+			"message": map[string]any{
+				"role":    "assistant",
+				"content": text,
+			},
+			"done": isDone,
+		}
+	} else {
+		chunk = map[string]any{
+			"response": text,
+			"done":     isDone,
+		}
+	}
+	if b, err := json.Marshal(chunk); err == nil {
+		s.outBuf.Write(b)
+		s.outBuf.WriteByte('\n')
 	}
 }
 

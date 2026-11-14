@@ -1,6 +1,7 @@
 package stream
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -498,6 +499,168 @@ func TestSSETrackerMemoryBoundsAndLimits(t *testing.T) {
 
 	if !slices.Contains(inspMulti.codes, "JG-CFG-202") {
 		t.Errorf("SECURITY FAILURE (JG-05): expected JG-CFG-202 for stream exceeding maxTrackersPerStream, got %v", inspMulti.codes)
+	}
+
+	// 3. Test R2: Anthropic stream with 50 distinct indices must strictly cap toolTrackers map to <= 32
+	var anthropicMultiTrackers strings.Builder
+	for i := 0; i < 50; i++ {
+		anthropicMultiTrackers.WriteString(fmt.Sprintf("event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":%d,\"content_block\":{\"type\":\"tool_use\",\"id\":\"call_%d\",\"name\":\"tool_%d\"}}\n\n", i, i, i))
+		anthropicMultiTrackers.WriteString(fmt.Sprintf("event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":%d,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{}\"}}\n\n", i))
+		anthropicMultiTrackers.WriteString(fmt.Sprintf("event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":%d}\n\n", i))
+	}
+	anthropicMultiTrackers.WriteString("data: [DONE]\n\n")
+
+	inspAnthropicMulti := NewSSEInspector(
+		io.NopCloser(strings.NewReader(anthropicMultiTrackers.String())),
+		&cfg,
+		vault,
+		guards.InspectionResult{Status: "CLEAN", SessionID: "sess-anthropic-trackers"},
+		nil,
+	)
+
+	_, _ = io.ReadAll(inspAnthropicMulti)
+
+	if len(inspAnthropicMulti.toolTrackers) > 32 {
+		t.Fatalf("SECURITY FAILURE (R2): Anthropic toolTrackers map exceeded limit: %d > 32", len(inspAnthropicMulti.toolTrackers))
+	}
+	if !slices.Contains(inspAnthropicMulti.codes, "JG-CFG-202") {
+		t.Errorf("expected JG-CFG-202 for Anthropic stream exceeding maxTrackersPerStream, got %v", inspAnthropicMulti.codes)
+	}
+}
+
+func TestAnthropicStreamingBlockLifecycleAndNoOrphanEvents(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.ApplyPreset()
+	cfg.Whitelist.EnforceToolWhitelist = true
+	cfg.Whitelist.AllowedTools = []string{"allowed_tool"}
+
+	// Stream containing 1 forbidden tool (index 0) and 1 allowed tool (index 1)
+	anthropicStream := "event: content_block_start\n" +
+		"data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"call_bad\",\"name\":\"drop_db\"}}\n\n" +
+		"event: content_block_delta\n" +
+		"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"force\\\":true}\"}}\n\n" +
+		"event: content_block_stop\n" +
+		"data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" +
+		"event: content_block_start\n" +
+		"data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"call_good\",\"name\":\"allowed_tool\"}}\n\n" +
+		"event: content_block_delta\n" +
+		"data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"city\\\":\\\"Sorocaba\\\"}\"}}\n\n" +
+		"event: content_block_stop\n" +
+		"data: {\"type\":\"content_block_stop\",\"index\":1}\n\n"
+
+	insp := NewSSEInspector(
+		io.NopCloser(strings.NewReader(anthropicStream)),
+		&cfg,
+		guards.NewPIIVault(),
+		guards.InspectionResult{Status: "CLEAN", SessionID: "sess-anthropic-lifecycle"},
+		nil,
+	)
+
+	outBytes, err := io.ReadAll(insp)
+	if err != nil {
+		t.Fatalf("read failed: %v", err)
+	}
+	outStr := string(outBytes)
+
+	// 1. Forbidden tool drop_db and its arguments must be completely absent
+	if strings.Contains(outStr, "drop_db") || strings.Contains(outStr, `"force":true`) {
+		t.Fatalf("SECURITY FAILURE (R3): forbidden tool survived stream:\n%s", outStr)
+	}
+
+	// 2. No orphan event: headers or orphan stop blocks for pruned index 0
+	lines := strings.Split(outStr, "\n")
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "event:") {
+			// Next non-empty line must be data:
+			foundData := false
+			for j := i + 1; j < len(lines); j++ {
+				subTrim := strings.TrimSpace(lines[j])
+				if subTrim == "" {
+					continue
+				}
+				if strings.HasPrefix(subTrim, "data:") {
+					foundData = true
+				}
+				break
+			}
+			if !foundData {
+				t.Fatalf("PROTOCOL VIOLATION (R3): orphan SSE event line found with no matching data:\n%s", trimmed)
+			}
+		}
+	}
+
+	// 3. Verify allowed tool is fully preserved with start, delta, and stop
+	if !strings.Contains(outStr, "allowed_tool") || !strings.Contains(outStr, "Sorocaba") {
+		t.Fatalf("allowed tool was incorrectly corrupted:\n%s", outStr)
+	}
+}
+
+func TestOllamaNDJSONChatVsGenerateFormatDistinction(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.ApplyPreset()
+	vault := guards.NewPIIVault()
+
+	// Mask CPF token
+	masked, _, _ := vault.MaskTextWithSession("sess-ollama-chat", "CPF 123.456.789-01", cfg.Guards.PIIVault, false)
+	tokenStart := strings.Index(masked, piiOpenPrefix)
+	piiToken := masked[tokenStart:]
+	half1 := piiToken[:8]
+	half2 := piiToken[8:]
+
+	// Ollama /api/chat format with split PII token
+	chatNDJSON := fmt.Sprintf("{\"model\":\"llama3.2\",\"message\":{\"role\":\"assistant\",\"content\":\"Ola! Seu CPF e %s\"},\"done\":false}\n"+
+		"{\"model\":\"llama3.2\",\"message\":{\"role\":\"assistant\",\"content\":\"%s confirmado com sucesso.\"},\"done\":true}\n", half1, half2)
+
+	inspChat := NewSSEInspector(
+		io.NopCloser(strings.NewReader(chatNDJSON)),
+		&cfg,
+		vault,
+		guards.InspectionResult{Status: "CLEAN", SessionID: "sess-ollama-chat"},
+		nil,
+	)
+
+	chatBytes, err := io.ReadAll(inspChat)
+	if err != nil {
+		t.Fatalf("read failed: %v", err)
+	}
+
+	// Parse each NDJSON line as a real client would
+	chatLines := strings.Split(strings.TrimSpace(string(chatBytes)), "\n")
+	foundRestored := false
+	sawTerminalDone := false
+	for _, l := range chatLines {
+		if strings.TrimSpace(l) == "" {
+			continue
+		}
+		var parsed map[string]any
+		if err := json.Unmarshal([]byte(l), &parsed); err != nil {
+			t.Fatalf("invalid NDJSON line: %s", l)
+		}
+
+		if sawTerminalDone {
+			t.Fatalf("PROTOCOL VIOLATION (R4): data received after done:true in Ollama NDJSON:\n%s", l)
+		}
+
+		if doneVal, _ := parsed["done"].(bool); doneVal {
+			sawTerminalDone = true
+		}
+
+		// Verify that /api/chat emits message.content, NOT response
+		if _, hasResp := parsed["response"]; hasResp {
+			t.Fatalf("PROTOCOL VIOLATION (R4): /api/chat received event with top-level 'response' instead of 'message':\n%s", l)
+		}
+
+		if msgMap, ok := parsed["message"].(map[string]any); ok {
+			content, _ := msgMap["content"].(string)
+			if strings.Contains(content, "123.456.789-01") {
+				foundRestored = true
+			}
+		}
+	}
+
+	if !foundRestored {
+		t.Fatalf("expected restored CPF in message.content of /api/chat NDJSON stream, got:\n%s", string(chatBytes))
 	}
 }
 

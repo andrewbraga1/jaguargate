@@ -32,5 +32,16 @@ jobs:
       - name: Build static jgate binary
         run: CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o jgate ./cmd/jgate
 
+      - name: Install Enterprise Security Scanners (Govulncheck & GoSec)
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          go install github.com/securego/gosec/v2/cmd/gosec@latest
+
+      - name: Run Govulncheck (Dependency Supply-Chain Audit)
+        run: $(go env GOPATH)/bin/govulncheck ./...
+
+      - name: Run GoSec (SAST Static Analysis)
+        run: $(go env GOPATH)/bin/gosec -exclude-dir=examples ./...
+
       - name: Execute built-in OWASP & MCP Red-Teaming Suite (jgate pounce)
         run: ./jgate pounce

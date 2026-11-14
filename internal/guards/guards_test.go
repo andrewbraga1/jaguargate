@@ -512,7 +512,7 @@ func TestAnthropicNonStreamingOutputSanitization(t *testing.T) {
 	piiToken := maskedPrompt[tokenOpen:tokenClose]
 
 	// Simulate an Anthropic non-streaming response body
-	anthropicResp := []byte(fmt.Sprintf(`{
+	anthropicResp := fmt.Appendf(nil, `{
 		"id": "msg_01X",
 		"type": "message",
 		"role": "assistant",
@@ -534,7 +534,7 @@ func TestAnthropicNonStreamingOutputSanitization(t *testing.T) {
 				"input": {"url": "https://evil.com/leak"}
 			}
 		]
-	}`, piiToken))
+	}`, piiToken)
 
 	inboundRes := InspectionResult{
 		SessionID: "sess-anthropic",
@@ -582,12 +582,12 @@ func TestOllamaNativeGenerateResponseField(t *testing.T) {
 	piiToken := maskedPrompt[tokenOpen:tokenClose]
 
 	// Simulate Ollama native /api/generate non-streaming response body
-	ollamaResp := []byte(fmt.Sprintf(`{
+	ollamaResp := fmt.Appendf(nil, `{
 		"model": "llama3.2",
 		"created_at": "2026-11-11T12:00:00Z",
 		"response": "O CPF do titular é %s e o token de canary é jg_cnry_ollama123456.",
 		"done": true
-	}`, piiToken))
+	}`, piiToken)
 
 	inboundRes := InspectionResult{
 		Status:      "CLEAN",
@@ -606,12 +606,12 @@ func TestOllamaNativeGenerateResponseField(t *testing.T) {
 	}
 
 	// 2. PII restoration in clean /api/generate response field (no canary leak)
-	ollamaCleanResp := []byte(fmt.Sprintf(`{
+	ollamaCleanResp := fmt.Appendf(nil, `{
 		"model": "llama3.2",
 		"created_at": "2026-11-11T12:00:00Z",
 		"response": "O CPF do titular é %s e está regular.",
 		"done": true
-	}`, piiToken))
+	}`, piiToken)
 
 	inboundClean := InspectionResult{
 		Status:      "CLEAN",

@@ -71,7 +71,7 @@ func (ins *Inspector) InspectPayload(body []byte, sessionID, mcpServerHeader str
 				res.Status = "BLOCKED"
 				res.Blocked = true
 				res.Severity = "INTRUSION_ALERT"
-				errPayload := []byte(fmt.Sprintf(`{"jsonrpc":"2.0","error":{"code":-32600,"message":"JaguarGate: MCP server %q is not authorized by security policy (JG-CFG-102)"}}`, mcpServerHeader))
+				errPayload := fmt.Appendf(nil, `{"jsonrpc":"2.0","error":{"code":-32600,"message":"JaguarGate: MCP server %q is not authorized by security policy (JG-CFG-102)"}}`, mcpServerHeader)
 				res.ModifiedBody = errPayload
 				return res
 			}
@@ -118,7 +118,21 @@ func (ins *Inspector) InspectPayload(body []byte, sessionID, mcpServerHeader str
 		}
 
 		res.finalize(cfg.Core.Mode)
-		if modified && !isShadow && !res.Blocked {
+		if res.Blocked && !isShadow {
+			blockedErr := map[string]any{
+				"jsonrpc": "2.0",
+				"error": map[string]any{
+					"code":    -32600,
+					"message": "JaguarGate: MCP security policy blocked request or response",
+					"data":    res.Codes,
+				},
+			}
+			if b, err := marshalUnescaped(blockedErr); err == nil {
+				res.ModifiedBody = b
+			}
+			return res
+		}
+		if modified && !isShadow {
 			if b, err := marshalUnescaped(keptBatch); err == nil {
 				res.ModifiedBody = b
 			}

@@ -209,9 +209,9 @@ func NewGatewayServer(cfgMgr *config.Manager, logger *slog.Logger) (*GatewayServ
 							if len(inboundRes.Codes) > 0 {
 								resp.Header.Set("X-JaguarGate-Codes", strings.Join(inboundRes.Codes, ","))
 							}
-							blockedBody := mcpRes.ModifiedBody
-							if len(blockedBody) == 0 {
-								blockedBody = []byte(`{"error":{"code":"mcp_blocked","message":"JaguarGate: MCP response blocked by security policy"}}`)
+							blockedBody := []byte(`{"jsonrpc":"2.0","error":{"code":-32600,"message":"JaguarGate: MCP response blocked by security policy"}}`)
+							if len(mcpRes.ModifiedBody) > 0 && !bytes.Equal(mcpRes.ModifiedBody, rawResp) {
+								blockedBody = mcpRes.ModifiedBody
 							}
 							resp.Body = io.NopCloser(bytes.NewReader(blockedBody))
 							resp.ContentLength = int64(len(blockedBody))
