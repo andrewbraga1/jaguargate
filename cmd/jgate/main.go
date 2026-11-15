@@ -251,30 +251,30 @@ func checkTCPReachability(rawURL string) bool {
 	if rawURL == "" {
 		return false
 	}
-	if !strings.Contains(rawURL, "://") {
-		conn, err := net.DialTimeout("tcp", rawURL, 300*time.Millisecond)
-		if err != nil {
+	u, err := url.Parse(rawURL)
+	var target string
+	if err != nil || u.Host == "" {
+		if strings.Contains(rawURL, "://") {
 			return false
 		}
-		_ = conn.Close()
-		return true
-	}
-	u, err := url.Parse(rawURL)
-	if err != nil || u.Host == "" {
-		return false
-	}
-	host := u.Host
-	if !strings.Contains(host, ":") {
-		switch u.Scheme {
-		case "https":
-			host += ":443"
-		case "redis", "rediss":
-			host += ":6379"
-		default:
-			host += ":80"
+		target = rawURL
+	} else {
+		target = u.Host
+		if !strings.Contains(target, ":") {
+			switch u.Scheme {
+			case "https":
+				target += ":443"
+			case "redis", "rediss":
+				target += ":6379"
+			default:
+				target += ":80"
+			}
 		}
 	}
-	conn, err := net.DialTimeout("tcp", host, 300*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	var d net.Dialer
+	conn, err := d.DialContext(ctx, "tcp", target)
 	if err != nil {
 		return false
 	}
@@ -286,7 +286,10 @@ func checkUnixReachability(sockPath string) bool {
 	if sockPath == "" {
 		return false
 	}
-	conn, err := net.DialTimeout("unix", sockPath, 300*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	var d net.Dialer
+	conn, err := d.DialContext(ctx, "unix", sockPath)
 	if err != nil {
 		return false
 	}

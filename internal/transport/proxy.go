@@ -846,8 +846,7 @@ func (dt *dynamicTransport) updateTransportLocked(cfg *config.Config) {
 		TLSHandshakeTimeout:   5 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
 		TLSClientConfig: &tls.Config{
-			InsecureSkipVerify: !cfg.Network.Egress.TLSVerify,
-			MinVersion:         tls.VersionTLS12,
+			MinVersion: tls.VersionTLS12,
 		},
 	}
 	if cfg.Network.Egress.UpstreamUnixSocket != "" {
