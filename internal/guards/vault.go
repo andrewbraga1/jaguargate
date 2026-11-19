@@ -24,6 +24,7 @@ var (
 	reVaultAWSKey     = regexp.MustCompile(`\bAKIA[0-9A-Z]{16}\b`)
 	reVaultAPISecret  = regexp.MustCompile(`\b(?:sk-[A-Za-z0-9_-]{16,}|ghp_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{10,})\b`)
 	reVaultJWT        = regexp.MustCompile(`\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b`)
+	reVaultPrivateKey = regexp.MustCompile(`(?i)-----BEGIN(?: [A-Z0-9]+)? PRIVATE KEY-----`)
 	reVaultToken      = regexp.MustCompile(`\x3cJG_PII_[A-Z0-9_]+_[0-9a-f]{8,32}\x3e`)
 )
 
@@ -459,4 +460,46 @@ func isValidLuhn(raw string) bool {
 		double = !double
 	}
 	return sum%10 == 0
+}
+
+// RedactSecretsInText performs active output DLP scanning for spontaneous/unmapped secrets
+// emitted by the LLM (AWS keys, API secrets, JWTs, private key headers, and custom is_secret patterns).
+func RedactSecretsInText(text string, cfg config.PIIVaultConfig, replacement string) (string, bool) {
+	if !cfg.Enabled || text == "" {
+		return text, false
+	}
+
+	out := text
+	found := false
+
+	apply := func(re *regexp.Regexp) {
+		if re != nil && re.MatchString(out) {
+			found = true
+			if replacement != "" {
+				out = re.ReplaceAllString(out, replacement)
+			}
+		}
+	}
+
+	if cfg.Entities.AWSKeys {
+		apply(resolvePattern(cfg.PatternOverrides.AWSKeys, reVaultAWSKey))
+	}
+	if cfg.Entities.APISecrets {
+		apply(resolvePattern(cfg.PatternOverrides.APISecrets, reVaultAPISecret))
+	}
+	if cfg.Entities.JWTTokens {
+		apply(resolvePattern(cfg.PatternOverrides.JWTTokens, reVaultJWT))
+	}
+	apply(reVaultPrivateKey)
+
+	for _, cp := range cfg.CustomPatterns {
+		if !cp.IsEnabled() || !cp.IsSecret || strings.TrimSpace(cp.Regex) == "" {
+			continue
+		}
+		if re, err := getOrCompileRegex(cp.Regex); err == nil {
+			apply(re)
+		}
+	}
+
+	return out, found
 }

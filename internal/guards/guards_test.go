@@ -751,6 +751,36 @@ func TestPIIVaultExternalStorePreservesSecretClassificationAfterRestart(t *testi
 	}
 }
 
+func TestOutputActiveSecretDLPForSpontaneousModelLeaks(t *testing.T) {
+	vault := NewPIIVault()
+	engine := NewEngine(vault)
+	cfg := config.DefaultConfig()
+	cfg.ApplyPreset()
+
+	// Spontaneous secrets hallucinated/leaked by the LLM (never sent in the inbound prompt)
+	respJSON := []byte(`{
+		"choices": [{
+			"index": 0,
+			"message": {
+				"role": "assistant",
+				"content": "Aqui está a chave vazada AKIAIOSFODNN7EXAMPLE e o header -----BEGIN OPENSSH PRIVATE KEY----- para debug."
+			}
+		}]
+	}`)
+
+	out := engine.SanitizeOutputJSON(respJSON, InspectionResult{SessionID: "sess-dlp-out"}, &cfg)
+	outStr := string(out.ModifiedBody)
+	if strings.Contains(outStr, "AKIAIOSFODNN7EXAMPLE") || strings.Contains(outStr, "BEGIN OPENSSH PRIVATE KEY") {
+		t.Fatalf("SECURITY FAILURE: spontaneous LLM secrets leaked in output: %s", outStr)
+	}
+	if !strings.Contains(outStr, "JG-SEC-503") {
+		t.Errorf("expected JG-SEC-503 redaction placeholder in output, got: %s", outStr)
+	}
+	if !slices.Contains(out.Codes, "JG-SEC-503") || out.Severity != "INTRUSION_ALERT" {
+		t.Errorf("expected JG-SEC-503 with INTRUSION_ALERT, got codes=%v severity=%s", out.Codes, out.Severity)
+	}
+}
+
 func BenchmarkOWASPInputEngine(b *testing.B) {
 	engine := NewEngine(NewPIIVault())
 	cfg := config.DefaultConfig()

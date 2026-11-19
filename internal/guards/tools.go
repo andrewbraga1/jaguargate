@@ -21,24 +21,32 @@ var (
 
 // OutputInspectionResult holds the outcome of inspecting a non-streaming LLM response.
 type OutputInspectionResult struct {
-	ModifiedBody []byte
-	Status       string
-	Severity     string
-	Codes        []string
-	PrunedTools  int
-	CanaryLeaked bool
+	ModifiedBody    []byte
+	Status          string
+	Severity        string
+	Codes           []string
+	PrunedTools     int
+	PrunedToolNames []string
+	CanaryLeaked    bool
 }
 
 // SanitizeToolCallsSlice inspects a JSON array of tool_calls (or tools definitions),
 // surgically pruning unauthorized tools (JG-CFG-101) and untrusted domains (JG-CFG-103).
 func SanitizeToolCallsSlice(rawTools []any, cfg config.WhitelistConfig, isShadow bool) ([]any, []string, int) {
+	kept, codes, prunedNames := SanitizeToolCallsSliceDetailed(rawTools, cfg, isShadow)
+	return kept, codes, len(prunedNames)
+}
+
+// SanitizeToolCallsSliceDetailed inspects a JSON array of tool_calls (or tool definitions)
+// and also returns the exact names of all pruned unauthorized tools for semantic feedback headers.
+func SanitizeToolCallsSliceDetailed(rawTools []any, cfg config.WhitelistConfig, isShadow bool) ([]any, []string, []string) {
 	if !cfg.EnforceToolWhitelist || len(rawTools) == 0 {
-		return rawTools, nil, 0
+		return rawTools, nil, nil
 	}
 
 	kept := make([]any, 0, len(rawTools))
 	var codes []string
-	prunedCount := 0
+	var prunedNames []string
 
 	for _, item := range rawTools {
 		toolMap, ok := item.(map[string]any)
@@ -49,7 +57,7 @@ func SanitizeToolCallsSlice(rawTools []any, cfg config.WhitelistConfig, isShadow
 
 		toolName := extractToolName(toolMap)
 		if toolName != "" && !isToolAllowed(toolName, cfg.AllowedTools) {
-			prunedCount++
+			prunedNames = append(prunedNames, sanitizeHeaderToken(toolName))
 			if !slices.Contains(codes, "JG-CFG-101") {
 				codes = append(codes, "JG-CFG-101")
 			}
@@ -94,7 +102,13 @@ func SanitizeToolCallsSlice(rawTools []any, cfg config.WhitelistConfig, isShadow
 		kept = append(kept, toolMap)
 	}
 
-	return kept, codes, prunedCount
+	return kept, codes, prunedNames
+}
+
+func sanitizeHeaderToken(s string) string {
+	s = strings.ReplaceAll(strings.ReplaceAll(s, "\r", ""), "\n", "")
+	s = strings.ReplaceAll(s, ",", "_")
+	return strings.TrimSpace(s)
 }
 
 // SanitizeOutputText checks a text segment for Canary Token leaks (JG-SEC-501),
@@ -168,6 +182,28 @@ func SanitizeOutputTextWithSession(sessionID, text, canaryToken string, cfg *con
 		working = vault.RestoreTextWithOptions(sessionID, working, cfg.Guards.PIIVault.RestoreSecrets)
 	}
 
+	// 5. Active Output Secret DLP (JG-SEC-503): redact spontaneous/unmapped credentials emitted by the LLM
+	if cfg.Guards.PIIVault.Enabled && !cfg.Guards.PIIVault.RestoreSecrets {
+		replacement := "[RESTRICTED SECRET LEAK (JG-SEC-503)]"
+		if isPT {
+			replacement = "[VAZAMENTO DE SEGREDO RESTRITO (JG-SEC-503)]"
+		}
+		if isShadow {
+			if _, leakedSecret := RedactSecretsInText(working, cfg.Guards.PIIVault, ""); leakedSecret {
+				if !slices.Contains(codes, "JG-SEC-503") {
+					codes = append(codes, "JG-SEC-503")
+				}
+			}
+		} else {
+			if redacted, leakedSecret := RedactSecretsInText(working, cfg.Guards.PIIVault, replacement); leakedSecret {
+				working = redacted
+				if !slices.Contains(codes, "JG-SEC-503") {
+					codes = append(codes, "JG-SEC-503")
+				}
+			}
+		}
+	}
+
 	return working, codes, false
 }
 
@@ -179,11 +215,12 @@ func (e *Engine) SanitizeOutputJSON(body []byte, inboundRes InspectionResult, cf
 	}
 
 	out := OutputInspectionResult{
-		ModifiedBody: body,
-		Status:       inboundRes.Status,
-		Severity:     inboundRes.Severity,
-		Codes:        slices.Clone(inboundRes.Codes),
-		PrunedTools:  inboundRes.PrunedTools,
+		ModifiedBody:    body,
+		Status:          inboundRes.Status,
+		Severity:        inboundRes.Severity,
+		Codes:           slices.Clone(inboundRes.Codes),
+		PrunedTools:     inboundRes.PrunedTools,
+		PrunedToolNames: slices.Clone(inboundRes.PrunedToolNames),
 	}
 	if out.Status == "" {
 		out.Status = "CLEAN"
@@ -237,8 +274,14 @@ func (e *Engine) SanitizeOutputJSON(body []byte, inboundRes InspectionResult, cf
 
 				// 2. Inspect & selectively prune assistant tool_calls
 				if rawTools, ok := msgMap["tool_calls"].([]any); ok && len(rawTools) > 0 {
-					keptTools, toolCodes, pruned := SanitizeToolCallsSlice(rawTools, cfg.Whitelist, isShadow)
+					keptTools, toolCodes, prunedNames := SanitizeToolCallsSliceDetailed(rawTools, cfg.Whitelist, isShadow)
+					pruned := len(prunedNames)
 					out.PrunedTools += pruned
+					for _, name := range prunedNames {
+						if !slices.Contains(out.PrunedToolNames, name) {
+							out.PrunedToolNames = append(out.PrunedToolNames, name)
+						}
+					}
 					for _, c := range toolCodes {
 						out.addOutputCode(c)
 					}
@@ -285,8 +328,14 @@ func (e *Engine) SanitizeOutputJSON(body []byte, inboundRes InspectionResult, cf
 			}
 		}
 		if rawTools, ok := msgMap["tool_calls"].([]any); ok && len(rawTools) > 0 {
-			keptTools, toolCodes, pruned := SanitizeToolCallsSlice(rawTools, cfg.Whitelist, isShadow)
+			keptTools, toolCodes, prunedNames := SanitizeToolCallsSliceDetailed(rawTools, cfg.Whitelist, isShadow)
+			pruned := len(prunedNames)
 			out.PrunedTools += pruned
+			for _, name := range prunedNames {
+				if !slices.Contains(out.PrunedToolNames, name) {
+					out.PrunedToolNames = append(out.PrunedToolNames, name)
+				}
+			}
 			for _, c := range toolCodes {
 				out.addOutputCode(c)
 			}
@@ -349,6 +398,10 @@ func (e *Engine) SanitizeOutputJSON(body []byte, inboundRes InspectionResult, cf
 				if cfg.Whitelist.EnforceToolWhitelist && toolName != "" {
 					if !IsToolAllowed(toolName, cfg.Whitelist.AllowedTools) {
 						out.PrunedTools++
+						safeName := sanitizeHeaderToken(toolName)
+						if safeName != "" && !slices.Contains(out.PrunedToolNames, safeName) {
+							out.PrunedToolNames = append(out.PrunedToolNames, safeName)
+						}
 						out.addOutputCode("JG-CFG-101")
 						if !isShadow {
 							blockMap["name"] = "unauthorized_tool_omitted"

@@ -148,12 +148,16 @@ func NewGatewayServer(cfgMgr *config.Manager, logger *slog.Logger) (*GatewayServ
 						resp.Header.Set("X-JaguarGate-Codes", strings.Join(inboundRes.Codes, ","))
 					}
 					if inboundRes.PrunedTools > 0 {
+						resp.Header.Set("X-JaguarGate-Veto", "tool_unauthorized")
 						resp.Header.Set("X-JaguarGate-Pruned-Count", strconv.Itoa(inboundRes.PrunedTools))
+						if len(inboundRes.PrunedToolNames) > 0 {
+							resp.Header.Set("X-JaguarGate-Pruned-Tools", strings.Join(inboundRes.PrunedToolNames, ","))
+						}
 					}
 				}
 
 				if activeCfg.Telemetry.WarningFlags.EmitHTTPTrailersOnStream {
-					resp.Header.Set("Trailer", "X-JaguarGate-Status, X-JaguarGate-Severity, X-JaguarGate-Codes, X-JaguarGate-Pruned-Count")
+					resp.Header.Set("Trailer", "X-JaguarGate-Status, X-JaguarGate-Severity, X-JaguarGate-Codes, X-JaguarGate-Pruned-Count, X-JaguarGate-Veto, X-JaguarGate-Pruned-Tools")
 					if resp.Trailer == nil {
 						resp.Trailer = make(http.Header)
 					}
@@ -240,7 +244,11 @@ func NewGatewayServer(cfgMgr *config.Manager, logger *slog.Logger) (*GatewayServ
 							resp.Header.Set("X-JaguarGate-Codes", strings.Join(outRes.Codes, ","))
 						}
 						if outRes.PrunedTools > 0 {
+							resp.Header.Set("X-JaguarGate-Veto", "tool_unauthorized")
 							resp.Header.Set("X-JaguarGate-Pruned-Count", strconv.Itoa(outRes.PrunedTools))
+							if len(outRes.PrunedToolNames) > 0 {
+								resp.Header.Set("X-JaguarGate-Pruned-Tools", strings.Join(outRes.PrunedToolNames, ","))
+							}
 						}
 					}
 

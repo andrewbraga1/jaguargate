@@ -1,51 +1,50 @@
-# 🛡️ JaguarGate — Pacote de Auditoria e Certificação de Segurança Gate 5
+# 🛡️ JaguarGate Gate 5 — Pacote de Verificação Bilateral 4 Quadrantes
 
-[![Gate 5 Certified](https://img.shields.io/badge/Gate%205-Certified%20Zero--CVE-brightgreen.svg)](#)
-[![Taxa de Neutralização](https://img.shields.io/badge/Neutraliza%C3%A7%C3%A3o-30%2F30%20(100%25)-blue.svg)](#)
-[![Zero-Nosec](https://img.shields.io/badge/GoSec%20SAST-Zero%20Nosec-success.svg)](#)
-[![Govulncheck](https://img.shields.io/badge/Govulncheck-Zero%20Vulnerabilidades-success.svg)](#)
+[![Bilateral Suite](https://img.shields.io/badge/Su%C3%ADte%20Bilateral-30%2F30%20Verificados-blue.svg)](#)
+[![GoSec SAST](https://img.shields.io/badge/GoSec%20SAST-0%20Issues%20%7C%200%20Nosec-success.svg)](#)
+[![Govulncheck](https://img.shields.io/badge/Govulncheck-0%20CVEs%20Alcan%C3%A7%C3%A1veis-success.svg)](#)
 
-Este diretório contém o dossiê completo de auditoria independente, evidências de execução, metodologia de testes adversariais e suíte de reprodução gerados pelo **Maestro Software Foundry** para o **JaguarGate** (commit `6d2057e`).
+Este diretório contém o pacote reproduzível da **Suíte Automatizada de Verificação Bilateral 4 Quadrantes** do **JaguarGate**.
+
+> **Nota de Escopo:** Esta é uma bateria automatizada interna com captura explícita do corpo recebido pelo upstream (Q2), validação de saída no cliente (Q3) e controle positivo direto sem gateway (Q4). Os resultados são delimitados exatamente aos 30 vetores sintéticos e à configuração testada, não substituindo pentest externo independente.
 
 ---
 
-## 📁 Estrutura do Pacote de Auditoria
+## 📁 Conteúdo do Pacote
 
 ```text
 jaguargate-audit-pack/
-├── README.md                      # Visão geral e guia da comunidade (Inglês)
-├── README.pt-BR.md                # Visão geral e guia da comunidade (Português)
-├── CERTIFICATE_GATE5.md           # Certificado formal assinado pelo Maestro
-├── METHODOLOGY.md                 # Metodologia dos 3 Frontes e 7 Fail-Safes
+├── README.md                      # Visão geral e guia de reprodução (EN)
+├── README.pt-BR.md                # Visão geral e guia de reprodução (PT-BR)
+├── CERTIFICATE_GATE5.md           # Relatório delimitado da bateria automatizada
+├── METHODOLOGY.md                 # Protocolo Invariante Bilateral 4 Quadrantes
 ├── findings/
-│   ├── gate5_30_rounds_matrix.md  # Detalhamento linha por linha das 30 sondas
-│   └── full_campaign_report.json  # Relatório bruto estruturado em JSON
-├── raw_logs/
-│   ├── gate5_campaign_console.log # Log completo do console durante a bateria
-│   ├── gate5_target_gateway.log   # Log de execução do binário JaguarGate
-│   └── redteam_campaign_report.json
+│   ├── gate5_30_rounds_matrix.md  # Matriz detalhada dos vetores testados
+│   └── full_campaign_report.json  # Evidências capturadas (upstream e cliente)
 └── reproduce/
-    ├── run_reproduce.sh           # Script em 1 comando para reproduzir a auditoria
-    ├── reproduce_audit.py         # Executor determinístico em Python
-    ├── test_vectors.json          # Definição congelada dos 30 vetores
-    └── mock_upstream.py           # Mock local do upstream LLM (custo zero)
+    ├── run_reproduce.sh           # Script executor (4010 / 4020)
+    ├── reproduce_audit.py         # Verificador bilateral 4 quadrantes em Python
+    ├── test_vectors.json          # 30 vetores bilaterais (JSON bruto e SSE real)
+    └── mock_upstream.py           # Mock com captura (/_mock/last_request + eco de tokens + SSE)
 ```
 
 ---
 
-## 🚀 Como Reproduzir a Auditoria Localmente
+## 🚀 Como Reproduzir Localmente
 
-Qualquer desenvolvedor ou pesquisador de segurança pode validar e reproduzir a bateria de 30 rodadas em menos de 15 segundos:
-
-1. **Inicie o JaguarGate:**
+1. **Suba o mock upstream com captura na porta `4020`:**
    ```bash
-   jgate serve -c jaguargate.yaml
+   python3 docs/security/jaguargate-audit-pack/reproduce/mock_upstream.py 4020
    ```
 
-2. **Execute o script de verificação:**
+2. **Suba o JaguarGate na porta `4010` apontando para `http://127.0.0.1:4020`:**
    ```bash
-   cd reproduce
-   ./run_reproduce.sh 4010
+   ./jgate serve -c jaguargate.yaml
    ```
 
-O script testará automaticamente as 3 frentes de ataque (FRONT-1: Confusão Estrutural, FRONT-2: Canários de Dados Sensíveis e PII, FRONT-3: Evasão Semântica) e certificará que nenhum canário vazou e que o gateway tratou todos os envelopes com sucesso.
+3. **Execute o Verificador Bilateral 4 Quadrantes:**
+   ```bash
+   ./docs/security/jaguargate-audit-pack/reproduce/run_reproduce.sh 4010 4020
+   ```
+
+O verificador executa primeiro o **Controle Positivo (Q4)** direto no mock (provando captura de vazamento cru) e depois valida todos os 30 vetores nos quadrantes Q1, Q2 e Q3, salvando as evidências em `findings/full_campaign_report.json`.

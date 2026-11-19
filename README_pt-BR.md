@@ -3,7 +3,7 @@
 > **Gateway de Segurança de Ultra-Baixa Latência para IA, Agentes Autônomos e MCP em Go.**  
 > *Batizado em homenagem à Panthera onca (a nossa onça-pintada — do Tupi "Yaguara", o predador que neutraliza a ameaça em um único salto).*
 
-[![Go Version](https://img.shields.io/badge/Go-1.23+-00ADD8?style=flat&logo=go)](https://go.dev/)
+[![Go Version](https://img.shields.io/badge/Go-1.26+-00ADD8?style=flat&logo=go)](https://go.dev/)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![OWASP LLM Top 10](https://img.shields.io/badge/OWASP-LLM%20Top%2010%20Aligned-critical)](https://owasp.org/www-project-top-10-for-large-language-model-applications/)
 [![Language](https://img.shields.io/badge/Docs-EN%20%7C%20PT--BR-success)](README.md)
@@ -14,17 +14,17 @@
 
 ## ⚡ Por que o JaguarGate?
 
-Proxies de segurança tradicionais tratam o tráfego de IA como páginas web estáticas: se um único parâmetro viola uma regra, eles devolvem um erro `HTTP 403/500`, **derrubando toda a cadeia de raciocínio do seu agente autônomo** e desperdiçando tokens.
+O **JaguarGate** é um **gateway corporativo agnóstico de framework para políticas de tráfego LLM e MCP** escrito em Go puro (`CGO_ENABLED=0`), desenhado como camada de rede/sidecar **complementar aos guardrails de aplicação** (como Pydantic AI, LangChain, CrewAI ou hooks de SDK — *Defense-in-Depth*):
 
-O **JaguarGate** é um gateway sidecar resiliente de sub-milissegundos escrito em Go puro (`CGO_ENABLED=0`), desenhado para **LLMs**, **Agentes Autônomos** (AgentScope, LangChain, CrewAI, LiteLLM) e servidores **MCP (Model Context Protocol)**:
+> **Fronteira Arquitetural:** Regras de negócio (RBAC do usuário logado, limites de pagamento, aprovação humana) pertencem ao executor da aplicação. O **JaguarGate** aplica políticas unificadas de tráfego em toda a infraestrutura (Python, Go, Node.js, Ruby, Java), impedindo que dados sensíveis saiam do perímetro rumo a provedores LLM externos.
 
-* 🛡️ **Degradação Elegante (Pass-Through Seletivo):** Se um agente executar 3 ferramentas em paralelo e 1 não estiver autorizada, o JaguarGate remove cirurgicamente apenas a chamada proibida, mantém a requisição viva (`HTTP 200`) e anexa **Flags de Aviso** (`X-JaguarGate-*`).
-* 🧩 **Regras Corporativas Totalmente Desacopladas:** Empresas podem ativar/desativar entidades padrão (`CPF`, `CNPJ`, `CreditCard`, `Email`, `AWSKeys`, `APISecrets`, `JWT`) via YAML/JSON, sobrescrever regexes com `pattern_overrides` ou registrar padrões proprietários (`custom_patterns`) sem alterar código Go.
-* 🚀 **Arquitetura Tri-Transporte:** **HTTP/REST** (`:4010`) por padrão para integração sem alterar código, **Unix Domain Sockets (UDS)** para latência quase zero via Kernel com modelos locais (ex: Ollama) e **gRPC/RPC** (`:4011`) com validação obrigatória de metadados Bearer e framing `Grpc-Status: 16 (UNAUTHENTICATED)`.
-* 🌊 **Inspeção de Streaming com Recomposição de Fragmentos (SSE):** Remonta argumentos de ferramentas divididos em múltiplos chunks e valida respostas token a token usando janela deslizante UTF-8 nos formatos OpenAI, Anthropic e Ollama.
-* 🔐 **Cofre Reversível com Isolamento por Sessão:** Mascara entidades com pseudônimos de 128 bits de entropia (`<JG_PII_{LABEL}_{HEX}>`) isolados no escopo do `sessionID` do cliente, impedindo vazamento de dados entre inquilinos (Multi-Tenant).
-* 🔏 **Logger Zero-Trust Extensível:** Reduz dados sensíveis e credenciais dos logs da aplicação com um motor thread-safe linear (`slog`) e sanitização nativa contra injeção de log CRLF (CWE-117 / GoSec G706).
-* 🔌 **Guardrail MCP & Firewall Recursivo:** Inspeciona recursivamente chamadas JSON-RPC 2.0 (`tools/call`, `resources/read`) com teto de profundidade (`JG-CFG-203`) e cobertura de campos irmãos contra injeção indireta.
+* 🛡️ **Degradação Elegante & Feedback Semântico de Veto:** Se um agente emitir 3 ferramentas em paralelo e 1 não estiver autorizada, o JaguarGate remove cirurgicamente apenas a chamada proibida, mantém o transporte vivo (`HTTP 200`) e emite cabeçalhos/trailers estruturados de veto (`X-JaguarGate-Veto: tool_unauthorized`, `X-JaguarGate-Pruned-Tools`, `X-JaguarGate-Codes`).
+* 🧩 **Regras Corporativas e Dados Brasileiros Nativos:** Detectores integrados para **CPF** (formatado e cru de 11 dígitos com validação Módulo 11), **CNPJ** (numérico e alfanumérico 2026), **Telefone Brasileiro** (celular e fixo com DDD), **Cartões de Crédito** (13–19 dígitos com validação Luhn), **Email**, **Chaves AWS**, **API Secrets**, **JWT** e **Cabeçalhos de Chave Privada**, além de `pattern_overrides` e `custom_patterns` via YAML/JSON.
+* 🚀 **Arquitetura Tri-Transporte:** **HTTP/REST** (`:4010`) para integração sem alterar código, **Unix Domain Sockets (UDS)** para roteamento local via Kernel (ex: Ollama) e **gRPC/RPC** (`:4011`) com validação Bearer e framing `Grpc-Status: 16 (UNAUTHENTICATED)`.
+* 🌊 **Inspeção Incremental de Streaming (SSE / NDJSON):** Remonta argumentos de ferramentas divididos em chunks e inspeciona fluxos OpenAI, Anthropic e Ollama por meio de uma **janela deslizante UTF-8 de 64 runes** (sobretaxa determinística inferior a 100µs por fragmento, sem buffering do corpo inteiro; a retenção de sufixo ativa-se apenas quando um marcador aberto, canário ou prefixo de segredo é detectado).
+* 🔐 **Cofre Reversível PII com Retenção Estrita de Segredos (`restore_secrets: false`):** Mascara PII e segredos com pseudônimos de 128 bits vinculados à sessão (`<JG_PII_{LABEL}_{HEX}>`), preservando o metadado `isSecret` na memória L1 e no Redis L2. Por padrão, **PII autorizada é restaurada para a sessão dona enquanto segredos permanecem retidos mesmo se ecoados pelo modelo**, somado ao **DLP Ativo de Saída (`JG-SEC-503`)** contra credenciais geradas espontaneamente pelo LLM.
+* 🔏 **Logger Zero-Trust Extensível:** Reduz dados sensíveis e credenciais dos logs da aplicação com motor thread-safe linear (`slog`) e sanitização nativa contra injeção CRLF (CWE-117 / GoSec G706).
+* 🔌 **Guardrail MCP & Firewall Recursivo:** Inspeciona recursivamente chamadas JSON-RPC 2.0 (`tools/call`, `resources/read`) com teto de profundidade (`JG-CFG-203`), corpo de erro seguro em bloqueios em lote (HTTP 403) e cobertura de campos irmãos.
 * 🔄 **Disjuntor de Loops por Hash Canônico SHA-256:** Interrompe loops infinitos de agentes em tempo $O(1)$ identificando a assinatura canônica das chamadas repetidas (`tool_name + sorted_json_args`).
 
 ---
@@ -293,47 +293,50 @@ O JaguarGate exibe todas as tabelas e saídas de CLI em **Inglês (`en`)** por p
 
 ---
 
-## 📊 Cobertura OWASP Top 10 para LLMs e Agentes
+## 📊 Cobertura OWASP Top 10 (Defense-in-Depth)
 
-| Ameaça OWASP | Mecanismo de Defesa do JaguarGate | Comportamento Resiliente (`sanitize_and_warn`) |
+| Ameaça OWASP | Mecanismo de Mitigação do JaguarGate | Comportamento Resiliente (`sanitize_and_warn`) |
 | :--- | :--- | :--- |
-| **LLM01: Prompt Injection** | Motor Linear RE2 + Assinaturas Customizadas + Spotlighting Dinâmico | Neutraliza o trecho malicioso; encaminha o contexto limpo + `JG-SEC-401` |
-| **LLM02: Vazamento de Dados (PII)** | Cofre Reversível de PII & Segredos (Isolado por Sessão + Regex Customizado) | Substitui entidade por `<JG_PII_{LABEL}_{HEX}>` + `JG-PII-301`/`JG-PII-302` |
-| **LLM05: Manipulação de Saída** | Bloqueador de imagens rastreadoras em Markdown e scripts | Remove links maliciosos no streaming SSE em tempo real + `JG-SEC-502` |
-| **LLM06: Agência Excessiva** | Firewall Seletivo de *Tool Calls* e JSON-RPC 2.0 MCP | Remove a ferramenta não autorizada sem quebrar a requisição `HTTP 200` + `JG-CFG-101` |
-| **LLM07: Vazamento de System Prompt** | Injeção invisível de *Canary Token* e detecção em streaming SSE | Corta imediatamente a transmissão que vazou o prompt + `JG-SEC-501` |
+| **LLM01: Prompt Injection** | Motor Linear RE2 + Assinaturas Customizadas + Spotlighting Dinâmico | Mitiga assinaturas conhecidas e delimita conteúdo externo + `JG-SEC-401` |
+| **LLM02: Vazamento de Dados (PII)** | Cofre Reversível PII (CPF Mód-11, CNPJ 2026, Telefone BR, Cartão Luhn) + `restore_secrets: false` + DLP Ativo de Saída | Mascara PII/segredos na saída (`JG-PII-301`/`302`); retém segredos ecoados; censura credenciais espontâneas geradas pelo modelo (`JG-SEC-503`) |
+| **LLM05: Manipulação de Saída** | Bloqueador de imagens rastreadoras em Markdown e scripts | Remove links e scripts maliciosos no streaming SSE em tempo real + `JG-SEC-502` |
+| **LLM06: Agência Excessiva** | Firewall Seletivo de *Tool Calls* e JSON-RPC 2.0 MCP | Poda ferramentas não autorizadas + emite `X-JaguarGate-Veto: tool_unauthorized` e `X-JaguarGate-Pruned-Tools` + `JG-CFG-101` |
+| **LLM07: Vazamento de System Prompt** | Injeção invisível de *Canary Token* e janela deslizante de 64 runes | Interrompe imediatamente a transmissão SSE ao detectar o canário + `JG-SEC-501` |
 | **LLM10: Consumo Ilimitado / Loops** | Disjuntor de Loops por Hash SHA-256 Canônico e limites de tokens | Interrompe chamadas repetidas idênticas sem derrubar o agente + `JG-CFG-201` |
 
 ---
 
-## 🧪 Verificação de Segurança & Bateria Red-Team
+## 🧪 Verificação de Segurança & Auditoria Bilateral 4 Quadrantes
 
-Toda alteração passa por baterias rigorosas com verificação estática e detecção de corrida (`-race`):
+Toda versão é verificada por análise estática (`go vet`, `gosec` com **0 issues / 0 nosec**, `govulncheck`), testes unitários e E2E com detector de corrida (`go test -race ./...`), bateria embutida (`jgate pounce`) e o pacote reproduzível **Gate 5 Bilateral 4 Quadrantes** (`docs/security/jaguargate-audit-pack/`), que captura e valida tanto o corpo recebido pelo upstream (Q2) quanto a resposta ao cliente (Q3) sob controle positivo obrigatório (Q4):
 
 ```bash
-# Executar testes unitários e de concorrência
-go test -race ./...
+# Executar testes unitários, E2E e detector de concorrência
+go test -race -count=1 ./...
 
-# Executar a bateria de ataques simulados
-jgate bote
+# Executar a bateria embutida de verificação OWASP & MCP
+./jgate pounce
+
+# Executar Verificador Bilateral 4 Quadrantes (mock_upstream em :4020 e jgate em :4010)
+./docs/security/jaguargate-audit-pack/reproduce/run_reproduce.sh 4010 4020
 ```
 
 ```
 ===========================================================================================================
-  JAGUARGATE RED-TEAMING SUITE (jgate pounce) — RELATÓRIO DE AUDITORIA DE SEGURANÇA
+  JAGUARGATE RED-TEAMING SUITE (jgate pounce) — RELATÓRIO DE VERIFICAÇÃO
 ===========================================================================================================
-ID      | CATEGORIA    | CENÁRIO DE ATAQUE SIMULADO                      | FLAGS DISPARADAS      | LAT.   | STATUS
+ID      | CATEGORIA    | CENÁRIO DE TESTE AUTOMATIZADO                                  | FLAGS DISPARADAS      | STATUS
 -----------------------------------------------------------------------------------------------------------
-VEC-01  | OWASP-LLM01  | Neutralização Direta de Prompt Injection        | JG-SEC-401            |  136µs | PASS  
-VEC-02  | OWASP-OBFUSC | Defesa contra Unicode Invisível + Base64        | JG-SEC-402,JG-SEC-401 |  255µs | PASS  
-VEC-03  | MULTIMODAL   | Remoção de Payload Oculto em EXIF de JPEG       | JG-SEC-403            |    2µs | PASS  
-VEC-04  | OWASP-LLM02  | Cofre Reversível de PII (CPF + CNPJ Alfanum. + Segredo) | JG-PII-301,JG-PII-302 |  109µs | PASS  
-VEC-05  | OWASP-LLM06  | Poda Cirúrgica de Tool Calls Não Autorizadas    | JG-CFG-101            |   42µs | PASS  
-VEC-06  | AGENT-LOOP   | Disjuntor O(1) SHA-256 de Loops de Agentes      | JG-CFG-201            |   17µs | PASS  
-VEC-07  | MCP-GUARD    | Firewall de Servidores MCP e JSON-RPC 2.0       | JG-CFG-102,JG-CFG-101 |   22µs | PASS  
-VEC-08  | SSE-STREAM   | Truncamento Imediato de Vazamento de Canary SSE | JG-SEC-501            |   76µs | PASS  
+VEC-01  | OWASP-LLM01  | Mitigação Direta de Prompt Injection                           | JG-SEC-401            | PASS  
+VEC-02  | OWASP-OBFUSC | Defesa contra Unicode Invisível + Base64                       | JG-SEC-402,JG-SEC-401 | PASS  
+VEC-03  | MULTIMODAL   | Remoção de Payload Oculto em EXIF de JPEG                      | JG-SEC-403            | PASS  
+VEC-04  | OWASP-LLM02  | Cofre Reversível PII (CPF + CNPJ Alfanum. + Segredo Retido)    | JG-PII-301,JG-PII-302 | PASS  
+VEC-05  | OWASP-LLM06  | Poda Cirúrgica de Tool Calls Não Autorizadas                   | JG-CFG-101            | PASS  
+VEC-06  | AGENT-LOOP   | Disjuntor O(1) SHA-256 de Loops de Agentes                     | JG-CFG-201            | PASS  
+VEC-07  | MCP-GUARD    | Firewall de Servidores MCP e JSON-RPC 2.0                      | JG-CFG-102,JG-CFG-101 | PASS  
+VEC-08  | SSE-STREAM   | Truncamento Imediato de Vazamento de Canary SSE                | JG-SEC-501            | PASS  
 -----------------------------------------------------------------------------------------------------------
-  VEREDITO: APROVADO (8/8 Vetores de Ataque Neutralizados) | Duração Total: 692µs
+  VEREDITO: APROVADO (8/8 Vetores Verificados) | Escopo da Bateria Automatizada Interna
 ===========================================================================================================
 ```
 

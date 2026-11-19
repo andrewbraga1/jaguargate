@@ -508,3 +508,59 @@ network:
 		t.Fatalf("SECURITY FAILURE (R1): Malicious batch payload was leaked in HTTP 403 response:\n%s", bodyStr)
 	}
 }
+
+func TestProxyToolPruningEmitsVetoHeadersAndPrunedToolNames(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"choices":[{"index":0,"finish_reason":"tool_calls","message":{"role":"assistant","tool_calls":[{"id":"1","function":{"name":"get_weather","arguments":"{}"}},{"id":"2","function":{"name":"drop_database","arguments":"{}"}}]}}]}`))
+	}))
+	defer upstream.Close()
+
+	tmpDir := t.TempDir()
+	cfgPath := filepath.Join(tmpDir, "jaguargate.yaml")
+	_ = os.WriteFile(cfgPath, []byte(`
+core:
+  preset: balanced
+whitelist:
+  enforce_tool_whitelist: true
+  allowed_tools: ["get_weather"]
+network:
+  egress:
+    upstream_url: "`+upstream.URL+`"
+`), 0600)
+
+	mgr, err := config.NewManager(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mgr.Close()
+
+	logger := telemetry.NewZeroTrustLoggerWithConfig(io.Discard, config.LoggingConfig{})
+	gw, err := NewGatewayServer(mgr, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader([]byte(`{"model":"llama3","messages":[{"role":"user","content":"Check weather"}]}`)))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	gw.Handler().ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected HTTP 200 sanitized response, got %d", w.Code)
+	}
+	if got := w.Header().Get("X-JaguarGate-Veto"); got != "tool_unauthorized" {
+		t.Errorf("expected X-JaguarGate-Veto='tool_unauthorized', got %q", got)
+	}
+	if got := w.Header().Get("X-JaguarGate-Pruned-Count"); got != "1" {
+		t.Errorf("expected X-JaguarGate-Pruned-Count='1', got %q", got)
+	}
+	if got := w.Header().Get("X-JaguarGate-Pruned-Tools"); got != "drop_database" {
+		t.Errorf("expected X-JaguarGate-Pruned-Tools='drop_database', got %q", got)
+	}
+	bodyStr := w.Body.String()
+	if strings.Contains(bodyStr, "drop_database") || !strings.Contains(bodyStr, "get_weather") {
+		t.Errorf("expected drop_database pruned and get_weather preserved, got: %s", bodyStr)
+	}
+}

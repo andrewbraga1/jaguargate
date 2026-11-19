@@ -50,10 +50,11 @@ type SSEInspector struct {
 	holdback     string // Rune-safe holdback buffer for cross-chunk tokens
 	utf8Rem      []byte // Holds incomplete multi-byte UTF-8 sequences split across TCP reads
 	codes        []string
-	status       string
-	severity     string
-	prunedTools  int
-	halted       bool
+	status          string
+	severity        string
+	prunedTools     int
+	prunedToolNames []string
+	halted          bool
 	eofReached   bool
 	reported         bool
 	isAnthropic      bool
@@ -88,11 +89,12 @@ func NewSSEInspector(
 		sessionID:   sessID,
 		canaryToken: inbound.CanaryToken,
 		trailers:    trailers,
-		codes:        slices.Clone(inbound.Codes),
-		status:       status,
-		severity:     severity,
-		prunedTools:  inbound.PrunedTools,
-		toolTrackers: make(map[int]*streamToolCallTracker),
+		codes:           slices.Clone(inbound.Codes),
+		status:          status,
+		severity:        severity,
+		prunedTools:     inbound.PrunedTools,
+		prunedToolNames: slices.Clone(inbound.PrunedToolNames),
+		toolTrackers:    make(map[int]*streamToolCallTracker),
 	}
 }
 
@@ -301,6 +303,7 @@ func (s *SSEInspector) handleSSELine(line string) {
 									if !tracker.isPruned {
 										tracker.isPruned = true
 										s.prunedTools++
+										s.recordPrunedToolName(nameStr)
 										s.recordCode("JG-CFG-101")
 									}
 								}
@@ -401,6 +404,7 @@ func (s *SSEInspector) handleSSELine(line string) {
 				if s.cfg.Whitelist.EnforceToolWhitelist && !guards.IsToolAllowed(toolName, s.cfg.Whitelist.AllowedTools) {
 					tracker.isPruned = true
 					s.prunedTools++
+					s.recordPrunedToolName(toolName)
 					s.recordCode("JG-CFG-101")
 				}
 				if _, exists := s.toolTrackers[idx]; !exists {
@@ -522,8 +526,12 @@ func (s *SSEInspector) handleSSELine(line string) {
 			}
 		}
 		if rawTools, ok := msgMap["tool_calls"].([]any); ok && len(rawTools) > 0 {
-			keptTools, toolCodes, pruned := guards.SanitizeToolCallsSlice(rawTools, s.cfg.Whitelist, isShadow)
+			keptTools, toolCodes, prunedNames := guards.SanitizeToolCallsSliceDetailed(rawTools, s.cfg.Whitelist, isShadow)
+			pruned := len(prunedNames)
 			s.prunedTools += pruned
+			for _, name := range prunedNames {
+				s.recordPrunedToolName(name)
+			}
 			for _, c := range toolCodes {
 				s.recordCode(c)
 			}
@@ -539,8 +547,12 @@ func (s *SSEInspector) handleSSELine(line string) {
 		}
 	}
 	if rawTools, ok := eventObj["tool_calls"].([]any); ok && len(rawTools) > 0 {
-		keptTools, toolCodes, pruned := guards.SanitizeToolCallsSlice(rawTools, s.cfg.Whitelist, isShadow)
+		keptTools, toolCodes, prunedNames := guards.SanitizeToolCallsSliceDetailed(rawTools, s.cfg.Whitelist, isShadow)
+		pruned := len(prunedNames)
 		s.prunedTools += pruned
+		for _, name := range prunedNames {
+			s.recordPrunedToolName(name)
+		}
 		for _, c := range toolCodes {
 			s.recordCode(c)
 		}
@@ -832,7 +844,19 @@ func (s *SSEInspector) populateTrailers() {
 		s.trailers.Set("X-JaguarGate-Codes", strings.Join(s.codes, ","))
 	}
 	if s.prunedTools > 0 {
+		s.trailers.Set("X-JaguarGate-Veto", "tool_unauthorized")
 		s.trailers.Set("X-JaguarGate-Pruned-Count", strconv.Itoa(s.prunedTools))
+		if len(s.prunedToolNames) > 0 {
+			s.trailers.Set("X-JaguarGate-Pruned-Tools", strings.Join(s.prunedToolNames, ","))
+		}
+	}
+}
+
+func (s *SSEInspector) recordPrunedToolName(name string) {
+	name = strings.ReplaceAll(strings.ReplaceAll(strings.TrimSpace(name), "\r", ""), "\n", "")
+	name = strings.ReplaceAll(name, ",", "_")
+	if name != "" && !slices.Contains(s.prunedToolNames, name) {
+		s.prunedToolNames = append(s.prunedToolNames, name)
 	}
 }
 
@@ -900,8 +924,34 @@ func splitHoldbackSuffix(text, canary string, maxRunes int) (string, string) {
 		}
 	}
 
+	// Hold back in-progress spontaneous secrets split across SSE chunks (until whitespace/delimiter closes the token)
+	secretOpens := []string{"AKIA", "sk-", "ghp_", "xoxb-", "xoxp-", "xoxa-", "eyJ", "-----BEGIN"}
+	for _, secOpen := range secretOpens {
+		lastOpen := strings.LastIndex(tail, secOpen)
+		if lastOpen != -1 {
+			if lastOpen > 0 {
+				prev := tail[lastOpen-1]
+				if (prev >= 'a' && prev <= 'z') || (prev >= 'A' && prev <= 'Z') || (prev >= '0' && prev <= '9') {
+					continue
+				}
+			}
+			afterOpen := tail[lastOpen+len(secOpen):]
+			if secOpen == "-----BEGIN" {
+				if !strings.Contains(afterOpen, "-----") {
+					if earliestHoldIdx == -1 || lastOpen < earliestHoldIdx {
+						earliestHoldIdx = lastOpen
+					}
+				}
+			} else if !strings.ContainsAny(afterOpen, " \t\r\n\"',;)}]") {
+				if earliestHoldIdx == -1 || lastOpen < earliestHoldIdx {
+					earliestHoldIdx = lastOpen
+				}
+			}
+		}
+	}
+
 	// Also hold back any partial prefix of open markers (even 1-2 chars like "!" of "![" or "[" of "[JG-CANARY:")
-	partialPrefixes := []string{piiOpenPrefix, "[JG-CANARY:", "!["}
+	partialPrefixes := []string{piiOpenPrefix, "[JG-CANARY:", "![", "AKIA", "-----BEGIN"}
 	for _, pref := range partialPrefixes {
 		maxP := min(len(pref)-1, len(tail))
 		for k := maxP; k >= 1; k-- {

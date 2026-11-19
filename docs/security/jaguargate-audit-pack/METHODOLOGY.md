@@ -1,42 +1,58 @@
-# 🏛️ JaguarGate Independent Security Evaluation Methodology
+# 🏛️ JaguarGate Automated Security Verification Methodology
 
-## 1. Overview & Governance
+## 1. Overview & Scope Boundaries
 
-This audit was conducted by the **Maestro Software Foundry** under the strict governance of **COBIT Segregation of Duties (SoD)**. In accordance with this principle, testing execution, vector design, and sign-offs are strictly segregated:
+This document describes the automated internal security test methodology executed against **JaguarGate** using the **Maestro Gate 5 Bilateral 4-Quadrant Protocol**.
 
-- **Audited Target:** JaguarGate (Commit `6d2057e`).
-- **Defensive Auditing Persona (Gate 4):** `@blue-team-appsec` (SAST, Zero-CVE, Zero-Nosec verification).
-- **Offensive Red-Team Persona (Gate 5):** `@red-team-hacker` (Cognitive red-teaming, boundary stress, adversarial probing).
-- **Quality Gatekeeper & Sign-off:** `🎩 Maestro (Tech Lead & Gatekeeper)`.
+- **Scope:** Validates deterministic HTTP/SSE/NDJSON/MCP proxy behavior, reversible PII vault isolation, `restore_secrets: false` enforcement, active output secret DLP (`JG-SEC-503`), Brazilian PII detectors (formatted & Mod-11 raw CPF, numeric & 2026 alphanumeric CNPJ, BR mobile/landline phone), Luhn credit card verification, and tool-call pruning veto headers (`X-JaguarGate-Veto`, `X-JaguarGate-Pruned-Tools`).
+- **Explicit Limitation:** Automated internal suites verify only the configured policies, parsers, and synthetic vectors listed in `reproduce/test_vectors.json`. They do **not** replace external independent penetration testing, application-layer business authorization (e.g., RBAC/spending limits inside Pydantic AI), or adversarial evaluation of natural-language paraphrases outside configured signatures.
 
 ---
 
-## 2. Evaluation Scope & Fronts
+## 2. The 4-Quadrant Bilateral Invariant Protocol (Kaizen Standard)
 
-The evaluation was structured into three distinct threat model fronts:
+Every vector in `reproduce/reproduce_audit.py` MUST verify **both sides of the network transaction** so that an HTTP 200 response can never mask an upstream leak:
 
-### Front 1: Protocol & Structural Confusion
-- **Objective:** Evaluate the robustness of the gateway's HTTP framing, JSON parser, boundary limits, and header processing against malformed and out-of-spec requests.
-- **Vectors:** JSON-RPC batch arrays, streaming mismatch, unexpected content-types, SSRF header injection, deep recursive JSON nesting, chunked token splitting, oversized buffers (8KB), Unicode envelope smuggling, duplicate keys, and 4096-character continuous tokens.
-
-### Front 2: Data Confidentiality & Exfiltration Prevention
-- **Objective:** Verify that sensitive customer data (PII) and corporate infrastructure credentials are never reflected or leaked through the gateway.
-- **Vectors:** Synthetic high-entropy canaries simulating Brazilian CPFs, CNPJs, AWS Access/Secret Keys, Unix `/etc/shadow` entries, environment variables, unformatted numeric PII, Bearer tokens, PEM headers, and database connection URIs.
-
-### Front 3: Semantic Evasion & Contextual Hijacking
-- **Objective:** Test the sanitization and inspection pipeline against sophisticated linguistic evasion techniques designed to bypass keyword and regex filters.
-- **Vectors:** Cyrillic homoglyph lookalikes, Right-to-Left Override (U+202E), Zero-Width Spaces (U+200B), Zero-Width Joiners (U+200D), JSON Unicode escape sequences, Markdown/HTML polyglots, CRLF injection, hypothetical adversarial framing, and nested quote evasion.
+1. **Quadrant 1 — Ingress Injection:**
+   Sends canonical JSON payloads or raw wire-level byte sequences (`raw_body` bypassing `json.dumps` deduplication) with synthetic Brazilian PII, credentials, SSE streaming requests, or adversarial framing.
+2. **Quadrant 2 — Upstream Egress Capture (Mandatory):**
+   `reproduce/mock_upstream.py` captures the exact raw bytes of every incoming HTTP request and exposes them via `GET /_mock/last_request`. For every PII/secret vector, the runner asserts:
+   - `must_not_reach_upstream`: raw sensitive strings MUST NOT exist in the captured upstream body.
+   - `must_reach_upstream_masked`: expected `<JG_PII_*` or `jg_untrusted` marker MUST exist in the captured upstream body (proving the detector fired).
+   - `must_reach_upstream_verbatim`: benign negative controls (e.g., Luhn-invalid 16-digit serial numbers) MUST arrive intact without false-positive masking.
+3. **Quadrant 3 — Client Response & Output Policy:**
+   The mock upstream echoes any `<JG_PII_...>` tokens it receives (in both JSON and fragmented SSE frames). The runner asserts:
+   - `must_restore_in_client`: authorized session PII (CPF, CNPJ, Phone, Card) IS restored to the same session.
+   - `must_not_leak_in_client`: vaulted secrets (`AWSKEY`, `SECRET`, `JWT`) remain masked even when echoed (`restore_secrets: false`), and spontaneous model secrets trigger `JG-SEC-503`.
+   - `expect_warning_header`: expected warning/veto headers (`X-JaguarGate-Codes`, `X-JaguarGate-Veto`, `X-JaguarGate-Pruned-Tools`) are emitted.
+4. **Quadrant 4 — Positive Control (Pre-Flight Proof):**
+   Before running any gateway vector, the harness sends a raw Mod-11 CPF (`52998224725`) **directly to `mock_upstream.py`** (bypassing JaguarGate) and verifies that the mock captures the raw leak. If the positive control fails, the harness aborts with exit code 2.
 
 ---
 
-## 3. Seven Cybernetic Fail-Safes
+## 3. Evaluation Fronts (30 Bilateral Vectors)
 
-To ensure rigorous, deterministic, and non-blocking evaluation, the test harness implemented 7 strict fail-safes:
+- **Front 1 — Protocol, Streaming & Structural Framing (10 vectors):**
+  JSON-RPC batch arrays, real fragmented SSE token streaming (`stream: true`), SSE secret withholding, unexpected Content-Types, SSRF header override resistance, recursive JSON nesting, 8KB buffer stress with embedded CPF, Unicode BiDi controls, raw wire-level duplicate JSON keys (`raw_body`), and oversized single-token payloads.
+- **Front 2 — PII, Secretário IA Coverage & Secret Withholding (10 vectors):**
+  Formatted CPF, raw unformatted 11-digit CPF (Mod 11), legacy & 2026 alphanumeric CNPJ, Brazilian mobile phone (formatted & unformatted), Luhn-valid credit card, Luhn-invalid 16-digit serial negative control, canonical AWS Access Key (`AKIA...`), OpenAI API key (`sk-proj-...`), GitHub PAT (`ghp_...`), and canonical 3-segment JWT — all tested for both upstream masking (Q2) and echo response policy (Q3).
+- **Front 3 — Injection Signatures, Deobfuscation & Spotlighting (10 vectors):**
+  Direct prompt injection (`JG-SEC-401`), zero-width space obfuscated injection (`JG-SEC-402`), BiDi RTLO, benign academic framing (false-positive check), zero-width joiners, untrusted `tool` role spotlighting (`jg_untrusted`), Markdown/HTML polyglot, CRLF prompt smuggling, benign hypothetical explanation, and nested quote delimiters.
 
-1. **Pre-Flight Healthcheck:** Validates `127.0.0.1:4010/health` before running any probe. Refuses execution if the port is dead or occupied by an unknown PID.
-2. **Post-Probe Crash Detector:** After any probe that returns an unexpected code (0, 500+), immediately verifies `/health`. A non-responsive gateway halts the campaign with `ABORTED_TARGET_CRASHED` (Exit 1).
-3. **Hard Wall-Clock Timeouts:** Outer SIGALRM and per-round timeouts prevent silent hanging.
-4. **Anti-Stagnation Guard:** Detects if the vector generator repeats identical payloads 3 consecutive times, halting with `ABORTED_STALL` (Exit 5).
-5. **Shared Context Hashing:** Computes SHA-256 digests of initial context and transmits only lightweight delta requests per round to prevent token and memory bloat.
-6. **Explicit Error Taxonomy:** Distinct exit codes (`0` Certified, `1` Vulnerabilities/Crash, `2` Config error, `3` Target down, `4` Generator error, `5` Duplicate stall, `10` Incomplete/Baseline).
-7. **Atomic Report Persistence:** Reports are written to `.tmp` files and atomically renamed using POSIX `replace` to guarantee consistency.
+---
+
+## 4. Reproducing Locally
+
+```bash
+# 1. Build static binary
+CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o jgate ./cmd/jgate
+
+# 2. Start bilateral mock upstream on port 4020
+python3 docs/security/jaguargate-audit-pack/reproduce/mock_upstream.py 4020 &
+
+# 3. Start JaguarGate on port 4010 pointing to http://127.0.0.1:4020 (preset: balanced)
+./jgate serve -c jaguargate.yaml &
+
+# 4. Run 4-Quadrant Bilateral Verifier (outputs evidence to findings/full_campaign_report.json)
+./docs/security/jaguargate-audit-pack/reproduce/run_reproduce.sh 4010 4020
+```

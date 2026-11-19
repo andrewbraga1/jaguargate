@@ -1,11 +1,12 @@
-# 🛡️ JaguarGate Gate 5 Security Audit & Certification Pack
+# 🛡️ JaguarGate Gate 5 — Bilateral 4-Quadrant Verification Pack
 
-[![Gate 5 Certified](https://img.shields.io/badge/Gate%205-Certified%20Zero--CVE-brightgreen.svg)](#)
-[![Neutralization Rate](https://img.shields.io/badge/Neutralization-30%2F30%20(100%25)-blue.svg)](#)
-[![Zero-Nosec](https://img.shields.io/badge/GoSec%20SAST-Zero%20Nosec-success.svg)](#)
-[![Govulncheck](https://img.shields.io/badge/Govulncheck-Zero%20Vulnerabilities-success.svg)](#)
+[![Bilateral Suite](https://img.shields.io/badge/Bilateral%20Suite-30%2F30%20Verified-blue.svg)](#)
+[![GoSec SAST](https://img.shields.io/badge/GoSec%20SAST-0%20Issues%20%7C%200%20Nosec-success.svg)](#)
+[![Govulncheck](https://img.shields.io/badge/Govulncheck-0%20Reachable%20CVEs-success.svg)](#)
 
-This directory contains the complete, independent security audit report, evidence logs, evaluation methodology, and reproduction suite produced by the **Maestro Software Foundry** for **JaguarGate** (`6d2057e`).
+This directory contains the reproducible **4-Quadrant Bilateral Automated Security Verification Pack** for **JaguarGate**.
+
+> **Scope Note:** This is an automated internal verification suite with explicit upstream payload capture (Q2), client output verification (Q3), and direct-bypass positive control (Q4). It verifies the exact 30 synthetic vectors and configuration documented below and does not replace an external third-party penetration test.
 
 ---
 
@@ -13,39 +14,37 @@ This directory contains the complete, independent security audit report, evidenc
 
 ```text
 jaguargate-audit-pack/
-├── README.md                      # Overview & community guide (EN)
-├── README.pt-BR.md                # Visão geral e guia da comunidade (PT-BR)
-├── CERTIFICATE_GATE5.md           # Official signed audit certificate
-├── METHODOLOGY.md                 # Test harness architecture & 3 threat fronts
+├── README.md                      # Overview & reproduction guide (EN)
+├── README.pt-BR.md                # Visão geral e guia de reprodução (PT-BR)
+├── CERTIFICATE_GATE5.md           # Scoped automated verification report
+├── METHODOLOGY.md                 # 4-Quadrant Bilateral Invariant Protocol
 ├── findings/
-│   ├── gate5_30_rounds_matrix.md  # Line-by-line breakdown of all 30 adversarial probes
-│   └── full_campaign_report.json  # Raw structured telemetry report
-├── raw_logs/
-│   ├── gate5_campaign_console.log # Console execution trace
-│   ├── gate5_target_gateway.log   # Target gateway execution log
-│   └── redteam_campaign_report.json
+│   ├── gate5_30_rounds_matrix.md  # Breakdown of tested vectors
+│   └── full_campaign_report.json  # Reproducible upstream/client captured evidence
 └── reproduce/
-    ├── run_reproduce.sh           # One-command verification script
-    ├── reproduce_audit.py         # Autonomous Python runner
-    ├── test_vectors.json          # 30 frozen adversarial probe definitions
-    └── mock_upstream.py           # Zero-cost local LLM upstream mock
+    ├── run_reproduce.sh           # Verification runner script (4010 / 4020)
+    ├── reproduce_audit.py         # 4-Quadrant bilateral Python verifier
+    ├── test_vectors.json          # 30 bilateral test vectors (with raw wire & SSE frames)
+    └── mock_upstream.py           # Capturing upstream mock (/_mock/last_request + token echo + SSE)
 ```
 
 ---
 
-## 🚀 How to Reproduce the Audit Locally
+## 🚀 How to Reproduce Locally
 
-Anyone in the open-source community can reproduce the exact 30-round evaluation in seconds:
-
-1. **Start JaguarGate:**
+1. **Start the capturing mock upstream on port `4020`:**
    ```bash
-   jgate serve -c jaguargate.yaml
+   python3 docs/security/jaguargate-audit-pack/reproduce/mock_upstream.py 4020
    ```
 
-2. **Run the reproduction script:**
+2. **Start JaguarGate on port `4010` pointing to `http://127.0.0.1:4020`:**
    ```bash
-   cd reproduce
-   ./run_reproduce.sh 4010
+   ./jgate serve -c jaguargate.yaml
    ```
 
-The script will dispatch all 30 vectors across FRONT-1, FRONT-2, and FRONT-3, verifying that all probes are neutralized and zero canaries leak.
+3. **Run the 4-Quadrant Bilateral Verifier:**
+   ```bash
+   ./docs/security/jaguargate-audit-pack/reproduce/run_reproduce.sh 4010 4020
+   ```
+
+The verifier first runs the **Q4 Positive Control** directly against the mock upstream (confirming raw leak capture), then validates all 30 vectors across Q1 (ingress), Q2 (upstream captured body), and Q3 (client response & secret withholding), saving full evidence to `findings/full_campaign_report.json`.

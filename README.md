@@ -3,7 +3,7 @@
 > **Ultra-low latency AI, Autonomous Agent & MCP Security Gateway in Go.**  
 > *Named after Panthera onca (the Brazilian Jaguar — from Tupi "Yaguara", the predator that neutralizes threats in a single leap).*
 
-[![Go Version](https://img.shields.io/badge/Go-1.23+-00ADD8?style=flat&logo=go)](https://go.dev/)
+[![Go Version](https://img.shields.io/badge/Go-1.26+-00ADD8?style=flat&logo=go)](https://go.dev/)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![OWASP LLM Top 10](https://img.shields.io/badge/OWASP-LLM%20Top%2010%20Aligned-critical)](https://owasp.org/www-project-top-10-for-large-language-model-applications/)
 [![Language](https://img.shields.io/badge/Docs-EN%20%7C%20PT--BR-success)](README_pt-BR.md)
@@ -14,17 +14,17 @@
 
 ## ⚡ Why JaguarGate?
 
-Traditional security proxies treat AI traffic like static web pages: if a single parameter violates a rule, they return an `HTTP 403/500`, **crashing your autonomous agent's entire reasoning loop** and wasting tokens.
+**JaguarGate** is a **framework-agnostic LLM & MCP traffic policy gateway** built in pure Go (`CGO_ENABLED=0`), designed as a resilient network/sidecar boundary **complementary to application-level guardrails** (such as Pydantic AI, LangChain, CrewAI, or custom SDK hooks — *Defense-in-Depth*):
 
-**JaguarGate** is a resilient, sub-millisecond sidecar gateway built in pure Go (`CGO_ENABLED=0`) designed for **LLMs**, **Autonomous Agents** (AgentScope, LangChain, CrewAI, LiteLLM), and **MCP (Model Context Protocol)** servers:
+> **Architectural Boundary:** Business-level authorization (user RBAC, payment limits, human-in-the-loop approval) belongs inside the application executor. **JaguarGate** enforces unified network-level traffic policies across heterogeneous stacks (Python, Go, Node.js, Ruby, Java), preventing sensitive data from leaving your perimeter to external LLM providers.
 
-* 🛡️ **Graceful Degradation (Selective Pass-Through):** If an agent executes 3 tool calls in parallel and 1 is unauthorized, JaguarGate surgically prunes only the forbidden call, keeps the request alive (`HTTP 200`), and injects lightweight **Warning Flags** (`X-JaguarGate-*`).
-* 🧩 **Fully Decoupled Enterprise Rules:** Organizations can toggle built-in patterns (`CPF`, `CNPJ`, `CreditCard`, `Email`, `AWSKeys`, `APISecrets`, `JWT`) via YAML/JSON, override regexes with `pattern_overrides`, or register custom company patterns (`custom_patterns`) with zero code changes.
-* 🚀 **Tri-Transport Ingestion:** Standard **HTTP/REST** (`:4010`) for zero-code integration, **Unix Domain Sockets (UDS)** for near-zero kernel-level latency with local models (e.g., Ollama), and **gRPC/RPC** (`:4011`) with mandatory metadata Bearer token validation and HTTP/2 `Grpc-Status: 16 (UNAUTHENTICATED)` framing.
-* 🌊 **Cross-Chunk Streaming Inspection (SSE):** Reassembles fragmented tool call arguments and validates UTF-8 safe sliding window buffers across OpenAI, Anthropic, and Ollama formats without delaying Time-To-First-Token (TTFT).
-* 🔐 **Reversible PII & Secrets Vault:** Scopes masked pseudonyms strictly to the caller `sessionID` with 128-bit entropy (`<JG_PII_{LABEL}_{HEX}>`) and restores them on output without leaking data between tenants.
-* 🔏 **Extensible Zero-Trust Logging:** Redacts secrets and PII from application logs using an extensible, thread-safe linear-time engine (`slog`) with native CRLF injection neutralization (CWE-117 / GoSec G706).
-* 🔌 **MCP Guardrail & Recursive Firewall:** Inspeciona deeply nested JSON-RPC 2.0 payloads (`tools/call`, `resources/read`) with recursion depth caps (`JG-CFG-203`) and sibling field coverage to prevent prompt injection via external tools.
+* 🛡️ **Graceful Degradation & Semantic Veto Feedback:** If an agent emits 3 tool calls in parallel and 1 is unauthorized, JaguarGate surgically prunes only the forbidden call, keeps the transport alive (`HTTP 200`), and emits structured veto headers/trailers (`X-JaguarGate-Veto: tool_unauthorized`, `X-JaguarGate-Pruned-Tools`, `X-JaguarGate-Codes`).
+* 🧩 **Decoupled Enterprise & Brazilian PII Rules:** Built-in detectors for **CPF** (formatted & raw 11-digit Modulo 11), **CNPJ** (numeric & 2026 alphanumeric), **Brazilian Phone** (mobile & landline with DDD), **Credit Cards** (13–19 digits with Luhn checksum), **Email**, **AWS Keys**, **API Secrets**, **JWTs**, and **Private Key Headers**, plus `pattern_overrides` and `custom_patterns` via YAML/JSON.
+* 🚀 **Tri-Transport Ingestion:** Standard **HTTP/REST** (`:4010`) for zero-code integration, **Unix Domain Sockets (UDS)** for kernel-level local routing (e.g., Ollama), and **gRPC/RPC** (`:4011`) with Bearer validation and HTTP/2 `Grpc-Status: 16 (UNAUTHENTICATED)` framing.
+* 🌊 **Incremental Cross-Chunk Streaming Inspection (SSE / NDJSON):** Reassembles fragmented tool call arguments and inspects OpenAI, Anthropic, and Ollama streams through a **64-rune UTF-8 sliding window** (deterministic sub-100µs overhead per fragment without full-response buffering; suffix holdback activates only when an open marker, canary, or secret prefix is detected).
+* 🔐 **Reversible PII Vault with Strict Secret Withholding (`restore_secrets: false`):** Masks PII and secrets with 128-bit session-bound pseudonyms (`<JG_PII_{LABEL}_{HEX}>`) persisted with structured `isSecret` metadata across L1 memory and L2 Redis. By default, **authorized PII is restored to the owning session while vaulted secrets remain withheld even if echoed by the LLM**, complemented by **Active Output Secret DLP (`JG-SEC-503`)** for spontaneous/hallucinated credentials.
+* 🔏 **Extensible Zero-Trust Logging:** Redacts secrets and PII from application logs using a thread-safe linear engine (`slog`) with native CRLF injection sanitization (CWE-117 / GoSec G706).
+* 🔌 **MCP Guardrail & Recursive Firewall:** Inspects deeply nested JSON-RPC 2.0 payloads (`tools/call`, `resources/read`) with recursion depth caps (`JG-CFG-203`), batch 403 safe error bodies, and sibling field coverage.
 * 🔄 **SHA-256 Canonical Circuit Breaker:** Detects and halts infinite agent loops in $O(1)$ time by fingerprinting canonical tool signatures (`tool_name + sorted_json_args`).
 
 ---
@@ -293,47 +293,50 @@ JaguarGate outputs all CLI tables and logs in **English (`en`)** by default for 
 
 ---
 
-## 📊 OWASP LLM & Agentic Top 10 Coverage
+## 📊 OWASP LLM & Agentic Top 10 Defense-in-Depth Coverage
 
-| OWASP Threat | JaguarGate Defense Mechanism | Resilient Behavior (`sanitize_and_warn`) |
+| OWASP Threat | JaguarGate Mitigation Mechanism | Resilient Behavior (`sanitize_and_warn`) |
 | :--- | :--- | :--- |
-| **LLM01: Prompt Injection** | RE2 Linear Engine + Custom Signatures + Cryptographic Spotlighting | Neutralizes injection payload; forwards sanitized context + `JG-SEC-401` |
-| **LLM02: Sensitive Info Disclosure** | Reversible PII & Secrets Vault (Session-Isolated + Custom Regex) | Replaces entity with `<JG_PII_{LABEL}_{HEX}>` + `JG-PII-301`/`JG-PII-302` |
-| **LLM05: Improper Output Handling** | Markdown tracker blocker & executable script sanitizer | Strips malicious links in real-time SSE stream + `JG-SEC-502` |
-| **LLM06: Excessive Agency** | Selective Tool Call & MCP JSON-RPC 2.0 Firewall | Prunes unwhitelisted tool calls without breaking `HTTP 200` + `JG-CFG-101` |
-| **LLM07: System Prompt Leakage** | Invisible Canary Token injection & sliding-window detector | Immediately cuts off leaked SSE transmission + `JG-SEC-501` |
+| **LLM01: Prompt Injection** | RE2 Linear Engine + Custom Signatures + Cryptographic Spotlighting | Mitigates known signatures & marks untrusted tool content + `JG-SEC-401` |
+| **LLM02: Sensitive Info Disclosure** | Reversible PII Vault (Mod-11 CPF, 2026 CNPJ, BR Phone, Luhn Card) + `restore_secrets: false` + Active Output Secret DLP | Masks outbound PII/secrets (`JG-PII-301`/`302`); withholds echoed secrets; redacts spontaneous model credentials (`JG-SEC-503`) |
+| **LLM05: Improper Output Handling** | Markdown tracker blocker & executable script sanitizer | Strips malicious links & scripts across SSE chunks + `JG-SEC-502` |
+| **LLM06: Excessive Agency** | Selective Tool Call & MCP JSON-RPC 2.0 Firewall | Prunes unwhitelisted tool calls + emits `X-JaguarGate-Veto: tool_unauthorized` & `X-JaguarGate-Pruned-Tools` + `JG-CFG-101` |
+| **LLM07: System Prompt Leakage** | Invisible Canary Token injection & 64-rune sliding-window detector | Immediately halts SSE transmission upon canary detection + `JG-SEC-501` |
 | **LLM10: Unbounded Consumption** | Canonical SHA-256 Agent Loop Breaker & session token budgets | Halts repetitive identical tool calls gracefully + `JG-CFG-201` |
 
 ---
 
-## 🧪 Security Verification & Red-Teaming Battery
+## 🧪 Security Verification & Bilateral 4-Quadrant Audit Suite
 
-Every release passes static and dynamic verification with zero CVEs and race detector validation:
+Every release is verified against static analysis (`go vet`, `gosec` with **0 issues / 0 nosec**, `govulncheck`), race-detector unit/E2E suites (`go test -race ./...`), the built-in red-teaming suite (`jgate pounce`), and the reproducible **4-Quadrant Bilateral Gate 5 Audit Pack** (`docs/security/jaguargate-audit-pack/`), which captures and asserts both upstream-received payloads (Q2) and client responses (Q3) with a mandatory direct-bypass positive control (Q4):
 
 ```bash
-# Run unit and race tests
-go test -race ./...
+# Run unit, E2E and race detector tests
+go test -race -count=1 ./...
 
-# Run simulated OWASP attack battery
-jgate pounce
+# Run built-in OWASP & MCP verification suite
+./jgate pounce
+
+# Run 4-Quadrant Bilateral Audit Verifier (with mock_upstream on :4020 and jgate on :4010)
+./docs/security/jaguargate-audit-pack/reproduce/run_reproduce.sh 4010 4020
 ```
 
 ```
 ===========================================================================================================
   JAGUARGATE RED-TEAMING SUITE (jgate pounce) — SECURITY AUDIT REPORT
 ===========================================================================================================
-ID      | CATEGORY     | SIMULATED ATTACK SCENARIO                       | TRIGGERED FLAGS       | LAT.   | STATUS
+ID      | CATEGORY     | SIMULATED ATTACK SCENARIO                                      | TRIGGERED FLAGS       | STATUS
 -----------------------------------------------------------------------------------------------------------
-VEC-01  | OWASP-LLM01  | Direct Prompt Injection Neutralization          | JG-SEC-401            |  136µs | PASS  
-VEC-02  | OWASP-OBFUSC | Invisible Unicode + Base64 Smuggling Defense    | JG-SEC-402,JG-SEC-401 |  255µs | PASS  
-VEC-03  | MULTIMODAL   | Binary JPEG EXIF Hidden Payload Stripping       | JG-SEC-403            |    2µs | PASS  
-VEC-04  | OWASP-LLM02  | Reversible PII Vault (CPF + Alphanumeric CNPJ + Secret) | JG-PII-301,JG-PII-302 |  109µs | PASS  
-VEC-05  | OWASP-LLM06  | Selective Unauthorized Tool Call Pruning        | JG-CFG-101            |   42µs | PASS  
-VEC-06  | AGENT-LOOP   | O(1) SHA-256 Canonical Agent Loop Circuit Breaker | JG-CFG-201            |   17µs | PASS  
-VEC-07  | MCP-GUARD    | MCP JSON-RPC 2.0 Untrusted Server & Tool Firewall | JG-CFG-102,JG-CFG-101 |   22µs | PASS  
-VEC-08  | SSE-STREAM   | Real-Time SSE Canary Leak Stream Truncation     | JG-SEC-501            |   76µs | PASS  
+VEC-01  | OWASP-LLM01  | Direct Prompt Injection Neutralization                         | JG-SEC-401            | PASS  
+VEC-02  | OWASP-OBFUSC | Invisible Unicode + Base64 Smuggling Defense                   | JG-SEC-402,JG-SEC-401 | PASS  
+VEC-03  | MULTIMODAL   | Binary JPEG EXIF Hidden Payload Stripping                      | JG-SEC-403            | PASS  
+VEC-04  | OWASP-LLM02  | Reversible PII Vault (CPF + Alphanumeric CNPJ + Secret Withheld)| JG-PII-301,JG-PII-302 | PASS  
+VEC-05  | OWASP-LLM06  | Selective Unauthorized Tool Call Pruning                       | JG-CFG-101            | PASS  
+VEC-06  | AGENT-LOOP   | O(1) SHA-256 Canonical Agent Loop Circuit Breaker              | JG-CFG-201            | PASS  
+VEC-07  | MCP-GUARD    | MCP JSON-RPC 2.0 Untrusted Server & Tool Firewall              | JG-CFG-102,JG-CFG-101 | PASS  
+VEC-08  | SSE-STREAM   | Real-Time SSE Canary Leak Stream Truncation                    | JG-SEC-501            | PASS  
 -----------------------------------------------------------------------------------------------------------
-  VERDICT: PASSED (8/8 Attack Vectors Neutralized) | Total Suite Duration: 692µs
+  VERDICT: PASSED (8/8 Vectors Verified) | Scoped to Built-in Automated Suite
 ===========================================================================================================
 ```
 

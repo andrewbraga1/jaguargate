@@ -38,9 +38,10 @@ type InspectionResult struct {
 	Severity     string   // "NONE" | "CONFIG_WARNING" | "INTRUSION_ALERT"
 	Codes        []string // Compact JG-* codes
 	CanaryToken  string   // Per-request Canary Token injected into system prompt
-	MaskedCount  int      // Number of PII/Secret entities masked
-	PrunedTools  int      // Number of unwhitelisted tool definitions/calls surgically omitted
-	Blocked      bool     // True ONLY when mode == "hard_block" and an intrusion/breaker occurs
+	MaskedCount     int      // Number of PII/Secret entities masked
+	PrunedTools     int      // Number of unwhitelisted tool definitions/calls surgically omitted
+	PrunedToolNames []string // Names of pruned unauthorized tools for semantic feedback headers
+	Blocked         bool     // True ONLY when mode == "hard_block" and an intrusion/breaker occurs
 }
 
 // Engine executes OWASP Input/Output Defense, Multimodal Hygiene, Spotlighting, Tool Firewall, and PII Vaulting.
@@ -102,8 +103,14 @@ func (e *Engine) InspectJSONPayloadWithSession(body []byte, sessionID string, cf
 	// 1. Selective Tool Whitelist on top-level "tools" definition array if present
 	if rawTools, ok := payload["tools"].([]any); ok {
 		if cfg.Whitelist.EnforceToolWhitelist {
-			keptTools, toolCodes, pruned := SanitizeToolCallsSlice(rawTools, cfg.Whitelist, isShadow)
+			keptTools, toolCodes, prunedNames := SanitizeToolCallsSliceDetailed(rawTools, cfg.Whitelist, isShadow)
+			pruned := len(prunedNames)
 			res.PrunedTools += pruned
+			for _, name := range prunedNames {
+				if !slices.Contains(res.PrunedToolNames, name) {
+					res.PrunedToolNames = append(res.PrunedToolNames, name)
+				}
+			}
 			for _, c := range toolCodes {
 				res.addCode(c, false)
 			}
@@ -134,8 +141,14 @@ func (e *Engine) InspectJSONPayloadWithSession(body []byte, sessionID string, cf
 			// Selective Tool Call pruning and PII masking inside message history if present (OpenAI format)
 			if msgTools, ok := msgMap["tool_calls"].([]any); ok {
 				if cfg.Whitelist.EnforceToolWhitelist {
-					keptMsgTools, toolCodes, pruned := SanitizeToolCallsSlice(msgTools, cfg.Whitelist, isShadow)
+					keptMsgTools, toolCodes, prunedNames := SanitizeToolCallsSliceDetailed(msgTools, cfg.Whitelist, isShadow)
+					pruned := len(prunedNames)
 					res.PrunedTools += pruned
+					for _, name := range prunedNames {
+						if !slices.Contains(res.PrunedToolNames, name) {
+							res.PrunedToolNames = append(res.PrunedToolNames, name)
+						}
+					}
 					for _, c := range toolCodes {
 						res.addCode(c, false)
 					}

@@ -664,6 +664,49 @@ func TestOllamaNDJSONChatVsGenerateFormatDistinction(t *testing.T) {
 	}
 }
 
+func TestSSEActiveSecretDLPAndVetoTrailers(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.ApplyPreset()
+	cfg.Whitelist.EnforceToolWhitelist = true
+	cfg.Whitelist.AllowedTools = []string{"get_weather"}
+	vault := guards.NewPIIVault()
+
+	// Stream emits both a spontaneous AWS key split across chunks AND an unauthorized tool call
+	ssePayload := "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Chave vazada: AKIAIOSF\"}}]}\n\n" +
+		"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ODNN7EXAMPLE fim.\"}}]}\n\n" +
+		"data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_bad\",\"function\":{\"name\":\"exec_shell\",\"arguments\":\"{}\"}}]}}]}\n\n" +
+		"data: [DONE]\n\n"
+
+	trailers := make(http.Header)
+	insp := NewSSEInspector(
+		io.NopCloser(strings.NewReader(ssePayload)),
+		&cfg,
+		vault,
+		guards.InspectionResult{Status: "CLEAN", SessionID: "sess-sse-dlp"},
+		trailers,
+	)
+	outBytes, err := io.ReadAll(insp)
+	if err != nil {
+		t.Fatalf("SSE read failed: %v", err)
+	}
+	outStr := string(outBytes)
+	if strings.Contains(outStr, "AKIAIOSFODNN7EXAMPLE") {
+		t.Fatalf("SECURITY FAILURE: spontaneous AWS key leaked across SSE chunks: %s", outStr)
+	}
+	if !strings.Contains(outStr, "JG-SEC-503") {
+		t.Errorf("expected JG-SEC-503 redaction marker in SSE stream, got: %s", outStr)
+	}
+	if !strings.Contains(trailers.Get("X-JaguarGate-Codes"), "JG-SEC-503") {
+		t.Errorf("expected JG-SEC-503 in X-JaguarGate-Codes trailer, got %q", trailers.Get("X-JaguarGate-Codes"))
+	}
+	if trailers.Get("X-JaguarGate-Veto") != "tool_unauthorized" {
+		t.Errorf("expected X-JaguarGate-Veto='tool_unauthorized' trailer, got %q", trailers.Get("X-JaguarGate-Veto"))
+	}
+	if trailers.Get("X-JaguarGate-Pruned-Tools") != "exec_shell" {
+		t.Errorf("expected X-JaguarGate-Pruned-Tools='exec_shell' trailer, got %q", trailers.Get("X-JaguarGate-Pruned-Tools"))
+	}
+}
+
 func BenchmarkSSERuneSlidingWindow(b *testing.B) {
 	cfg := config.DefaultConfig()
 	cfg.ApplyPreset()
