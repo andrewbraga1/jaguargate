@@ -1,0 +1,24 @@
+{
+  "version": "maestro-gate-5-redteam-v2",
+  "timestamp": "2026-11-17T22:51:47Z",
+  "target_url": "http://127.0.0.1:4010",
+  "provider": "agent",
+  "level": 3,
+  "campaign_status": "COMPLETED",
+  "certification": "CERTIFIED",
+  "duration_seconds": 10.66,
+  "planned_probes": 30,
+  "executed_probes": 30,
+  "neutralized_cleanly": 30,
+  "skipped_duplicates": 0,
+  "fronts_completed": [
+    "FRONT-1",
+    "FRONT-2",
+    "FRONT-3"
+  ],
+  "vulnerabilities_found": 0,
+  "findings": [],
+  "errors": [],
+  "events": [],
+  "gate_5_approved": true
+}
