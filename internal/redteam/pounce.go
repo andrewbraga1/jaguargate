@@ -104,19 +104,25 @@ func RunPounceSuite(lang string) SuiteReport {
 		Passed:       r3.MetadataStripped && r3.ViolationCode == "JG-SEC-403",
 	})
 
-	// Vector 4: OWASP LLM02 — Reversible PII Vault (CPF + 2026 Alphanumeric CNPJ + API Key)
+	// Vector 4: OWASP LLM02 — Reversible PII Vault (CPF + 2026 Alphanumeric CNPJ restored; API Secret withheld)
 	t0 = time.Now()
 	rawPII := "CPF 123.456.789-01, CNPJ 12.ABC.345/01DE-35, Key sk-proj-1234567890abcdefghij"
 	maskedPII, r4Codes, count := vault.MaskText(rawPII, cfg.Guards.PIIVault, false)
 	restoredPII := vault.RestoreText(maskedPII)
+	r4Passed := count == 3 &&
+		strings.Contains(restoredPII, "123.456.789-01") &&
+		strings.Contains(restoredPII, "12.ABC.345/01DE-35") &&
+		!strings.Contains(restoredPII, "sk-proj-1234567890abcdefghij") &&
+		slices.Contains(r4Codes, "JG-PII-301") &&
+		slices.Contains(r4Codes, "JG-PII-302")
 	results = append(results, VectorResult{
 		ID:           "VEC-04",
 		Category:     "OWASP-LLM02",
-		Scenario:     pickLang(isPT, "Cofre Reversível PII (CPF + CNPJ Alfanumérico + Secret)", "Reversible PII Vault (CPF + Alphanumeric CNPJ + Secret)"),
+		Scenario:     pickLang(isPT, "Cofre Reversível PII (CPF + CNPJ Alfanumérico + Secret Retido)", "Reversible PII Vault (CPF + Alphanumeric CNPJ + Secret Withheld)"),
 		ExpectedCode: "JG-PII-301",
 		ActualCodes:  r4Codes,
 		LatencyUs:    max(1, time.Since(t0).Microseconds()),
-		Passed:       count == 3 && restoredPII == rawPII && slices.Contains(r4Codes, "JG-PII-301") && slices.Contains(r4Codes, "JG-PII-302"),
+		Passed:       r4Passed,
 	})
 
 	// Vector 5: OWASP LLM06 — Selective Tool Call Firewall Pruning

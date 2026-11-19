@@ -133,6 +133,7 @@ type MultimodalConfig struct {
 type PIIVaultConfig struct {
 	Enabled          bool                  `yaml:"enabled" json:"enabled"`
 	RestoreOnOutput  bool                  `yaml:"restore_on_output" json:"restore_on_output"`
+	RestoreSecrets   bool                  `yaml:"restore_secrets" json:"restore_secrets"`
 	TTLSeconds       int                   `yaml:"ttl_seconds" json:"ttl_seconds"`
 	Entities         PIIEntitiesConfig     `yaml:"entities" json:"entities"`
 	CustomPatterns   []CustomPatternConfig `yaml:"custom_patterns" json:"custom_patterns"`
@@ -157,6 +158,7 @@ type PIIPatternOverrides struct {
 	CPF        string `yaml:"cpf,omitempty" json:"cpf,omitempty"`
 	CNPJ       string `yaml:"cnpj,omitempty" json:"cnpj,omitempty"`
 	CreditCard string `yaml:"credit_card,omitempty" json:"credit_card,omitempty"`
+	Phone      string `yaml:"phone,omitempty" json:"phone,omitempty"`
 	Email      string `yaml:"email,omitempty" json:"email,omitempty"`
 	AWSKeys    string `yaml:"aws_keys,omitempty" json:"aws_keys,omitempty"`
 	APISecrets string `yaml:"api_secrets,omitempty" json:"api_secrets,omitempty"`
@@ -167,6 +169,7 @@ type PIIEntitiesConfig struct {
 	CPF        bool `yaml:"cpf" json:"cpf"`
 	CNPJ       bool `yaml:"cnpj" json:"cnpj"`
 	CreditCard bool `yaml:"credit_card" json:"credit_card"`
+	Phone      bool `yaml:"phone" json:"phone"`
 	Email      bool `yaml:"email" json:"email"`
 	AWSKeys    bool `yaml:"aws_keys" json:"aws_keys"`
 	APISecrets bool `yaml:"api_secrets" json:"api_secrets"`
@@ -325,11 +328,13 @@ func DefaultConfig() Config {
 			PIIVault: PIIVaultConfig{
 				Enabled:         true,
 				RestoreOnOutput: true,
+				RestoreSecrets:  false,
 				TTLSeconds:      300,
 				Entities: PIIEntitiesConfig{
 					CPF:        true,
 					CNPJ:       true,
 					CreditCard: true,
+					Phone:      true,
 					Email:      false,
 					AWSKeys:    true,
 					APISecrets: true,

@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/andrewbraga1/jaguargate/internal/config"
 )
@@ -55,10 +57,18 @@ func TestReversiblePIIVaultMaskAndRestore(t *testing.T) {
 		t.Errorf("expected both JG-PII-301 and JG-PII-302, got %v", codes)
 	}
 
-	// Restore back on output
+	// Restore back on output (default policy: PII restored, secrets withheld)
 	restored := vault.RestoreText("Comprovante gerado para " + masked)
 	if !strings.Contains(restored, "123.456.789-01") {
 		t.Errorf("failed to restore original CPF from vault, got: %s", restored)
+	}
+	if strings.Contains(restored, "sk-proj-9876543210abcdefghijkl") {
+		t.Errorf("SECURITY FAILURE: secret was restored despite default restore_secrets=false: %s", restored)
+	}
+	// Explicit opt-in restore_secrets=true restores both
+	restoredWithSecrets := vault.RestoreTextWithOptions("default_session", "Comprovante gerado para "+masked, true)
+	if !strings.Contains(restoredWithSecrets, "sk-proj-9876543210abcdefghijkl") {
+		t.Errorf("expected secret to be restored when restoreSecrets=true, got: %s", restoredWithSecrets)
 	}
 }
 
@@ -139,8 +149,38 @@ func TestPIIVaultTableDrivenAllEntitiesAndCNPJFormats(t *testing.T) {
 
 		// 2. Financial & Contact PII
 		{
-			name:         "CreditCard_16Digits_Spaced",
-			rawSecret:    "4532 1111 2222 3333",
+			name:         "CPF_Raw_Unformatted_ValidMod11",
+			rawSecret:    "52998224725",
+			expectedCode: "JG-PII-301",
+			shouldMask:   true,
+		},
+		{
+			name:         "CreditCard_16Digits_Spaced_ValidLuhn",
+			rawSecret:    "4532 1111 2222 3336",
+			expectedCode: "JG-PII-301",
+			shouldMask:   true,
+		},
+		{
+			name:         "CreditCard_15Digits_Amex_ValidLuhn",
+			rawSecret:    "378282246310005",
+			expectedCode: "JG-PII-301",
+			shouldMask:   true,
+		},
+		{
+			name:         "Phone_BR_Mobile_Formatted",
+			rawSecret:    "(11) 98765-4321",
+			expectedCode: "JG-PII-301",
+			shouldMask:   true,
+		},
+		{
+			name:         "Phone_BR_Mobile_Unformatted",
+			rawSecret:    "11987654321",
+			expectedCode: "JG-PII-301",
+			shouldMask:   true,
+		},
+		{
+			name:         "Phone_BR_Landline_Formatted",
+			rawSecret:    "+55 (21) 3456-7890",
 			expectedCode: "JG-PII-301",
 			shouldMask:   true,
 		},
@@ -183,10 +223,22 @@ func TestPIIVaultTableDrivenAllEntitiesAndCNPJFormats(t *testing.T) {
 			shouldMask:   true,
 		},
 
-		// 4. False-Positive Guard (14-char SKU/Identifier without CNPJ punctuation MUST NOT be masked)
+		// 4. False-Positive Guards (SKUs, invalid Luhn 16-digit serial, invalid Mod 11 11-digit number)
 		{
 			name:         "FalsePositive_ProductSKU_14Chars",
 			rawSecret:    "PRODUTOTESTE01",
+			expectedCode: "",
+			shouldMask:   false,
+		},
+		{
+			name:         "FalsePositive_16DigitSerial_InvalidLuhn",
+			rawSecret:    "4532 1111 2222 3333",
+			expectedCode: "",
+			shouldMask:   false,
+		},
+		{
+			name:         "FalsePositive_11DigitOrderID_InvalidMod11_NonPhone",
+			rawSecret:    "11122233344",
 			expectedCode: "",
 			shouldMask:   false,
 		},
@@ -207,10 +259,20 @@ func TestPIIVaultTableDrivenAllEntitiesAndCNPJFormats(t *testing.T) {
 				if !slices.Contains(codes, tc.expectedCode) {
 					t.Errorf("[%s] expected flag code %q, got %v", tc.name, tc.expectedCode, codes)
 				}
-				// Verify reversible restoration from vault
+				// Verify reversible restoration policy: PII restored by default, Secrets withheld by default
 				restored := vault.RestoreText(masked)
-				if restored != prompt {
-					t.Errorf("[%s] vault restoration mismatch: got %q, want %q", tc.name, restored, prompt)
+				if tc.expectedCode == "JG-PII-302" {
+					if strings.Contains(restored, tc.rawSecret) {
+						t.Errorf("[%s] SECURITY FAILURE: secret %q was restored under default restore_secrets=false", tc.name, tc.rawSecret)
+					}
+					restoredOptIn := vault.RestoreTextWithOptions("default_session", masked, true)
+					if restoredOptIn != prompt {
+						t.Errorf("[%s] opt-in secret restoration mismatch: got %q, want %q", tc.name, restoredOptIn, prompt)
+					}
+				} else {
+					if restored != prompt {
+						t.Errorf("[%s] vault restoration mismatch: got %q, want %q", tc.name, restored, prompt)
+					}
 				}
 			} else {
 				if count != 0 || masked != prompt {
@@ -345,16 +407,20 @@ func TestPIIVaultCustomPatternsAndOverrides(t *testing.T) {
 		t.Errorf("expected both PII and Secret warning codes, got %v", codes)
 	}
 
-	// 3. Test reversible restoration
+	// 3. Test reversible restoration (PII restored by default, custom secret withheld unless restoreSecrets=true)
 	restored := vault.RestoreTextWithSession("sess-corp", "Restaurando: "+masked)
 	if !strings.Contains(restored, "BADGE-ALPHA123") {
 		t.Errorf("failed to restore custom badge: %s", restored)
 	}
-	if !strings.Contains(restored, "corp_sec_0123456789abcdef0123456789abcdef") {
-		t.Errorf("failed to restore custom secret token: %s", restored)
+	if strings.Contains(restored, "corp_sec_0123456789abcdef0123456789abcdef") {
+		t.Errorf("SECURITY FAILURE: custom secret token was restored under default restore_secrets=false: %s", restored)
 	}
 	if !strings.Contains(restored, "12345678901") {
 		t.Errorf("failed to restore overridden CPF: %s", restored)
+	}
+	restoredOptIn := vault.RestoreTextWithOptions("sess-corp", "Restaurando: "+masked, true)
+	if !strings.Contains(restoredOptIn, "corp_sec_0123456789abcdef0123456789abcdef") {
+		t.Errorf("failed to restore custom secret token when restoreSecrets=true: %s", restoredOptIn)
 	}
 }
 
@@ -622,6 +688,66 @@ func TestOllamaNativeGenerateResponseField(t *testing.T) {
 	outClean := engine.SanitizeOutputJSON(ollamaCleanResp, inboundClean, &cfg)
 	if !strings.Contains(string(outClean.ModifiedBody), "123.456.789-01") {
 		t.Errorf("expected PII token to be restored to clean CPF in Ollama response field, got:\n%s", string(outClean.ModifiedBody))
+	}
+}
+
+type mockExternalKV struct {
+	mu   sync.Mutex
+	data map[string]string
+}
+
+func (m *mockExternalKV) Set(key, value string, _ time.Duration) (string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.data == nil {
+		m.data = make(map[string]string)
+	}
+	m.data[key] = value
+	return "", nil
+}
+
+func (m *mockExternalKV) Get(key string) (string, string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.data[key], "", nil
+}
+
+func TestPIIVaultExternalStorePreservesSecretClassificationAfterRestart(t *testing.T) {
+	sharedL2 := &mockExternalKV{data: make(map[string]string)}
+	cfg := config.DefaultConfig().Guards.PIIVault
+
+	// Instance A masks both PII (CPF) and Secret (AWS Key) and replicates to L2
+	vaultA := NewPIIVault()
+	vaultA.SetExternalStore(sharedL2)
+	raw := "Cliente CPF 52998224725 com chave AKIAIOSFODNN7EXAMPLE"
+	masked, _, count := vaultA.MaskTextWithSession("sess-l2", raw, cfg, false)
+	if count != 2 {
+		t.Fatalf("expected 2 entities masked, got %d (%s)", count, masked)
+	}
+
+	// Instance B starts cold (empty L1 memory, simulating restart/failover) connected to the same L2
+	vaultB := NewPIIVault()
+	vaultB.SetExternalStore(sharedL2)
+
+	// Default restore (restoreSecrets=false): CPF must be restored, AWS Key MUST remain masked
+	restoredDefault := vaultB.RestoreTextWithSession("sess-l2", masked)
+	if !strings.Contains(restoredDefault, "52998224725") {
+		t.Fatalf("expected CPF to be restored from L2 after restart, got: %s", restoredDefault)
+	}
+	if strings.Contains(restoredDefault, "AKIAIOSFODNN7EXAMPLE") {
+		t.Fatalf("CRITICAL SECURITY FAILURE: L2 lost isSecret metadata and restored AWS key after restart: %s", restoredDefault)
+	}
+
+	// Cross-session isolation from L2
+	restoredOther := vaultB.RestoreTextWithSession("sess-other", masked)
+	if strings.Contains(restoredOther, "52998224725") || strings.Contains(restoredOther, "AKIAIOSFODNN7EXAMPLE") {
+		t.Fatalf("CRITICAL SECURITY FAILURE: L2 cross-session leak: %s", restoredOther)
+	}
+
+	// Explicit opt-in restoreSecrets=true from L2
+	restoredOptIn := vaultB.RestoreTextWithOptions("sess-l2", masked, true)
+	if !strings.Contains(restoredOptIn, "AKIAIOSFODNN7EXAMPLE") {
+		t.Fatalf("expected AWS key to be restored from L2 when restoreSecrets=true, got: %s", restoredOptIn)
 	}
 }
 

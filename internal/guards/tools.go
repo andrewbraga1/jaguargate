@@ -163,9 +163,9 @@ func SanitizeOutputTextWithSession(sessionID, text, canaryToken string, cfg *con
 		}
 	}
 
-	// 4. Reversible PII Vault Restoration (scoped strictly to sessionID)
+	// 4. Reversible PII Vault Restoration (scoped strictly to sessionID; secrets withheld unless restore_secrets=true)
 	if vault != nil && cfg.Guards.PIIVault.Enabled && cfg.Guards.PIIVault.RestoreOnOutput && !isShadow {
-		working = vault.RestoreTextWithSession(sessionID, working)
+		working = vault.RestoreTextWithOptions(sessionID, working, cfg.Guards.PIIVault.RestoreSecrets)
 	}
 
 	return working, codes, false
