@@ -781,6 +781,75 @@ func TestOutputActiveSecretDLPForSpontaneousModelLeaks(t *testing.T) {
 	}
 }
 
+func TestMessageNestedMetadataAndBatchArrayPIIMasking(t *testing.T) {
+	vault := NewPIIVault()
+	engine := NewEngine(vault)
+	cfg := config.DefaultConfig()
+	cfg.ApplyPreset()
+
+	// Regression test for JG-R1: deeply nested PII inside messages[].metadata.l1.l2.l3.l4
+	nestedPayload := []byte(`{
+		"model": "llama3",
+		"messages": [
+			{
+				"role": "user",
+				"content": "nest",
+				"metadata": {
+					"l1": {
+						"l2": {
+							"l3": {
+								"l4": "CPF 123.456.789-09"
+							}
+						}
+					}
+				}
+			}
+		]
+	}`)
+
+	res := engine.InspectJSONPayloadWithSession(nestedPayload, "sess-nested-meta", &cfg)
+	modStr := string(res.ModifiedBody)
+	if strings.Contains(modStr, "123.456.789-09") {
+		t.Fatalf("SECURITY FAILURE (JG-R1): CPF inside messages[].metadata survived unmasked:\n%s", modStr)
+	}
+	if !strings.Contains(modStr, "<JG_PII_CPF_") {
+		t.Fatalf("expected <JG_PII_CPF_ token in messages[].metadata, got:\n%s", modStr)
+	}
+	if !slices.Contains(res.Codes, "JG-PII-301") {
+		t.Errorf("expected JG-PII-301 code, got %v", res.Codes)
+	}
+
+	// Regression test for batch array smuggling containing nested metadata PII and unauthorized tool
+	cfg.Whitelist.EnforceToolWhitelist = true
+	cfg.Whitelist.AllowedTools = []string{"safe_tool"}
+	batchPayload := []byte(`[{
+		"model": "llama3",
+		"tools": [
+			{"type": "function", "function": {"name": "drop_database"}},
+			{"type": "function", "function": {"name": "safe_tool"}}
+		],
+		"messages": [
+			{
+				"role": "user",
+				"content": "batch_probe",
+				"metadata": {"deep": "CPF 52998224725"}
+			}
+		]
+	}]`)
+
+	batchRes := engine.InspectJSONPayloadWithSession(batchPayload, "sess-batch-meta", &cfg)
+	batchStr := string(batchRes.ModifiedBody)
+	if strings.Contains(batchStr, "52998224725") {
+		t.Fatalf("SECURITY FAILURE: CPF inside batch array metadata survived unmasked:\n%s", batchStr)
+	}
+	if strings.Contains(batchStr, "drop_database") {
+		t.Fatalf("SECURITY FAILURE: unauthorized tool inside batch array survived unpruned:\n%s", batchStr)
+	}
+	if !strings.Contains(batchStr, "<JG_PII_CPF_") || batchRes.PrunedTools != 1 {
+		t.Errorf("expected masked CPF and 1 pruned tool in batch array, got pruned=%d body=%s", batchRes.PrunedTools, batchStr)
+	}
+}
+
 func BenchmarkOWASPInputEngine(b *testing.B) {
 	engine := NewEngine(NewPIIVault())
 	cfg := config.DefaultConfig()

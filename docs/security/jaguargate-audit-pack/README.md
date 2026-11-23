@@ -1,12 +1,12 @@
 # 🛡️ JaguarGate Gate 5 — Bilateral 4-Quadrant Verification Pack
 
-[![Bilateral Suite](https://img.shields.io/badge/Bilateral%20Suite-30%2F30%20Verified-blue.svg)](#)
+[![Bilateral Suite](https://img.shields.io/badge/Bilateral%20Suite-34%2F34%20Verified-blue.svg)](#)
 [![GoSec SAST](https://img.shields.io/badge/GoSec%20SAST-0%20Issues%20%7C%200%20Nosec-success.svg)](#)
 [![Govulncheck](https://img.shields.io/badge/Govulncheck-0%20Reachable%20CVEs-success.svg)](#)
 
-This directory contains the reproducible **4-Quadrant Bilateral Automated Security Verification Pack** for **JaguarGate**.
+This directory contains the reproducible **4-Stage Bilateral Automated Security Verification Pack** for **JaguarGate**.
 
-> **Scope Note:** This is an automated internal verification suite with explicit upstream payload capture (Q2), client output verification (Q3), and direct-bypass positive control (Q4). It verifies the exact 30 synthetic vectors and configuration documented below and does not replace an external third-party penetration test.
+> **Scope Note:** This is an automated internal verification suite recording and asserting all 4 stages on every vector: Ingress (Stage 1), Gateway Decision/Codes (Stage 2), Upstream Captured Payload or `upstream_reached: false` pre-block proof (Stage 3), and Upstream Egress / Mid-Token SSE Fragments vs. Client Delivery (Stage 4), plus a direct-bypass positive control (Q4). It verifies the exact 34 synthetic vectors and configuration documented below and does not replace an external third-party penetration test.
 
 ---
 
@@ -24,8 +24,8 @@ jaguargate-audit-pack/
 └── reproduce/
     ├── run_reproduce.sh           # Verification runner script (4010 / 4020)
     ├── reproduce_audit.py         # 4-Quadrant bilateral Python verifier
-    ├── test_vectors.json          # 30 bilateral test vectors (with raw wire & SSE frames)
-    └── mock_upstream.py           # Capturing upstream mock (/_mock/last_request + token echo + SSE)
+    ├── test_vectors.json          # 34 4-stage bilateral test vectors (raw JSON, nested metadata & mid-token SSE)
+    └── mock_upstream.py           # Capturing upstream mock (/_mock/last_request + mid-token SSE fragmentation)
 ```
 
 ---
@@ -42,9 +42,9 @@ jaguargate-audit-pack/
    ./jgate serve -c jaguargate.yaml
    ```
 
-3. **Run the 4-Quadrant Bilateral Verifier:**
+3. **Run the 4-Stage Bilateral Verifier:**
    ```bash
    ./docs/security/jaguargate-audit-pack/reproduce/run_reproduce.sh 4010 4020
    ```
 
-The verifier first runs the **Q4 Positive Control** directly against the mock upstream (confirming raw leak capture), then validates all 30 vectors across Q1 (ingress), Q2 (upstream captured body), and Q3 (client response & secret withholding), saving full evidence to `findings/full_campaign_report.json`.
+The verifier first runs the **Q4 Positive Control** directly against the mock upstream (confirming raw leak capture), then validates and logs all 34 vectors across Stage 1 (ingress), Stage 2 (gateway decision/codes), Stage 3 (upstream captured body or `upstream_reached: false` pre-block), and Stage 4 (upstream SSE fragments vs. reconstructed client delivery), saving full evidence to `findings/full_campaign_report.json`.

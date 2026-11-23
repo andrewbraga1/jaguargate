@@ -85,6 +85,65 @@ func (e *Engine) InspectJSONPayloadWithSession(body []byte, sessionID string, cf
 
 	var payload map[string]any
 	if err := json.Unmarshal(body, &payload); err != nil {
+		// Support top-level JSON batch arrays structurally (prevents batch_array_smuggling bypasses)
+		var batchArr []any
+		if arrErr := json.Unmarshal(body, &batchArr); arrErr == nil {
+			modifiedBatch := false
+			isShadow := cfg.Core.Mode == "shadow"
+			for i, elem := range batchArr {
+				switch v := elem.(type) {
+				case map[string]any:
+					elemBytes, mErr := marshalJSONUnescaped(v)
+					if mErr != nil {
+						continue
+					}
+					subRes := e.InspectJSONPayloadWithSession(elemBytes, sessionID, cfg)
+					res.MaskedCount += subRes.MaskedCount
+					res.PrunedTools += subRes.PrunedTools
+					for _, pn := range subRes.PrunedToolNames {
+						if !slices.Contains(res.PrunedToolNames, pn) {
+							res.PrunedToolNames = append(res.PrunedToolNames, pn)
+						}
+					}
+					if res.CanaryToken == "" && subRes.CanaryToken != "" {
+						res.CanaryToken = subRes.CanaryToken
+					}
+					for _, c := range subRes.Codes {
+						res.addCode(c, subRes.Severity == "INTRUSION_ALERT")
+					}
+					if !isShadow && !bytes.Equal(subRes.ModifiedBody, elemBytes) {
+						var updatedElem map[string]any
+						if uErr := json.Unmarshal(subRes.ModifiedBody, &updatedElem); uErr == nil {
+							batchArr[i] = updatedElem
+							modifiedBatch = true
+						}
+					}
+				case []any:
+					if e.inspectArbitraryJSONSlice(v, sessionID, cfg, &res, 1) {
+						batchArr[i] = v
+						modifiedBatch = true
+					}
+				case string:
+					cleaned, codes, intruded, masked := e.inspectTextSegment(sessionID, v, "user", cfg, &res.CanaryToken)
+					res.MaskedCount += masked
+					for _, c := range codes {
+						res.addCode(c, intruded)
+					}
+					if !isShadow && cleaned != v {
+						batchArr[i] = cleaned
+						modifiedBatch = true
+					}
+				}
+			}
+			res.finalizeMode(cfg.Core.Mode)
+			if modifiedBatch && !isShadow && !res.Blocked {
+				if updatedBytes, mErr := marshalJSONUnescaped(batchArr); mErr == nil {
+					res.ModifiedBody = updatedBytes
+				}
+			}
+			return res
+		}
+
 		cleaned, codes, intruded, masked := e.inspectTextSegment(sessionID, string(body), "user", cfg, &res.CanaryToken)
 		res.MaskedCount += masked
 		for _, c := range codes {
@@ -269,6 +328,72 @@ func (e *Engine) InspectJSONPayloadWithSession(body []byte, sessionID string, cf
 								modified = true
 							}
 						}
+					}
+
+					// Inspect any extra nested fields inside multimodal/content part objects
+					for pk, pv := range partMap {
+						if pk == "type" || pk == "text" || pk == "input" || pk == "content" || pk == "image_url" {
+							continue
+						}
+						switch pval := pv.(type) {
+						case string:
+							cleaned, codes, intruded, masked := e.inspectTextSegment(sessionID, pval, "user", cfg, &res.CanaryToken)
+							res.MaskedCount += masked
+							for _, c := range codes {
+								res.addCode(c, intruded)
+							}
+							if !isShadow && cleaned != pval {
+								partMap[pk] = cleaned
+								modified = true
+							}
+						case map[string]any:
+							if e.inspectArbitraryJSONMap(pval, sessionID, cfg, &res, 1) {
+								partMap[pk] = pval
+								modified = true
+							}
+						case []any:
+							if e.inspectArbitraryJSONSlice(pval, sessionID, cfg, &res, 1) {
+								partMap[pk] = pval
+								modified = true
+							}
+						}
+					}
+				}
+			}
+
+			// Inspect any arbitrary or deeply nested sibling fields inside each message object
+			// (e.g. messages[].metadata.l1.l2.l3.l4, messages[].name, custom agent envelopes)
+			for mk, mv := range msgMap {
+				if mk == "role" || mk == "content" || mk == "tool_calls" {
+					continue
+				}
+				switch mval := mv.(type) {
+				case string:
+					cleaned, codes, intruded, masked := e.inspectTextSegment(sessionID, mval, "user", cfg, &res.CanaryToken)
+					res.MaskedCount += masked
+					for _, c := range codes {
+						res.addCode(c, intruded)
+					}
+					if len(cfg.Whitelist.AllowedDomains) > 0 {
+						domCleaned, domViolated := sanitizeDomainsInText(cleaned, cfg.Whitelist.AllowedDomains, isShadow)
+						if domViolated {
+							res.addCode("JG-CFG-103", false)
+							cleaned = domCleaned
+						}
+					}
+					if !isShadow && cleaned != mval {
+						msgMap[mk] = cleaned
+						modified = true
+					}
+				case map[string]any:
+					if e.inspectArbitraryJSONMap(mval, sessionID, cfg, &res, 1) {
+						msgMap[mk] = mval
+						modified = true
+					}
+				case []any:
+					if e.inspectArbitraryJSONSlice(mval, sessionID, cfg, &res, 1) {
+						msgMap[mk] = mval
+						modified = true
 					}
 				}
 			}

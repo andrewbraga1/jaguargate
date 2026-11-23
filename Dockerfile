@@ -1,18 +1,30 @@
 # ==============================================================================
-# Stage 1: Static Binary Builder (Go 1.23)
+# Stage 1: Static Binary Builder (Go 1.26, Non-Root Build Workspace)
 # ==============================================================================
-FROM golang:1.23-alpine AS builder
+FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS builder
 
-WORKDIR /src
+ARG TARGETOS=linux
+ARG TARGETARCH=amd64
 
-# Cache dependencies first
-COPY go.mod go.sum ./
+RUN adduser -D -u 10001 builder \
+    && mkdir -p /home/builder/src /home/builder/go \
+    && chown -R builder:builder /home/builder
+
+USER builder:builder
+ENV GOPATH=/home/builder/go \
+    GOCACHE=/home/builder/.cache/go-build \
+    GOMODCACHE=/home/builder/go/pkg/mod
+
+WORKDIR /home/builder/src
+
+# Cache dependencies first (explicit non-root workspace path, never /)
+COPY --chown=builder:builder go.mod go.sum /home/builder/src/
 RUN go mod download
 
 # Copy source and compile a stripped, 100% static binary (zero libc dependency)
-COPY . .
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
-    go build -trimpath -ldflags="-s -w" -o /out/jgate ./cmd/jgate
+COPY --chown=builder:builder . /home/builder/src/
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
+    go build -trimpath -ldflags="-s -w" -o /home/builder/src/jgate ./cmd/jgate
 
 # ==============================================================================
 # Stage 2: Minimal Hardened Distroless Runtime (~12MB, Non-Root, No Shell)
@@ -21,7 +33,7 @@ FROM gcr.io/distroless/static-debian12:nonroot
 
 WORKDIR /app
 
-COPY --from=builder --chown=nonroot:nonroot /out/jgate /app/jgate
+COPY --from=builder --chown=nonroot:nonroot /home/builder/src/jgate /app/jgate
 COPY --chown=nonroot:nonroot jaguargate.yaml /app/jaguargate.yaml
 
 USER nonroot:nonroot

@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Bilateral Inspection Upstream Mock Server for JaguarGate Gate 5 Audit.
 
-Captures every incoming request (method, path, headers, raw body) so the audit
-verifier can assert Quadrant 2 (Egress / Upstream Invariant) and supports
-token-echo responses and real fragmented SSE streaming for Quadrant 3 checks.
+Captures every incoming request (method, path, headers, raw body) AND records
+the exact response / SSE fragments emitted back to JaguarGate so the audit
+verifier can assert all 4 stages of the Kaizen Bidirectional Invariant:
+  Stage 1 (Ingress)  -> Stage 2 (Gateway Decision)
+  Stage 3 (Upstream) -> Stage 4 (Upstream Egress / SSE Fragments -> Client)
 """
 import http.server
 import json
@@ -14,9 +16,56 @@ import threading
 import time
 
 RE_JG_TOKEN = re.compile(r"<JG_PII_[A-Z0-9_]+_[0-9a-f]{8,32}>")
+RE_JG_CANARY = re.compile(r"\[JG-CANARY:(jg_cnry_[0-9a-f]+)\]")
 
 _lock = threading.Lock()
 _history = []
+
+
+def split_sse_fragments(text: str):
+    """Split text into SSE delta fragments that cut *inside* sensitive tokens/secrets.
+
+    Guarantees that <JG_PII_...> tokens or spontaneous AWS keys are split across
+    3+ separate SSE events so the test genuinely proves cross-chunk holdback and
+    re-assembly rather than passing intact tokens in a single event.
+    """
+    # 1. Cut right inside the first <JG_PII_...> token across 3 distinct chunks
+    m = RE_JG_TOKEN.search(text)
+    if m:
+        s, e = m.start(), m.end()
+        tok = text[s:e]
+        cut1 = s + min(10, max(4, len(tok) // 3))
+        cut2 = s + min(len(tok) - 4, max(cut1 + 4, (2 * len(tok)) // 3))
+        parts = [
+            text[:cut1],       # Prefix + opening partial token (e.g. "... <JG_PII_CP")
+            text[cut1:cut2],   # Pure middle hex/tag bytes (neither '<' nor '>')
+            text[cut2:e],      # Closing tail of token ("...>")
+        ]
+        if e < len(text):
+            parts.append(text[e:])
+        return [p for p in parts if p]
+
+    # 2. Cut right inside a spontaneous AWS key (AKIA...) across 3 distinct chunks
+    akia_idx = text.find("AKIA")
+    if akia_idx != -1 and akia_idx + 20 <= len(text):
+        parts = [
+            text[: akia_idx + 8],            # Prefix + "AKIAxxxx"
+            text[akia_idx + 8 : akia_idx + 14],  # Middle 6 chars
+            text[akia_idx + 14 :],           # Tail + suffix
+        ]
+        return [p for p in parts if p]
+
+    # 3. Cut right inside a canary token if echoed
+    cnry_idx = text.find("jg_cnry_")
+    if cnry_idx != -1 and cnry_idx + 14 <= len(text):
+        parts = [
+            text[: cnry_idx + 10],
+            text[cnry_idx + 10 :],
+        ]
+        return [p for p in parts if p]
+
+    mid = max(1, len(text) // 2)
+    return [text[:mid], text[mid:]] if len(text) > 1 else [text]
 
 
 class BilateralUpstreamHandler(http.server.BaseHTTPRequestHandler):
@@ -54,17 +103,6 @@ class BilateralUpstreamHandler(http.server.BaseHTTPRequestHandler):
             self._send_json(200, {"reset": True})
             return
 
-        # Quadrant 2: Capture exact request received by upstream
-        record = {
-            "timestamp": time.time(),
-            "method": "POST",
-            "path": self.path,
-            "headers": {k.lower(): v for k, v in self.headers.items()},
-            "body": body_text,
-        }
-        with _lock:
-            _history.append(record)
-
         # Check if request asks for SSE streaming
         wants_stream = False
         try:
@@ -74,21 +112,53 @@ class BilateralUpstreamHandler(http.server.BaseHTTPRequestHandler):
         except Exception:
             pass
 
-        # Extract any JaguarGate tokens present in the upstream request so we can echo them
-        # back to test Quadrant 3 (PII restored vs Secrets withheld on output)
+        mock_behavior = (self.headers.get("X-Mock-Behavior") or "").strip().lower()
         tokens = RE_JG_TOKEN.findall(body_text)
-        if tokens:
-            reply_content = "Upstream received tokens: " + " ".join(tokens)
+
+        if mock_behavior == "leak_spontaneous_secret":
+            # Simulates an LLM spontaneously leaking an unmapped AWS key never sent in ingress
+            reply_content = "Debug config key: AKIAZ9X8W7V6U5T4S3R2 active."
+        elif mock_behavior == "echo_canary":
+            cm = RE_JG_CANARY.search(body_text)
+            if cm:
+                reply_content = f"Leaked system marker: {cm.group(1)} end."
+            else:
+                reply_content = "no canary present"
+        elif tokens:
+            reply_content = "Upstream received tokens: " + " ".join(tokens) + "."
         else:
             reply_content = "mock upstream safe response"
 
+        sse_fragments = split_sse_fragments(reply_content) if wants_stream else []
+
+        # Stage 3 & Stage 4a: Capture exact request received AND exact response/fragments sent
+        record = {
+            "timestamp": time.time(),
+            "method": "POST",
+            "path": self.path,
+            "headers": {k.lower(): v for k, v in self.headers.items()},
+            "body": body_text,
+            "response_mode": "sse" if wants_stream else "json",
+            "response_content_sent": reply_content,
+            "sse_fragments_sent": sse_fragments,
+        }
+        with _lock:
+            _history.append(record)
+
         if wants_stream:
-            # Emit genuine fragmented SSE frames (split across chunks)
-            chunks = [
-                f'data: {json.dumps({"id":"sse-1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","content":reply_content[:12]}}]})}\n\n',
-                f'data: {json.dumps({"id":"sse-1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":reply_content[12:]}}]})}\n\n',
-                "data: [DONE]\n\n",
-            ]
+            chunks = []
+            for idx, frag in enumerate(sse_fragments):
+                delta = {"content": frag}
+                if idx == 0:
+                    delta["role"] = "assistant"
+                event = {
+                    "id": "sse-1",
+                    "object": "chat.completion.chunk",
+                    "choices": [{"index": 0, "delta": delta}],
+                }
+                chunks.append(f"data: {json.dumps(event)}\n\n")
+            chunks.append("data: [DONE]\n\n")
+
             payload = "".join(chunks).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")

@@ -1,12 +1,12 @@
 # 🛡️ JaguarGate Gate 5 — Pacote de Verificação Bilateral 4 Quadrantes
 
-[![Bilateral Suite](https://img.shields.io/badge/Su%C3%ADte%20Bilateral-30%2F30%20Verificados-blue.svg)](#)
+[![Bilateral Suite](https://img.shields.io/badge/Su%C3%ADte%20Bilateral-34%2F34%20Verificados-blue.svg)](#)
 [![GoSec SAST](https://img.shields.io/badge/GoSec%20SAST-0%20Issues%20%7C%200%20Nosec-success.svg)](#)
 [![Govulncheck](https://img.shields.io/badge/Govulncheck-0%20CVEs%20Alcan%C3%A7%C3%A1veis-success.svg)](#)
 
-Este diretório contém o pacote reproduzível da **Suíte Automatizada de Verificação Bilateral 4 Quadrantes** do **JaguarGate**.
+Este diretório contém o pacote reproduzível da **Suíte Automatizada de Verificação Bilateral em 4 Estágios** do **JaguarGate**.
 
-> **Nota de Escopo:** Esta é uma bateria automatizada interna com captura explícita do corpo recebido pelo upstream (Q2), validação de saída no cliente (Q3) e controle positivo direto sem gateway (Q4). Os resultados são delimitados exatamente aos 30 vetores sintéticos e à configuração testada, não substituindo pentest externo independente.
+> **Nota de Escopo:** Esta é uma bateria automatizada interna que registra e compara os 4 estágios em todos os vetores: Ingresso (Estágio 1), Decisão/Códigos do Gateway (Estágio 2), Captura Efetiva no Upstream ou prova `upstream_reached: false` em bloqueio pré-provedor (Estágio 3) e Fragmentos SSE/Resposta do Upstream vs. Entrega Reconstruída ao Cliente (Estágio 4), além do controle positivo direto sem gateway (Q4). Os resultados são delimitados exatamente aos 34 vetores sintéticos e à configuração testada, não substituindo pentest externo independente.
 
 ---
 
@@ -24,8 +24,8 @@ jaguargate-audit-pack/
 └── reproduce/
     ├── run_reproduce.sh           # Script executor (4010 / 4020)
     ├── reproduce_audit.py         # Verificador bilateral 4 quadrantes em Python
-    ├── test_vectors.json          # 30 vetores bilaterais (JSON bruto e SSE real)
-    └── mock_upstream.py           # Mock com captura (/_mock/last_request + eco de tokens + SSE)
+    ├── test_vectors.json          # 34 vetores bilaterais em 4 estágios (JSON bruto, metadata aninhado e SSE fragmentado)
+    └── mock_upstream.py           # Mock com captura (/_mock/last_request + fragmentação SSE no meio do token)
 ```
 
 ---
@@ -42,9 +42,9 @@ jaguargate-audit-pack/
    ./jgate serve -c jaguargate.yaml
    ```
 
-3. **Execute o Verificador Bilateral 4 Quadrantes:**
+3. **Execute o Verificador Bilateral em 4 Estágios:**
    ```bash
    ./docs/security/jaguargate-audit-pack/reproduce/run_reproduce.sh 4010 4020
    ```
 
-O verificador executa primeiro o **Controle Positivo (Q4)** direto no mock (provando captura de vazamento cru) e depois valida todos os 30 vetores nos quadrantes Q1, Q2 e Q3, salvando as evidências em `findings/full_campaign_report.json`.
+O verificador executa primeiro o **Controle Positivo (Q4)** direto no mock (provando captura de vazamento cru) e depois valida e registra todos os 34 vetores nos 4 estágios (ingresso, decisão/códigos do gateway, captura no upstream ou `upstream_reached: false`, e fragmentos SSE vs. entrega reconstruída ao cliente), salvando as evidências em `findings/full_campaign_report.json`.
