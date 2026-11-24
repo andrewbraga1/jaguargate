@@ -48,3 +48,11 @@ jobs:
 
       - name: Execute Gate 5 Self-Contained 4-Stage Bilateral Audit Suite
         run: bash docs/security/jaguargate-audit-pack/reproduce/run_reproduce.sh 4010 4020
+
+      - name: Upload Gate 5 Bilateral Audit Report Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate5-bilateral-report-${{ github.sha }}
+          path: docs/security/jaguargate-audit-pack/findings/full_campaign_report.json
+          if-no-files-found: error

@@ -529,7 +529,27 @@ func (e *Engine) inspectToolDefinitionsSlice(tools []any, sessionID string, cfg 
 	return modified
 }
 
+type schemaWalkContext int
+
+const (
+	schemaCtxObject schemaWalkContext = iota
+	schemaCtxPropertyDict
+)
+
+func isSchemaPropertyDictKey(k string) bool {
+	switch k {
+	case "properties", "$defs", "definitions", "patternProperties", "dependentSchemas":
+		return true
+	default:
+		return false
+	}
+}
+
 func (e *Engine) inspectSchemaMap(m map[string]any, sessionID string, cfg *config.Config, res *InspectionResult, depth int) bool {
+	return e.inspectSchemaMapCtx(m, schemaCtxObject, sessionID, cfg, res, depth)
+}
+
+func (e *Engine) inspectSchemaMapCtx(m map[string]any, ctx schemaWalkContext, sessionID string, cfg *config.Config, res *InspectionResult, depth int) bool {
 	isShadow := cfg.Core.Mode == "shadow"
 	if depth > maxSchemaInspectionDepth {
 		res.addCode("JG-CFG-203", false)
@@ -548,10 +568,75 @@ func (e *Engine) inspectSchemaMap(m map[string]any, sessionID string, cfg *confi
 
 	modified := false
 	for k, v := range m {
-		// Preserve JSON Schema structural keywords
-		if k == "$schema" || k == "type" || k == "required" {
-			continue
+		if ctx == schemaCtxObject {
+			// In a schema object, preserve structural JSON Schema metadata keywords ONLY when they hold
+			// structural schema shapes, never skipping user property sub-schemas in property dictionaries.
+			if k == "$schema" {
+				if s, ok := v.(string); ok && strings.HasPrefix(strings.ToLower(strings.TrimSpace(s)), "http") && strings.Contains(strings.ToLower(s), "json-schema.org") {
+					continue
+				}
+			}
+			if k == "type" {
+				switch tv := v.(type) {
+				case string:
+					// Schema primitive type keyword (e.g. "object", "string", "array") — skip only known JSON Schema types
+					cleaned, codes, intruded, masked := e.inspectTextSegment(sessionID, tv, "user", cfg, &res.CanaryToken)
+					res.MaskedCount += masked
+					for _, c := range codes {
+						res.addCode(c, intruded)
+					}
+					if !isShadow && cleaned != tv {
+						m[k] = cleaned
+						modified = true
+					}
+					continue
+				case []any:
+					if e.inspectSchemaSlice(tv, sessionID, cfg, res, depth+1) {
+						m[k] = tv
+						modified = true
+					}
+					continue
+				}
+			}
+			if k == "required" {
+				if _, isArr := v.([]any); isArr {
+					// Keep JSON Schema required field list intact (e.g. ["type", "required", "cpf"])
+					continue
+				}
+			}
+			if k == "default" || k == "const" || k == "enum" || k == "examples" {
+				// Data values/examples are arbitrary data contexts, not schema keyword maps
+				switch val := v.(type) {
+				case string:
+					cleaned, codes, intruded, masked := e.inspectTextSegment(sessionID, val, "user", cfg, &res.CanaryToken)
+					res.MaskedCount += masked
+					for _, c := range codes {
+						res.addCode(c, intruded)
+					}
+					if !isShadow && cleaned != val {
+						m[k] = cleaned
+						modified = true
+					}
+				case map[string]any:
+					if e.inspectArbitraryJSONMap(val, sessionID, cfg, res, 1) {
+						m[k] = val
+						modified = true
+					}
+				case []any:
+					if e.inspectArbitraryJSONSlice(val, sessionID, cfg, res, 1) {
+						m[k] = val
+						modified = true
+					}
+				}
+				continue
+			}
 		}
+
+		nextCtx := schemaCtxObject
+		if ctx == schemaCtxObject && isSchemaPropertyDictKey(k) {
+			nextCtx = schemaCtxPropertyDict
+		}
+
 		switch val := v.(type) {
 		case string:
 			cleaned, codes, intruded, masked := e.inspectTextSegment(sessionID, val, "user", cfg, &res.CanaryToken)
@@ -571,7 +656,7 @@ func (e *Engine) inspectSchemaMap(m map[string]any, sessionID string, cfg *confi
 				modified = true
 			}
 		case map[string]any:
-			if e.inspectSchemaMap(val, sessionID, cfg, res, depth+1) {
+			if e.inspectSchemaMapCtx(val, nextCtx, sessionID, cfg, res, depth+1) {
 				m[k] = val
 				modified = true
 			}

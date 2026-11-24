@@ -123,8 +123,15 @@ class BilateralUpstreamHandler(http.server.BaseHTTPRequestHandler):
         tokens = RE_JG_TOKEN.findall(body_text)
 
         # Tool call leak mode (JG-R2: tests output tool_calls arguments DLP in JSON & SSE)
-        if mock_behavior == "leak_tool_call_secret":
-            tool_args = '{"target":"audit","secret":"AKIAZ9X8W7V6U5T4S3R2"}'
+        if mock_behavior == "leak_tool_call_secret" or mock_behavior == "leak_tool_call_deep_secret":
+            if mock_behavior == "leak_tool_call_deep_secret":
+                # Build 18-level nested JSON object exceeding maxOutputJSONDepth (16) containing a secret at leaf
+                deep_node = {"secret": "AKIAZ9X8W7V6U5T4S3R2"}
+                for lvl in range(17, 0, -1):
+                    deep_node = {f"l{lvl}": deep_node}
+                tool_args = json.dumps({"target": "audit", "nested": deep_node}, separators=(",", ":"))
+            else:
+                tool_args = '{"target":"audit","secret":"AKIAZ9X8W7V6U5T4S3R2"}'
             sse_fragments = split_sse_fragments(tool_args) if wants_stream else []
             record = {
                 "timestamp": time.time(),

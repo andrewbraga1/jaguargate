@@ -1040,6 +1040,165 @@ func TestLegacyL2CustomSecretFailClosed(t *testing.T) {
 	}
 }
 
+func TestSchemaPropertiesNamedTypeAndRequired(t *testing.T) {
+	vault := NewPIIVault()
+	engine := NewEngine(vault)
+	cfg := config.DefaultConfig()
+	cfg.ApplyPreset()
+	cfg.Whitelist.EnforceToolWhitelist = true
+	cfg.Whitelist.AllowedTools = []string{"lookup_customer"}
+
+	// Regression for Achado A: parameters literally named "type" and "required" inside properties/$defs
+	payload := []byte(`{
+		"model": "llama3",
+		"tools": [
+			{
+				"type": "function",
+				"function": {
+					"name": "lookup_customer",
+					"parameters": {
+						"$schema": "https://json-schema.org/draft/2020-12/schema",
+						"type": "object",
+						"required": ["type", "required", "customer"],
+						"properties": {
+							"type": {
+								"type": "string",
+								"description": "Tipo conta CPF 123.456.789-09",
+								"default": "52998224725"
+							},
+							"required": {
+								"type": "string",
+								"description": "Obrigatorio ex: 123.456.789-09",
+								"examples": ["52998224725"]
+							},
+							"customer": {
+								"type": "string",
+								"description": "Cliente padrao"
+							}
+						},
+						"$defs": {
+							"type": {
+								"type": "string",
+								"description": "Def named type CPF 123.456.789-09"
+							}
+						}
+					}
+				}
+			}
+		],
+		"messages": [{"role": "user", "content": "ok"}]
+	}`)
+
+	res := engine.InspectJSONPayloadWithSession(payload, "sess-schema-edge", &cfg)
+	mod := string(res.ModifiedBody)
+
+	if strings.Contains(mod, "123.456.789-09") || strings.Contains(mod, "52998224725") {
+		t.Fatalf("SECURITY FAILURE (Achado A): raw CPF inside parameter named type/required leaked:\n%s", mod)
+	}
+	if !strings.Contains(mod, `"required":["type","required","customer"]`) {
+		t.Fatalf("schema required list was altered:\n%s", mod)
+	}
+	if !strings.Contains(mod, `"$schema":"https://json-schema.org/draft/2020-12/schema"`) {
+		t.Fatalf("schema URI was altered:\n%s", mod)
+	}
+	if !strings.Contains(mod, `"type":{"description":"Tipo conta CPF <JG_PII_CPF_`) {
+		// Map keys can appear in any order; check masked description & parameter key existence
+		if !strings.Contains(mod, `"<JG_PII_CPF_`) || !strings.Contains(mod, `"properties":{`) {
+			t.Fatalf("expected masked CPF inside properties.type:\n%s", mod)
+		}
+	}
+}
+
+func TestOutputToolCallArgumentsDepthLimitFailClosed(t *testing.T) {
+	vault := NewPIIVault()
+	engine := NewEngine(vault)
+	cfg := config.DefaultConfig()
+	cfg.ApplyPreset()
+
+	buildDeepObject := func(levels int, leaf string) map[string]any {
+		cur := map[string]any{"secret": leaf}
+		for i := levels; i >= 1; i-- {
+			cur = map[string]any{fmt.Sprintf("l%d", i): cur}
+		}
+		return cur
+	}
+	buildDeepArray := func(levels int, leaf string) []any {
+		cur := []any{leaf}
+		for i := levels; i >= 1; i-- {
+			cur = []any{cur}
+		}
+		return cur
+	}
+
+	const testSecret = "AKIAZ9X8W7V6U5T4S3R2"
+
+	// Test below limit (13 -> total depth <= 16), at limit (15 -> total 16/17), and well above limit (18 -> depth > 16)
+	for _, tc := range []struct {
+		name      string
+		depthCfg  int
+		useArray  bool
+		expect203 bool
+	}{
+		{"Obj_BelowLimit_13", 13, false, false},
+		{"Obj_AtLimit_15", 15, false, true},
+		{"Obj_AboveLimit_18", 18, false, true},
+		{"Arr_AboveLimit_18", 18, true, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var innerVal any
+			if tc.useArray {
+				innerVal = buildDeepArray(tc.depthCfg, testSecret)
+			} else {
+				innerVal = buildDeepObject(tc.depthCfg, testSecret)
+			}
+
+			// 1. OpenAI tool_calls stringified arguments
+			innerBytes, _ := marshalJSONUnescaped(innerVal)
+			oaPayload := fmt.Appendf(nil, `{"choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"id":"c1","type":"function","function":{"name":"send_audit","arguments":%q}}]}}]}`, string(innerBytes))
+			oaOut := engine.SanitizeOutputJSON(oaPayload, InspectionResult{SessionID: "sess-depth-oa"}, &cfg)
+			if strings.Contains(string(oaOut.ModifiedBody), testSecret) {
+				t.Fatalf("SECURITY FAILURE (Achado B OpenAI): secret leaked at %s:\n%s", tc.name, string(oaOut.ModifiedBody))
+			}
+			if tc.expect203 && !slices.Contains(oaOut.Codes, "JG-CFG-203") {
+				t.Errorf("expected JG-CFG-203 telemetry code for %s, got %v", tc.name, oaOut.Codes)
+			}
+
+			// 2. Anthropic tool_use.input structured object
+			anthObj := map[string]any{
+				"id":   "msg_d",
+				"type": "message",
+				"role": "assistant",
+				"content": []any{
+					map[string]any{
+						"type":  "tool_use",
+						"id":    "t1",
+						"name":  "send_audit",
+						"input": map[string]any{"nested": innerVal},
+					},
+				},
+			}
+			anthBytes, _ := marshalJSONUnescaped(anthObj)
+			anthOut := engine.SanitizeOutputJSON(anthBytes, InspectionResult{SessionID: "sess-depth-anth"}, &cfg)
+			if strings.Contains(string(anthOut.ModifiedBody), testSecret) {
+				t.Fatalf("SECURITY FAILURE (Achado B Anthropic): secret leaked at %s:\n%s", tc.name, string(anthOut.ModifiedBody))
+			}
+			if tc.expect203 && !slices.Contains(anthOut.Codes, "JG-CFG-203") {
+				t.Errorf("expected JG-CFG-203 for Anthropic %s, got %v", tc.name, anthOut.Codes)
+			}
+		})
+	}
+
+	// 3. hard_block mode on depth > 16 must result in Status=BLOCKED + INTRUSION_ALERT
+	hardCfg := cfg
+	hardCfg.Core.Mode = "hard_block"
+	deepBytes, _ := marshalJSONUnescaped(buildDeepObject(18, testSecret))
+	oaHard := fmt.Appendf(nil, `{"choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"id":"c1","type":"function","function":{"name":"send_audit","arguments":%q}}]}}]}`, string(deepBytes))
+	hardOut := engine.SanitizeOutputJSON(oaHard, InspectionResult{SessionID: "sess-depth-hard"}, &hardCfg)
+	if hardOut.Status != "BLOCKED" || hardOut.Severity != "INTRUSION_ALERT" || strings.Contains(string(hardOut.ModifiedBody), testSecret) {
+		t.Fatalf("expected BLOCKED + INTRUSION_ALERT + no secret in hard_block mode, got status=%s severity=%s body=%s", hardOut.Status, hardOut.Severity, string(hardOut.ModifiedBody))
+	}
+}
+
 func BenchmarkOWASPInputEngine(b *testing.B) {
 	engine := NewEngine(NewPIIVault())
 	cfg := config.DefaultConfig()

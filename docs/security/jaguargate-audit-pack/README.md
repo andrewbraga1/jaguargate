@@ -1,12 +1,12 @@
 # 🛡️ JaguarGate Gate 5 — Bilateral 4-Quadrant Verification Pack
 
-[![Bilateral Suite](https://img.shields.io/badge/Bilateral%20Suite-40%2F40%20Verified-blue.svg)](#)
+[![Bilateral Suite](https://img.shields.io/badge/Bilateral%20Suite-42%2F42%20Verified-blue.svg)](#)
 [![GoSec SAST](https://img.shields.io/badge/GoSec%20SAST-0%20Issues%20%7C%200%20Nosec-success.svg)](#)
 [![Govulncheck](https://img.shields.io/badge/Govulncheck-0%20Reachable%20CVEs-success.svg)](#)
 
 This directory contains the reproducible **Strict 4-Stage Bilateral Automated Security Verification Pack** for **JaguarGate** (executed automatically in `.github/workflows/ci.yml`).
 
-> **Scope Note:** This is an automated internal verification suite recording full payloads, SHA-256 provenance hashes, and asserting all 4 stages on every vector: Ingress (Stage 1), Structured Gateway Decision/Codes (Stage 2), Upstream Captured Payload or `upstream_reached: false` pre-block proof (Stage 3), and Upstream Egress / Mid-Token SSE Fragments vs. Exact Client Reconstruction (Stage 4), plus Q4 direct-bypass positive control and Q5 unsafe-mutation oracle self-check. It verifies the exact 40 synthetic vectors and versioned `jaguargate.audit.yaml` fixture documented below and does not replace an external third-party penetration test.
+> **Scope Note:** This is an automated internal verification suite recording full payloads, SHA-256 provenance hashes, and asserting all 4 stages on every vector: Ingress (Stage 1), Structured Gateway Decision/Codes (Stage 2), Upstream Captured Payload or `upstream_reached: false` pre-block proof (Stage 3), and Upstream Egress / Mid-Token SSE Fragments vs. Exact Client Reconstruction (Stage 4), plus Q4 direct-bypass positive control and Q5 unsafe-mutation oracle self-check. It verifies the exact 42 synthetic vectors and versioned `jaguargate.audit.yaml` fixture documented below and does not replace an external third-party penetration test.
 
 ---
 

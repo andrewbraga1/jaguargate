@@ -241,6 +241,57 @@
       "allowed_statuses": [200]
     },
     {
+      "technique": "tool_schema_param_named_type_and_required",
+      "reasoning": "Regression Achado A: allowed tool with parameters named 'type' and 'required' containing synthetic CPFs in description/default/examples must mask PII while preserving schema required list.",
+      "endpoint": "/v1/chat/completions",
+      "headers": {
+        "Content-Type": "application/json",
+        "X-JaguarGate-Session-ID": "audit-schema-type-req"
+      },
+      "payload": {
+        "model": "llama3",
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "lookup_customer",
+              "parameters": {
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "type": "object",
+                "required": ["type", "required"],
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "description": "Tipo conta CPF 123.456.789-09",
+                    "default": "52998224725"
+                  },
+                  "required": {
+                    "type": "string",
+                    "description": "Campo required CPF 123.456.789-09",
+                    "examples": ["52998224725"]
+                  }
+                }
+              }
+            }
+          }
+        ],
+        "messages": [
+          {
+            "role": "user",
+            "content": "Execute busca por tipo"
+          }
+        ]
+      },
+      "expect_gateway_status": "SANITIZED",
+      "expect_codes": ["JG-PII-301"],
+      "expect_upstream_reached": true,
+      "must_not_reach_upstream": ["123.456.789-09", "52998224725"],
+      "must_reach_upstream_masked": "<JG_PII_CPF_",
+      "must_reach_upstream_verbatim": "\"required\":[\"type\",\"required\"]",
+      "must_restore_in_client": "123.456.789-09",
+      "allowed_statuses": [200]
+    },
+    {
       "technique": "anthropic_top_level_system_pii_and_canary",
       "reasoning": "Proactive Anthropic format check: top-level system array must mask PII and inject Canary without prepending invalid role:system into messages[].",
       "endpoint": "/v1/messages",
@@ -716,6 +767,31 @@
         "target": "audit",
         "secret": "[RESTRICTED SECRET LEAK (JG-SEC-503)]"
       },
+      "allowed_statuses": [200]
+    },
+    {
+      "technique": "output_tool_call_arguments_depth_exceeded",
+      "reasoning": "Regression Achado B: upstream returns allowed tool_call with 18-level nested JSON arguments hiding an AWS key past depth limit 16; gateway must redact fail-closed and emit JG-CFG-203.",
+      "endpoint": "/v1/chat/completions",
+      "headers": {
+        "Content-Type": "application/json",
+        "X-JaguarGate-Session-ID": "audit-tc-depth-json",
+        "X-Mock-Behavior": "leak_tool_call_deep_secret"
+      },
+      "payload": {
+        "model": "llama3",
+        "messages": [
+          {
+            "role": "user",
+            "content": "Dispare auditoria profunda."
+          }
+        ]
+      },
+      "expect_gateway_status": "SANITIZED",
+      "expect_codes": ["JG-CFG-203"],
+      "expect_upstream_reached": true,
+      "must_not_leak_in_client": ["AKIAZ9X8W7V6U5T4S3R2"],
+      "must_contain_in_client": "[JG-DEPTH-EXCEEDED-REDACTED]",
       "allowed_statuses": [200]
     },
     {

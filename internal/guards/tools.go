@@ -264,11 +264,24 @@ func SanitizeOutputToolArgChunk(
 	return working, codes, false
 }
 
+const maxOutputJSONDepth = 16
+
 func (e *Engine) sanitizeOutputJSONValue(val any, sessionID, canaryToken string, cfg *config.Config, out *OutputInspectionResult, depth int) (any, bool) {
-	if depth > 16 {
+	isShadow := cfg.Core.Mode == "shadow"
+	if depth > maxOutputJSONDepth {
+		out.addOutputCode("JG-CFG-203")
+		if cfg.Core.Mode == "hard_block" {
+			out.Severity = "INTRUSION_ALERT"
+			if !isShadow {
+				return "[JG-DEPTH-EXCEEDED-REDACTED]", true
+			}
+			return val, false
+		}
+		if !isShadow {
+			return "[JG-DEPTH-EXCEEDED-REDACTED]", true
+		}
 		return val, false
 	}
-	isShadow := cfg.Core.Mode == "shadow"
 	switch v := val.(type) {
 	case string:
 		cleaned, codes, leaked := SanitizeOutputTextWithSession(sessionID, v, canaryToken, cfg, e.vault)
@@ -694,8 +707,8 @@ func (e *Engine) SanitizeOutputJSON(body []byte, inboundRes InspectionResult, cf
 					}
 				}
 			} else if subContent, ok := outMap["content"].([]any); ok {
-				if _, mut := e.sanitizeOutputJSONValue(subContent, sessionID, inboundRes.CanaryToken, cfg, &out, 1); mut && !isShadow {
-					outMap["content"] = subContent
+				if cleanedSub, mut := e.sanitizeOutputJSONValue(subContent, sessionID, inboundRes.CanaryToken, cfg, &out, 1); mut && !isShadow {
+					outMap["content"] = cleanedSub
 					outMod = true
 				}
 			}
@@ -748,7 +761,7 @@ func (r *OutputInspectionResult) finalizeOutputMode(mode string) {
 		r.Severity = "NONE"
 		return
 	}
-	if r.CanaryLeaked {
+	if r.CanaryLeaked || (mode == "hard_block" && slices.Contains(r.Codes, "JG-CFG-203")) {
 		r.Status = "BLOCKED"
 		r.Severity = "INTRUSION_ALERT"
 		return

@@ -45,14 +45,32 @@ def sha256_file(path: str) -> str:
     return h.hexdigest()
 
 
-def get_git_commit(repo_dir: str) -> str:
+def get_git_provenance(repo_dir: str) -> dict:
+    info = {
+        "git_commit": "unknown",
+        "git_dirty": False,
+        "git_modified_files": [],
+        "git_worktree_diff_sha256": "",
+    }
     try:
         out = subprocess.check_output(
             ["git", "rev-parse", "HEAD"], cwd=repo_dir, stderr=subprocess.DEVNULL
         )
-        return out.decode("utf-8").strip()
+        info["git_commit"] = out.decode("utf-8").strip()
+        status_out = subprocess.check_output(
+            ["git", "status", "--porcelain"], cwd=repo_dir, stderr=subprocess.DEVNULL
+        ).decode("utf-8", errors="replace")
+        dirty_lines = [ln.strip() for ln in status_out.splitlines() if ln.strip()]
+        if dirty_lines:
+            info["git_dirty"] = True
+            info["git_modified_files"] = dirty_lines
+            diff_bytes = subprocess.check_output(
+                ["git", "diff", "HEAD"], cwd=repo_dir, stderr=subprocess.DEVNULL
+            )
+            info["git_worktree_diff_sha256"] = hashlib.sha256(diff_bytes).hexdigest()
     except Exception:
-        return "unknown"
+        pass
+    return info
 
 
 def http_json(method: str, url: str, payload=None):
@@ -384,7 +402,8 @@ def main():
     script_dir = os.path.dirname(os.path.abspath(__file__))
     repo_root = os.path.abspath(os.path.join(script_dir, "..", "..", "..", ".."))
     binary_path = sys.argv[3] if len(sys.argv) > 3 else os.path.join(repo_root, "jgate")
-    fixture_path = sys.argv[4] if len(sys.argv) > 4 else os.path.join(script_dir, "jaguargate.audit.yaml")
+    runtime_cfg_path = sys.argv[4] if len(sys.argv) > 4 else os.path.join(script_dir, "jaguargate.audit.yaml")
+    template_cfg_path = sys.argv[5] if len(sys.argv) > 5 else os.path.join(script_dir, "jaguargate.audit.yaml")
 
     vectors_path = os.path.join(script_dir, "test_vectors.json")
     mock_script_path = os.path.join(script_dir, "mock_upstream.py")
@@ -397,27 +416,30 @@ def main():
         for idx, vec in enumerate(rounds, 1):
             validate_vector_schema(vec, front_name, idx)
 
-    fixture_text = ""
-    if os.path.isfile(fixture_path):
-        with open(fixture_path, "r", encoding="utf-8") as ff:
-            fixture_text = ff.read()
+    effective_yaml = ""
+    if os.path.isfile(runtime_cfg_path):
+        with open(runtime_cfg_path, "r", encoding="utf-8") as ff:
+            effective_yaml = ff.read()
 
+    git_prov = get_git_provenance(repo_root)
     provenance = {
-        "git_commit": get_git_commit(repo_root),
+        **git_prov,
         "jgate_binary_sha256": sha256_file(binary_path),
         "reproduce_audit_sha256": sha256_file(os.path.abspath(__file__)),
         "mock_upstream_sha256": sha256_file(mock_script_path),
         "test_vectors_sha256": sha256_file(vectors_path),
-        "config_fixture_sha256": sha256_file(fixture_path),
-        "effective_config_yaml": fixture_text,
+        "fixture_template_sha256": sha256_file(template_cfg_path),
+        "effective_runtime_config_sha256": sha256_file(runtime_cfg_path),
+        "effective_runtime_config_yaml": effective_yaml,
     }
 
     print("=" * 90)
     print("  JAGUARGATE GATE 5 — STRICT 4-STAGE BILATERAL AUDIT VERIFIER")
     print(f"  Gateway Target:  {gateway_url}")
     print(f"  Upstream Mock:   {mock_url}")
-    print(f"  Git Commit:      {provenance['git_commit'][:12]}")
+    print(f"  Git Commit:      {provenance['git_commit'][:12]} (dirty={provenance['git_dirty']})")
     print(f"  Binary SHA-256:  {provenance['jgate_binary_sha256'][:16]}...")
+    print(f"  Runtime Config:  {provenance['effective_runtime_config_sha256'][:16]}...")
     print("=" * 90)
 
     if not run_mutation_self_test():
