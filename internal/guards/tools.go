@@ -128,17 +128,14 @@ func SanitizeOutputTextWithSession(sessionID, text, canaryToken string, cfg *con
 	}
 
 	isShadow := cfg.Core.Mode == "shadow"
-	isPT := isPortuguese(cfg.Core.Language)
+	lang := cfg.Core.Language
 	var codes []string
 
 	// 1. Critical System Prompt Canary Leak Detection (JG-SEC-501)
 	if cfg.Guards.CanaryTokens.Enabled && canaryToken != "" && strings.Contains(text, canaryToken) {
 		codes = append(codes, "JG-SEC-501")
 		if cfg.Guards.CanaryTokens.TruncateStreamOnLeak && !isShadow {
-			if isPT {
-				return "[CONTEÚDO RESTRITO: Vazamento de System Prompt Bloqueado (JG-SEC-501)]", codes, true
-			}
-			return "[RESTRICTED CONTENT: System Prompt Leak Prevented (JG-SEC-501)]", codes, true
+			return config.T(lang, config.MsgCanaryPrevented), codes, true
 		}
 	}
 
@@ -153,11 +150,7 @@ func SanitizeOutputTextWithSession(sessionID, text, canaryToken string, cfg *con
 					codes = append(codes, "JG-SEC-502")
 				}
 				if !isShadow {
-					replacement := "[RESTRICTED IMAGE (JG-SEC-502)]"
-					if isPT {
-						replacement = "[IMAGEM RESTRITA (JG-SEC-502)]"
-					}
-					working = strings.ReplaceAll(working, m[0], replacement)
+					working = strings.ReplaceAll(working, m[0], config.T(lang, config.MsgRestrictedImage))
 				}
 			}
 		}
@@ -169,11 +162,7 @@ func SanitizeOutputTextWithSession(sessionID, text, canaryToken string, cfg *con
 			codes = append(codes, "JG-SEC-502")
 		}
 		if !isShadow {
-			replacement := "[RESTRICTED SCRIPT (JG-SEC-502)]"
-			if isPT {
-				replacement = "[SCRIPT RESTRITO (JG-SEC-502)]"
-			}
-			working = reExecutableScript.ReplaceAllString(working, replacement)
+			working = reExecutableScript.ReplaceAllString(working, config.T(lang, config.MsgRestrictedScript))
 		}
 	}
 
@@ -184,10 +173,7 @@ func SanitizeOutputTextWithSession(sessionID, text, canaryToken string, cfg *con
 
 	// 5. Active Output Secret DLP (JG-SEC-503): redact spontaneous/unmapped credentials emitted by the LLM
 	if cfg.Guards.PIIVault.Enabled && !cfg.Guards.PIIVault.RestoreSecrets {
-		replacement := "[RESTRICTED SECRET LEAK (JG-SEC-503)]"
-		if isPT {
-			replacement = "[VAZAMENTO DE SEGREDO RESTRITO (JG-SEC-503)]"
-		}
+		replacement := config.T(lang, config.MsgRestrictedSecret)
 		if isShadow {
 			if _, leakedSecret := RedactSecretsInText(working, cfg.Guards.PIIVault, ""); leakedSecret {
 				if !slices.Contains(codes, "JG-SEC-503") {
@@ -205,6 +191,199 @@ func SanitizeOutputTextWithSession(sessionID, text, canaryToken string, cfg *con
 	}
 
 	return working, codes, false
+}
+
+// SanitizeOutputToolArgChunk sanitizes a streaming JSON tool-call argument fragment (OpenAI delta.tool_calls
+// or Anthropic input_json_delta) for Canary leaks (JG-SEC-501), stateful PEM blocks & active secrets (JG-SEC-503),
+// scripts/trackers (JG-SEC-502), and JSON-safe session PII restoration while preserving JSON string syntax.
+func SanitizeOutputToolArgChunk(
+	sessionID, text, canaryToken string,
+	cfg *config.Config,
+	vault *PIIVault,
+	pemState *PEMStreamState,
+) (string, []string, bool) {
+	if text == "" && (pemState == nil || !pemState.Active) {
+		return "", nil, false
+	}
+	if sessionID == "" {
+		sessionID = "default_session"
+	}
+
+	isShadow := cfg.Core.Mode == "shadow"
+	lang := cfg.Core.Language
+	var codes []string
+
+	if cfg.Guards.CanaryTokens.Enabled && canaryToken != "" && strings.Contains(text, canaryToken) {
+		codes = append(codes, "JG-SEC-501")
+		if cfg.Guards.CanaryTokens.TruncateStreamOnLeak && !isShadow {
+			return config.T(lang, config.MsgCanaryPrevented), codes, true
+		}
+	}
+
+	working := text
+
+	// Stateful PEM block suppression across tool argument chunks
+	if cfg.Guards.PIIVault.Enabled && !cfg.Guards.PIIVault.RestoreSecrets && pemState != nil {
+		pemRepl := config.T(lang, config.MsgRestrictedSecret)
+		if isShadow {
+			pemRepl = ""
+		}
+		cleanedPEM, pemHit := StripStreamingPEM(working, pemState, pemRepl, true)
+		if pemHit {
+			if !slices.Contains(codes, "JG-SEC-503") {
+				codes = append(codes, "JG-SEC-503")
+			}
+			if !isShadow {
+				working = cleanedPEM
+			}
+		}
+	}
+
+	// JSON-safe reversible PII restoration (secrets remain masked when restore_secrets=false)
+	if vault != nil && cfg.Guards.PIIVault.Enabled && cfg.Guards.PIIVault.RestoreOnOutput && !isShadow {
+		working = vault.RestoreTextJSONSafeWithOptions(sessionID, working, cfg.Guards.PIIVault.RestoreSecrets)
+	}
+
+	// Active Output Secret DLP (JG-SEC-503)
+	if cfg.Guards.PIIVault.Enabled && !cfg.Guards.PIIVault.RestoreSecrets {
+		replacement := config.T(lang, config.MsgRestrictedSecret)
+		if isShadow {
+			if _, leakedSecret := RedactSecretsInText(working, cfg.Guards.PIIVault, ""); leakedSecret && !slices.Contains(codes, "JG-SEC-503") {
+				codes = append(codes, "JG-SEC-503")
+			}
+		} else {
+			if redacted, leakedSecret := RedactSecretsInText(working, cfg.Guards.PIIVault, replacement); leakedSecret {
+				working = redacted
+				if !slices.Contains(codes, "JG-SEC-503") {
+					codes = append(codes, "JG-SEC-503")
+				}
+			}
+		}
+	}
+
+	return working, codes, false
+}
+
+func (e *Engine) sanitizeOutputJSONValue(val any, sessionID, canaryToken string, cfg *config.Config, out *OutputInspectionResult, depth int) (any, bool) {
+	if depth > 16 {
+		return val, false
+	}
+	isShadow := cfg.Core.Mode == "shadow"
+	switch v := val.(type) {
+	case string:
+		cleaned, codes, leaked := SanitizeOutputTextWithSession(sessionID, v, canaryToken, cfg, e.vault)
+		if leaked {
+			out.CanaryLeaked = true
+		}
+		for _, c := range codes {
+			out.addOutputCode(c)
+		}
+		if len(cfg.Whitelist.AllowedDomains) > 0 {
+			domCleaned, domViolated := SanitizeDomainsInText(cleaned, cfg.Whitelist.AllowedDomains, isShadow)
+			if domViolated {
+				out.addOutputCode("JG-CFG-103")
+				if !isShadow {
+					cleaned = domCleaned
+				}
+			}
+		}
+		if !isShadow && cleaned != v {
+			return cleaned, true
+		}
+		return v, false
+	case map[string]any:
+		mut := false
+		for k, sub := range v {
+			newSub, subMut := e.sanitizeOutputJSONValue(sub, sessionID, canaryToken, cfg, out, depth+1)
+			if subMut {
+				v[k] = newSub
+				mut = true
+			}
+		}
+		return v, mut
+	case []any:
+		mut := false
+		for i, sub := range v {
+			newSub, subMut := e.sanitizeOutputJSONValue(sub, sessionID, canaryToken, cfg, out, depth+1)
+			if subMut {
+				v[i] = newSub
+				mut = true
+			}
+		}
+		return v, mut
+	default:
+		return val, false
+	}
+}
+
+// SanitizeOutputToolCallsSlice applies Active Output DLP (JG-SEC-503), Canary check (JG-SEC-501),
+// and session PII restoration to non-delta tool_calls arrays (e.g. Ollama NDJSON chunks).
+func SanitizeOutputToolCallsSlice(
+	tools []any,
+	sessionID, canaryToken string,
+	cfg *config.Config,
+	vault *PIIVault,
+) ([]any, []string, bool, bool) {
+	eng := NewEngine(vault)
+	out := OutputInspectionResult{}
+	mut := eng.sanitizeOutputToolCallsArgs(tools, sessionID, canaryToken, cfg, &out)
+	return tools, out.Codes, out.CanaryLeaked, mut
+}
+
+func (e *Engine) sanitizeOutputToolCallsArgs(tools []any, sessionID, canaryToken string, cfg *config.Config, out *OutputInspectionResult) bool {
+	isShadow := cfg.Core.Mode == "shadow"
+	modified := false
+	for i, item := range tools {
+		tMap, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		fnMap, ok := tMap["function"].(map[string]any)
+		if !ok {
+			continue
+		}
+		switch rawArgs := fnMap["arguments"].(type) {
+		case string:
+			if rawArgs == "" {
+				continue
+			}
+			var parsed any
+			if err := json.Unmarshal([]byte(rawArgs), &parsed); err == nil {
+				cleanedVal, mut := e.sanitizeOutputJSONValue(parsed, sessionID, canaryToken, cfg, out, 1)
+				if mut && !isShadow {
+					if b, mErr := marshalJSONUnescaped(cleanedVal); mErr == nil {
+						fnMap["arguments"] = string(b)
+						tMap["function"] = fnMap
+						tools[i] = tMap
+						modified = true
+					}
+				}
+			} else {
+				var pemState PEMStreamState
+				cleaned, codes, leaked := SanitizeOutputToolArgChunk(sessionID, rawArgs, canaryToken, cfg, e.vault, &pemState)
+				if leaked {
+					out.CanaryLeaked = true
+				}
+				for _, c := range codes {
+					out.addOutputCode(c)
+				}
+				if !isShadow && cleaned != rawArgs {
+					fnMap["arguments"] = cleaned
+					tMap["function"] = fnMap
+					tools[i] = tMap
+					modified = true
+				}
+			}
+		case map[string]any:
+			if _, mut := e.sanitizeOutputJSONValue(rawArgs, sessionID, canaryToken, cfg, out, 1); mut && !isShadow {
+				fnMap["arguments"] = rawArgs
+				tMap["function"] = fnMap
+				tools[i] = tMap
+				modified = true
+			}
+		}
+	}
+	return modified
 }
 
 // SanitizeOutputJSON inspects a complete non-streaming LLM response body (choices[].message.content & tool_calls).
@@ -272,23 +451,36 @@ func (e *Engine) SanitizeOutputJSON(body []byte, inboundRes InspectionResult, cf
 					}
 				}
 
-				// 2. Inspect & selectively prune assistant tool_calls
+				// 2. Inspect & selectively prune assistant tool_calls + apply Output DLP & PII policy to arguments
 				if rawTools, ok := msgMap["tool_calls"].([]any); ok && len(rawTools) > 0 {
-					keptTools, toolCodes, prunedNames := SanitizeToolCallsSliceDetailed(rawTools, cfg.Whitelist, isShadow)
-					pruned := len(prunedNames)
-					out.PrunedTools += pruned
-					for _, name := range prunedNames {
-						if !slices.Contains(out.PrunedToolNames, name) {
-							out.PrunedToolNames = append(out.PrunedToolNames, name)
+					activeTools := rawTools
+					if cfg.Whitelist.EnforceToolWhitelist {
+						keptTools, toolCodes, prunedNames := SanitizeToolCallsSliceDetailed(rawTools, cfg.Whitelist, isShadow)
+						pruned := len(prunedNames)
+						out.PrunedTools += pruned
+						for _, name := range prunedNames {
+							if !slices.Contains(out.PrunedToolNames, name) {
+								out.PrunedToolNames = append(out.PrunedToolNames, name)
+							}
+						}
+						for _, c := range toolCodes {
+							out.addOutputCode(c)
+						}
+						if !isShadow && (pruned > 0 || len(toolCodes) > 0) {
+							modified = true
+							activeTools = keptTools
 						}
 					}
-					for _, c := range toolCodes {
-						out.addOutputCode(c)
+
+					if len(activeTools) > 0 {
+						if e.sanitizeOutputToolCallsArgs(activeTools, sessionID, inboundRes.CanaryToken, cfg, &out) {
+							modified = true
+						}
 					}
-					if !isShadow && (pruned > 0 || len(toolCodes) > 0) {
-						modified = true
-						if len(keptTools) > 0 {
-							msgMap["tool_calls"] = keptTools
+
+					if modified && !isShadow {
+						if len(activeTools) > 0 {
+							msgMap["tool_calls"] = activeTools
 						} else {
 							// Enterprise SDK safety: normalize finish_reason when all tools are pruned
 							delete(msgMap, "tool_calls")
@@ -306,6 +498,21 @@ func (e *Engine) SanitizeOutputJSON(body []byte, inboundRes InspectionResult, cf
 					}
 				}
 				chMap["message"] = msgMap
+			}
+
+			// Support legacy OpenAI / vLLM completions format: choices[].text
+			if textStr, ok := chMap["text"].(string); ok && textStr != "" {
+				cleaned, codes, leaked := SanitizeOutputTextWithSession(sessionID, textStr, inboundRes.CanaryToken, cfg, e.vault)
+				if leaked {
+					out.CanaryLeaked = true
+				}
+				for _, c := range codes {
+					out.addOutputCode(c)
+				}
+				if !isShadow && cleaned != textStr {
+					chMap["text"] = cleaned
+					modified = true
+				}
 			}
 			choices[i] = chMap
 		}
@@ -328,21 +535,30 @@ func (e *Engine) SanitizeOutputJSON(body []byte, inboundRes InspectionResult, cf
 			}
 		}
 		if rawTools, ok := msgMap["tool_calls"].([]any); ok && len(rawTools) > 0 {
-			keptTools, toolCodes, prunedNames := SanitizeToolCallsSliceDetailed(rawTools, cfg.Whitelist, isShadow)
-			pruned := len(prunedNames)
-			out.PrunedTools += pruned
-			for _, name := range prunedNames {
-				if !slices.Contains(out.PrunedToolNames, name) {
-					out.PrunedToolNames = append(out.PrunedToolNames, name)
+			activeTools := rawTools
+			if cfg.Whitelist.EnforceToolWhitelist {
+				keptTools, toolCodes, prunedNames := SanitizeToolCallsSliceDetailed(rawTools, cfg.Whitelist, isShadow)
+				pruned := len(prunedNames)
+				out.PrunedTools += pruned
+				for _, name := range prunedNames {
+					if !slices.Contains(out.PrunedToolNames, name) {
+						out.PrunedToolNames = append(out.PrunedToolNames, name)
+					}
+				}
+				for _, c := range toolCodes {
+					out.addOutputCode(c)
+				}
+				if !isShadow && (pruned > 0 || len(toolCodes) > 0) {
+					modified = true
+					activeTools = keptTools
 				}
 			}
-			for _, c := range toolCodes {
-				out.addOutputCode(c)
-			}
-			if !isShadow && (pruned > 0 || len(toolCodes) > 0) {
+			if len(activeTools) > 0 && e.sanitizeOutputToolCallsArgs(activeTools, sessionID, inboundRes.CanaryToken, cfg, &out) {
 				modified = true
-				if len(keptTools) > 0 {
-					msgMap["tool_calls"] = keptTools
+			}
+			if modified && !isShadow {
+				if len(activeTools) > 0 {
+					msgMap["tool_calls"] = activeTools
 				} else {
 					delete(msgMap, "tool_calls")
 				}
@@ -395,8 +611,10 @@ func (e *Engine) SanitizeOutputJSON(body []byte, inboundRes InspectionResult, cf
 			// 2. Tool use block
 			if blockType == "tool_use" {
 				toolName, _ := blockMap["name"].(string)
+				wasPruned := false
 				if cfg.Whitelist.EnforceToolWhitelist && toolName != "" {
 					if !IsToolAllowed(toolName, cfg.Whitelist.AllowedTools) {
+						wasPruned = true
 						out.PrunedTools++
 						safeName := sanitizeHeaderToken(toolName)
 						if safeName != "" && !slices.Contains(out.PrunedToolNames, safeName) {
@@ -419,19 +637,13 @@ func (e *Engine) SanitizeOutputJSON(body []byte, inboundRes InspectionResult, cf
 					}
 				}
 
-				// Inspect tool inputs for unauthorized domains
-				if inputMap, ok := blockMap["input"].(map[string]any); ok && len(cfg.Whitelist.AllowedDomains) > 0 {
-					if inputBytes, err := json.Marshal(inputMap); err == nil {
-						cleanedInput, violated := SanitizeDomainsInText(string(inputBytes), cfg.Whitelist.AllowedDomains, isShadow)
-						if violated {
-							out.addOutputCode("JG-CFG-103")
-							if !isShadow {
-								var newInputs map[string]any
-								if err := json.Unmarshal([]byte(cleanedInput), &newInputs); err == nil {
-									blockMap["input"] = newInputs
-									modified = true
-								}
-							}
+				// Inspect allowed tool_use inputs for Active Secret DLP (JG-SEC-503), PII restoration, Canary & Domains
+				if !wasPruned {
+					if rawInput, hasInput := blockMap["input"]; hasInput {
+						cleanedInput, mut := e.sanitizeOutputJSONValue(rawInput, sessionID, inboundRes.CanaryToken, cfg, &out, 1)
+						if mut && !isShadow {
+							blockMap["input"] = cleanedInput
+							modified = true
 						}
 					}
 				}
@@ -440,6 +652,58 @@ func (e *Engine) SanitizeOutputJSON(body []byte, inboundRes InspectionResult, cf
 		}
 		if modified && !isShadow {
 			payload["content"] = rawContent
+		}
+	}
+
+	// Support OpenAI Responses API format: top-level "output" array (message content & function_call arguments)
+	if rawOutput, ok := payload["output"].([]any); ok {
+		keptOut := make([]any, 0, len(rawOutput))
+		outMod := false
+		for _, outItem := range rawOutput {
+			outMap, ok := outItem.(map[string]any)
+			if !ok {
+				keptOut = append(keptOut, outItem)
+				continue
+			}
+			itemType, _ := outMap["type"].(string)
+			if itemType == "function_call" {
+				tName, _ := outMap["name"].(string)
+				if cfg.Whitelist.EnforceToolWhitelist && tName != "" && !IsToolAllowed(tName, cfg.Whitelist.AllowedTools) {
+					out.PrunedTools++
+					safeName := sanitizeHeaderToken(tName)
+					if safeName != "" && !slices.Contains(out.PrunedToolNames, safeName) {
+						out.PrunedToolNames = append(out.PrunedToolNames, safeName)
+					}
+					out.addOutputCode("JG-CFG-101")
+					if isShadow {
+						keptOut = append(keptOut, outMap)
+					} else {
+						outMod = true
+					}
+					continue
+				}
+				if argsStr, ok := outMap["arguments"].(string); ok && argsStr != "" {
+					var parsed any
+					if err := json.Unmarshal([]byte(argsStr), &parsed); err == nil {
+						if cleanedVal, mut := e.sanitizeOutputJSONValue(parsed, sessionID, inboundRes.CanaryToken, cfg, &out, 1); mut && !isShadow {
+							if b, mErr := marshalJSONUnescaped(cleanedVal); mErr == nil {
+								outMap["arguments"] = string(b)
+								outMod = true
+							}
+						}
+					}
+				}
+			} else if subContent, ok := outMap["content"].([]any); ok {
+				if _, mut := e.sanitizeOutputJSONValue(subContent, sessionID, inboundRes.CanaryToken, cfg, &out, 1); mut && !isShadow {
+					outMap["content"] = subContent
+					outMod = true
+				}
+			}
+			keptOut = append(keptOut, outMap)
+		}
+		if outMod && !isShadow {
+			payload["output"] = keptOut
+			modified = true
 		}
 	}
 

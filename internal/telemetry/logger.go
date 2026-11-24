@@ -11,13 +11,16 @@ import (
 	"github.com/andrewbraga1/jaguargate/internal/config"
 )
 
-// Pre-compiled linear-time RE2 expressions for Zero-Trust log redaction.
+// Pre-compiled linear-time RE2 expressions for Zero-Trust log redaction (sourced from canonical config catalog).
 var (
-	reOpenAIKey = regexp.MustCompile(`sk-[A-Za-z0-9_-]{16,}`)
-	reAWSKey    = regexp.MustCompile(`AKIA[0-9A-Z]{16}`)
-	reBearer    = regexp.MustCompile(`(?i)Bearer\s+[A-Za-z0-9._~+/-]+=*`)
-	reCPF       = regexp.MustCompile(`\b\d{3}\.\d{3}\.\d{3}-\d{2}\b`)
-	reCNPJ      = regexp.MustCompile(`\b(?:[A-Za-z0-9]{2}\.[A-Za-z0-9]{3}\.[A-Za-z0-9]{3}/[A-Za-z0-9]{4}-\d{2}|[A-Za-z0-9]{8}/[A-Za-z0-9]{4}-\d{2}|\d{14})\b`)
+	rePrivateKey = regexp.MustCompile(config.RegexExprPEMBlock)
+	reOpenAIKey  = regexp.MustCompile(config.RegexExprProviderFormat)
+	reAWSKey     = regexp.MustCompile(config.RegexExprCloudAccessID)
+	reJWT        = regexp.MustCompile(config.RegexExprThreePartJWS)
+	reBearer     = regexp.MustCompile(config.RegexExprAuthHeaderScheme)
+	reCPF        = regexp.MustCompile(config.RegexExprCPFFormatted)
+	reCNPJ       = regexp.MustCompile(config.RegexExprCNPJ)
+	rePhoneBR    = regexp.MustCompile(config.RegexExprPhoneBR)
 )
 
 var defaultSensitiveFieldNames = map[string]struct{}{
@@ -50,11 +53,14 @@ func NewRedactor(placeholder string, customPatterns []string, customFields []str
 	}
 	r := &Redactor{
 		patterns: []*regexp.Regexp{
+			rePrivateKey,
 			reOpenAIKey,
 			reAWSKey,
+			reJWT,
 			reBearer,
 			reCPF,
 			reCNPJ,
+			rePhoneBR,
 		},
 		sensitiveFields: make(map[string]struct{}, len(defaultSensitiveFieldNames)+len(customFields)),
 		placeholder:     placeholder,

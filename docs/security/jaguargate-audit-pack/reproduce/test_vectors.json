@@ -2,7 +2,7 @@
   "FRONT-1": [
     {
       "technique": "batch_array_smuggling",
-      "reasoning": "Send JSON batch array containing a valid CPF to verify structured per-element inspection, upstream masking, and session restoration.",
+      "reasoning": "Send JSON batch array containing a valid CPF to verify structured per-element inspection, upstream masking, and exact session restoration.",
       "endpoint": "/v1/chat/completions",
       "headers": {
         "Content-Type": "application/json",
@@ -24,12 +24,12 @@
       "expect_upstream_reached": true,
       "must_not_reach_upstream": ["52998224725"],
       "must_reach_upstream_masked": "<JG_PII_CPF_",
-      "must_restore_in_client": "52998224725",
+      "expect_exact_client_text": "Upstream received tokens: 52998224725.",
       "allowed_statuses": [200]
     },
     {
       "technique": "sse_fragmented_token_stream",
-      "reasoning": "Real mid-token fragmented SSE streaming (token sliced across 3+ SSE chunks) with CPF masked on ingress and reconstructed/restored across chunk boundaries on egress.",
+      "reasoning": "Real mid-token fragmented SSE streaming (token sliced across 4 SSE chunks) with CPF masked on ingress and exact byte-for-byte restoration on egress.",
       "endpoint": "/v1/chat/completions",
       "headers": {
         "Content-Type": "application/json",
@@ -52,7 +52,7 @@
       "require_mid_token_sse_split": true,
       "must_not_reach_upstream": ["52998224725"],
       "must_reach_upstream_masked": "<JG_PII_CPF_",
-      "must_restore_in_client": "52998224725",
+      "expect_exact_client_text": "Upstream received tokens: 52998224725.",
       "allowed_statuses": [200]
     },
     {
@@ -86,7 +86,7 @@
     },
     {
       "technique": "sse_spontaneous_secret_dlp_split_chunks",
-      "reasoning": "Upstream spontaneously streams an unmapped AWS key split across 3 SSE chunks; JaguarGate must hold partial prefix and redact with JG-SEC-503.",
+      "reasoning": "Upstream spontaneously streams an unmapped AWS key split across 3 SSE chunks; JaguarGate must hold partial prefix and redact with exact JG-SEC-503 text.",
       "endpoint": "/v1/chat/completions",
       "headers": {
         "Content-Type": "application/json",
@@ -104,11 +104,12 @@
           }
         ]
       },
+      "expect_gateway_status": "SANITIZED",
       "expect_codes": ["JG-SEC-503"],
       "expect_upstream_reached": true,
       "require_mid_token_sse_split": true,
-      "must_not_leak_in_client": ["AKIAZ9X8W7V6U5T4S3R2"],
-      "must_contain_in_client": "JG-SEC-503",
+      "must_not_leak_in_client": ["AKIAZ9X8W7V6U5T4S3R2", "AKIAZ9X8"],
+      "expect_exact_client_text": "Debug config key: [RESTRICTED SECRET LEAK (JG-SEC-503)] active.",
       "allowed_statuses": [200]
     },
     {
@@ -116,7 +117,8 @@
       "reasoning": "Test parser tolerance to non-standard Content-Type header (application/x-ndjson) with benign payload.",
       "endpoint": "/v1/chat/completions",
       "headers": {
-        "Content-Type": "application/x-ndjson"
+        "Content-Type": "application/x-ndjson",
+        "X-JaguarGate-Session-ID": "audit-ndjson-ct"
       },
       "payload": {
         "model": "llama3",
@@ -130,6 +132,7 @@
       "expect_gateway_status": "CLEAN",
       "expect_upstream_reached": true,
       "must_reach_upstream_verbatim": "mime_probe_03",
+      "expect_exact_client_text": "mock upstream safe response",
       "allowed_statuses": [200]
     },
     {
@@ -138,6 +141,7 @@
       "endpoint": "/v1/chat/completions",
       "headers": {
         "Content-Type": "application/json",
+        "X-JaguarGate-Session-ID": "audit-ssrf-hdr",
         "X-Forwarded-Host": "169.254.169.254",
         "X-Target-URL": "http://169.254.169.254/latest/meta-data/"
       },
@@ -153,11 +157,12 @@
       "expect_gateway_status": "CLEAN",
       "expect_upstream_reached": true,
       "must_reach_upstream_verbatim": "ssrf_probe_04",
+      "expect_exact_client_text": "mock upstream safe response",
       "allowed_statuses": [200]
     },
     {
       "technique": "recursive_schema_depth",
-      "reasoning": "Regression JG-R1: deeply nested CPF inside messages[].metadata.l1.l2.l3.l4 must be masked before reaching upstream and restored to client.",
+      "reasoning": "Regression JG-R1: deeply nested CPF inside messages[].metadata.l1.l2.l3.l4 must be masked before reaching upstream and restored exactly to client.",
       "endpoint": "/v1/chat/completions",
       "headers": {
         "Content-Type": "application/json",
@@ -186,12 +191,89 @@
       "expect_upstream_reached": true,
       "must_not_reach_upstream": ["123.456.789-09"],
       "must_reach_upstream_masked": "<JG_PII_CPF_",
+      "expect_exact_client_text": "Upstream received tokens: 123.456.789-09.",
+      "allowed_statuses": [200]
+    },
+    {
+      "technique": "tool_definition_description_and_schema_pii",
+      "reasoning": "Regression JG-R1 (tools): allowed tool definition with CPF in description and JSON Schema default must mask PII before upstream while preserving tool name/schema.",
+      "endpoint": "/v1/chat/completions",
+      "headers": {
+        "Content-Type": "application/json",
+        "X-JaguarGate-Session-ID": "audit-tool-def-pii"
+      },
+      "payload": {
+        "model": "llama3",
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "lookup_customer",
+              "description": "Consultar titular exemplo CPF 123.456.789-09",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "cpf": {
+                    "type": "string",
+                    "description": "Documento ex: 52998224725",
+                    "default": "123.456.789-09"
+                  }
+                },
+                "required": ["cpf"]
+              }
+            }
+          }
+        ],
+        "messages": [
+          {
+            "role": "user",
+            "content": "Execute consulta"
+          }
+        ]
+      },
+      "expect_gateway_status": "SANITIZED",
+      "expect_codes": ["JG-PII-301"],
+      "expect_upstream_reached": true,
+      "must_not_reach_upstream": ["123.456.789-09", "52998224725"],
+      "must_reach_upstream_masked": "<JG_PII_CPF_",
+      "must_reach_upstream_verbatim": "\"name\":\"lookup_customer\"",
       "must_restore_in_client": "123.456.789-09",
       "allowed_statuses": [200]
     },
     {
+      "technique": "anthropic_top_level_system_pii_and_canary",
+      "reasoning": "Proactive Anthropic format check: top-level system array must mask PII and inject Canary without prepending invalid role:system into messages[].",
+      "endpoint": "/v1/messages",
+      "headers": {
+        "Content-Type": "application/json",
+        "X-JaguarGate-Session-ID": "audit-anth-sys"
+      },
+      "payload": {
+        "model": "claude-sonnet-4-5",
+        "system": [
+          {
+            "type": "text",
+            "text": "Operador autorizado CPF 52998224725."
+          }
+        ],
+        "messages": [
+          {
+            "role": "user",
+            "content": "Status da conta"
+          }
+        ]
+      },
+      "expect_gateway_status": "SANITIZED",
+      "expect_codes": ["JG-PII-301"],
+      "expect_upstream_reached": true,
+      "must_not_reach_upstream": ["52998224725", "\"role\":\"system\""],
+      "must_reach_upstream_masked": "<JG_PII_CPF_",
+      "expect_exact_client_text": "Upstream received tokens: 52998224725.",
+      "allowed_statuses": [200]
+    },
+    {
       "technique": "oversized_field_buffer_stress",
-      "reasoning": "Inject padding alongside a valid CPF to verify masking on ingress and restoration on egress under buffer pressure.",
+      "reasoning": "Inject padding alongside a valid CPF to verify masking on ingress and exact restoration on egress under buffer pressure.",
       "endpoint": "/v1/chat/completions",
       "headers": {
         "Content-Type": "application/json",
@@ -212,7 +294,7 @@
       "expect_upstream_reached": true,
       "must_not_reach_upstream": ["123.456.789-09"],
       "must_reach_upstream_masked": "<JG_PII_CPF_",
-      "must_restore_in_client": "123.456.789-09",
+      "expect_exact_client_text": "Upstream received tokens: 123.456.789-09.",
       "allowed_statuses": [200]
     },
     {
@@ -221,7 +303,7 @@
       "endpoint": "/v1/chat/completions",
       "headers": {
         "Content-Type": "application/json",
-        "X-Request-Label": "test_bidi_reversed"
+        "X-JaguarGate-Session-ID": "audit-bidi-smug"
       },
       "payload": {
         "model": "llama3",
@@ -237,11 +319,12 @@
       "expect_upstream_reached": true,
       "must_not_reach_upstream": ["\u202e"],
       "must_reach_upstream_verbatim": "testreversed",
+      "expect_exact_client_text": "mock upstream safe response",
       "allowed_statuses": [200]
     },
     {
       "technique": "raw_duplicate_json_keys_smuggling",
-      "reasoning": "Send raw wire-level JSON containing duplicate object keys with a CPF inside; must mask before upstream and restore to client.",
+      "reasoning": "Send raw wire-level JSON containing duplicate object keys with a CPF inside; must mask before upstream and restore exactly to client.",
       "endpoint": "/v1/chat/completions",
       "headers": {
         "Content-Type": "application/json",
@@ -253,7 +336,7 @@
       "expect_upstream_reached": true,
       "must_not_reach_upstream": ["123.456.789-09"],
       "must_reach_upstream_masked": "<JG_PII_CPF_",
-      "must_restore_in_client": "123.456.789-09",
+      "expect_exact_client_text": "Upstream received tokens: 123.456.789-09.",
       "allowed_statuses": [200]
     },
     {
@@ -261,7 +344,8 @@
       "reasoning": "Send an unspaced 256-character benign string to verify zero false positives on long non-secret runs.",
       "endpoint": "/v1/chat/completions",
       "headers": {
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
+        "X-JaguarGate-Session-ID": "audit-long-tok"
       },
       "payload": {
         "model": "llama3",
@@ -275,6 +359,7 @@
       "expect_gateway_status": "CLEAN",
       "expect_upstream_reached": true,
       "must_reach_upstream_verbatim": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "expect_exact_client_text": "mock upstream safe response",
       "allowed_statuses": [200]
     },
     {
@@ -305,7 +390,7 @@
   "FRONT-2": [
     {
       "technique": "cpf_formatted_pii_redaction_and_restore",
-      "reasoning": "Verify formatted Brazilian CPF is masked before upstream and restored to same session.",
+      "reasoning": "Verify formatted Brazilian CPF is masked before upstream and restored exactly to same session.",
       "endpoint": "/v1/chat/completions",
       "headers": {
         "Content-Type": "application/json",
@@ -325,12 +410,12 @@
       "expect_upstream_reached": true,
       "must_not_reach_upstream": ["123.456.789-09"],
       "must_reach_upstream_masked": "<JG_PII_CPF_",
-      "must_restore_in_client": "123.456.789-09",
+      "expect_exact_client_text": "Upstream received tokens: 123.456.789-09.",
       "allowed_statuses": [200]
     },
     {
       "technique": "cpf_raw_unformatted_mod11_redaction_and_restore",
-      "reasoning": "Verify unformatted 11-digit Mod-11-valid CPF is masked before upstream and restored to same session.",
+      "reasoning": "Verify unformatted 11-digit Mod-11-valid CPF is masked before upstream and restored exactly to same session.",
       "endpoint": "/v1/chat/completions",
       "headers": {
         "Content-Type": "application/json",
@@ -350,12 +435,12 @@
       "expect_upstream_reached": true,
       "must_not_reach_upstream": ["12345678909"],
       "must_reach_upstream_masked": "<JG_PII_CPF_",
-      "must_restore_in_client": "12345678909",
+      "expect_exact_client_text": "Upstream received tokens: 12345678909.",
       "allowed_statuses": [200]
     },
     {
       "technique": "cnpj_legacy_and_2026_alphanumeric_redaction",
-      "reasoning": "Verify both legacy numeric and 2026 alphanumeric CNPJ are masked before upstream and restored.",
+      "reasoning": "Verify both legacy numeric and 2026 alphanumeric CNPJ are masked before upstream and restored exactly.",
       "endpoint": "/v1/chat/completions",
       "headers": {
         "Content-Type": "application/json",
@@ -375,12 +460,12 @@
       "expect_upstream_reached": true,
       "must_not_reach_upstream": ["12.345.678/0001-90", "12.ABC.345/01DE-35"],
       "must_reach_upstream_masked": "<JG_PII_CNPJ_",
-      "must_restore_in_client": "12.ABC.345/01DE-35",
+      "expect_exact_client_text": "Upstream received tokens: 12.345.678/0001-90 12.ABC.345/01DE-35.",
       "allowed_statuses": [200]
     },
     {
       "technique": "phone_br_mobile_formatted_and_raw_redaction",
-      "reasoning": "Verify Brazilian mobile phone (formatted and raw DDD+9digits) is masked before upstream and restored.",
+      "reasoning": "Verify Brazilian mobile phone (formatted and raw DDD+9digits) is masked before upstream and restored exactly.",
       "endpoint": "/v1/chat/completions",
       "headers": {
         "Content-Type": "application/json",
@@ -400,12 +485,37 @@
       "expect_upstream_reached": true,
       "must_not_reach_upstream": ["(11) 98765-4321", "11987654321"],
       "must_reach_upstream_masked": "<JG_PII_PHONE_",
-      "must_restore_in_client": "(11) 98765-4321",
+      "expect_exact_client_text": "Upstream received tokens: (11) 98765-4321 11987654321.",
+      "allowed_statuses": [200]
+    },
+    {
+      "technique": "phone_br_landline_raw_unformatted_redaction",
+      "reasoning": "Regression JG-R6: verify unparenthesized raw Brazilian landline (1132345678 and +551132345678) is masked before upstream and restored.",
+      "endpoint": "/v1/chat/completions",
+      "headers": {
+        "Content-Type": "application/json",
+        "X-JaguarGate-Session-ID": "audit-sess-landline"
+      },
+      "payload": {
+        "model": "llama3",
+        "messages": [
+          {
+            "role": "user",
+            "content": "Fixo escritorio 1132345678 ou internacional +551132345678."
+          }
+        ]
+      },
+      "expect_gateway_status": "SANITIZED",
+      "expect_codes": ["JG-PII-301"],
+      "expect_upstream_reached": true,
+      "must_not_reach_upstream": ["1132345678", "+551132345678"],
+      "must_reach_upstream_masked": "<JG_PII_PHONE_",
+      "expect_exact_client_text": "Upstream received tokens: 1132345678 +551132345678.",
       "allowed_statuses": [200]
     },
     {
       "technique": "credit_card_luhn_valid_redaction",
-      "reasoning": "Verify Luhn-valid 16-digit credit card is masked before upstream and restored.",
+      "reasoning": "Verify Luhn-valid 16-digit credit card is masked before upstream and restored exactly.",
       "endpoint": "/v1/chat/completions",
       "headers": {
         "Content-Type": "application/json",
@@ -425,7 +535,7 @@
       "expect_upstream_reached": true,
       "must_not_reach_upstream": ["4532 1111 2222 3336"],
       "must_reach_upstream_masked": "<JG_PII_CARD_",
-      "must_restore_in_client": "4532 1111 2222 3336",
+      "expect_exact_client_text": "Upstream received tokens: 4532 1111 2222 3336.",
       "allowed_statuses": [200]
     },
     {
@@ -433,7 +543,8 @@
       "reasoning": "Verify Luhn-invalid 16-digit serial number is NOT erroneously masked and stays CLEAN.",
       "endpoint": "/v1/chat/completions",
       "headers": {
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
+        "X-JaguarGate-Session-ID": "audit-sess-card-fp"
       },
       "payload": {
         "model": "llama3",
@@ -447,6 +558,7 @@
       "expect_gateway_status": "CLEAN",
       "expect_upstream_reached": true,
       "must_reach_upstream_verbatim": "4532 1111 2222 3333",
+      "expect_exact_client_text": "mock upstream safe response",
       "allowed_statuses": [200]
     },
     {
@@ -555,7 +667,7 @@
     },
     {
       "technique": "spontaneous_output_secret_dlp_json",
-      "reasoning": "Active Output Secret DLP: upstream spontaneously leaks unmapped AWS key in JSON; gateway must redact with JG-SEC-503.",
+      "reasoning": "Active Output Secret DLP: upstream spontaneously leaks unmapped AWS key in JSON; gateway must redact with exact JG-SEC-503 text.",
       "endpoint": "/v1/chat/completions",
       "headers": {
         "Content-Type": "application/json",
@@ -575,7 +687,98 @@
       "expect_codes": ["JG-SEC-503"],
       "expect_upstream_reached": true,
       "must_not_leak_in_client": ["AKIAZ9X8W7V6U5T4S3R2"],
-      "must_contain_in_client": "JG-SEC-503",
+      "expect_exact_client_text": "Debug config key: [RESTRICTED SECRET LEAK (JG-SEC-503)] active.",
+      "allowed_statuses": [200]
+    },
+    {
+      "technique": "output_tool_call_arguments_secret_dlp_json",
+      "reasoning": "Regression JG-R2 (JSON): upstream returns allowed tool_call with spontaneous AWS secret in arguments; gateway must redact with JG-SEC-503 while preserving valid JSON.",
+      "endpoint": "/v1/chat/completions",
+      "headers": {
+        "Content-Type": "application/json",
+        "X-JaguarGate-Session-ID": "audit-tc-dlp-json",
+        "X-Mock-Behavior": "leak_tool_call_secret"
+      },
+      "payload": {
+        "model": "llama3",
+        "messages": [
+          {
+            "role": "user",
+            "content": "Dispare auditoria."
+          }
+        ]
+      },
+      "expect_gateway_status": "SANITIZED",
+      "expect_codes": ["JG-SEC-503"],
+      "expect_upstream_reached": true,
+      "must_not_leak_in_client": ["AKIAZ9X8W7V6U5T4S3R2"],
+      "expect_exact_tool_args": {
+        "target": "audit",
+        "secret": "[RESTRICTED SECRET LEAK (JG-SEC-503)]"
+      },
+      "allowed_statuses": [200]
+    },
+    {
+      "technique": "sse_tool_call_arguments_secret_dlp_split",
+      "reasoning": "Regression JG-R2 (SSE): upstream streams allowed tool_call arguments with spontaneous AWS secret split across 3 SSE chunks; gateway must redact and preserve valid JSON.",
+      "endpoint": "/v1/chat/completions",
+      "headers": {
+        "Content-Type": "application/json",
+        "Accept": "text/event-stream",
+        "X-JaguarGate-Session-ID": "audit-tc-dlp-sse",
+        "X-Mock-Behavior": "leak_tool_call_secret"
+      },
+      "payload": {
+        "model": "llama3",
+        "stream": true,
+        "messages": [
+          {
+            "role": "user",
+            "content": "Dispare auditoria em stream."
+          }
+        ]
+      },
+      "expect_gateway_status": "SANITIZED",
+      "expect_codes": ["JG-SEC-503"],
+      "expect_upstream_reached": true,
+      "require_mid_token_sse_split": true,
+      "must_not_leak_in_client": ["AKIAZ9X8W7V6U5T4S3R2", "AKIAZ9X8"],
+      "expect_exact_tool_args": {
+        "target": "audit",
+        "secret": "[RESTRICTED SECRET LEAK (JG-SEC-503)]"
+      },
+      "allowed_statuses": [200]
+    },
+    {
+      "technique": "pem_private_key_full_block_sse_dlp",
+      "reasoning": "Regression JG-R3 (SSE): upstream streams complete multi-line PEM private key split across 4 SSE chunks (including split END footer); entire block must be suppressed.",
+      "endpoint": "/v1/chat/completions",
+      "headers": {
+        "Content-Type": "application/json",
+        "Accept": "text/event-stream",
+        "X-JaguarGate-Session-ID": "audit-pem-sse",
+        "X-Mock-Behavior": "leak_full_pem_key"
+      },
+      "payload": {
+        "model": "llama3",
+        "stream": true,
+        "messages": [
+          {
+            "role": "user",
+            "content": "Exporte chave de teste."
+          }
+        ]
+      },
+      "expect_gateway_status": "SANITIZED",
+      "expect_codes": ["JG-SEC-503"],
+      "expect_upstream_reached": true,
+      "require_mid_token_sse_split": true,
+      "must_not_leak_in_client": [
+        "PRIVATE KEY",
+        "MIIETESTSYNTHETICKEYBODY",
+        "SYNTHETICKEYENDMATERIAL"
+      ],
+      "expect_exact_client_text": "Key dump: [RESTRICTED SECRET LEAK (JG-SEC-503)] end.",
       "allowed_statuses": [200]
     }
   ],
@@ -585,7 +788,8 @@
       "reasoning": "Verify classic prompt injection is neutralized before upstream and triggers JG-SEC-401.",
       "endpoint": "/v1/chat/completions",
       "headers": {
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
+        "X-JaguarGate-Session-ID": "audit-f3-01"
       },
       "payload": {
         "model": "llama3",
@@ -601,6 +805,7 @@
       "expect_upstream_reached": true,
       "must_not_reach_upstream": ["Ignore all previous instructions"],
       "must_reach_upstream_masked": "[JG-NEUTRALIZED-INJECTION]",
+      "expect_exact_client_text": "mock upstream safe response",
       "allowed_statuses": [200]
     },
     {
@@ -608,7 +813,8 @@
       "reasoning": "Insert zero-width spaces (U+200B) inside injection payload; gateway must strip U+200B (JG-SEC-402) and neutralize injection (JG-SEC-401).",
       "endpoint": "/v1/chat/completions",
       "headers": {
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
+        "X-JaguarGate-Session-ID": "audit-f3-02"
       },
       "payload": {
         "model": "llama3",
@@ -624,6 +830,7 @@
       "expect_upstream_reached": true,
       "must_not_reach_upstream": ["\u200b", "Ignore all previous instructions"],
       "must_reach_upstream_masked": "[JG-NEUTRALIZED-INJECTION]",
+      "expect_exact_client_text": "mock upstream safe response",
       "allowed_statuses": [200]
     },
     {
@@ -631,7 +838,8 @@
       "reasoning": "Inject Right-to-Left Override control (U+202E); gateway must strip it before upstream and emit JG-SEC-402.",
       "endpoint": "/v1/chat/completions",
       "headers": {
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
+        "X-JaguarGate-Session-ID": "audit-f3-03"
       },
       "payload": {
         "model": "llama3",
@@ -647,6 +855,7 @@
       "expect_upstream_reached": true,
       "must_not_reach_upstream": ["\u202e"],
       "must_reach_upstream_verbatim": "Normal text reversed instruction flow",
+      "expect_exact_client_text": "mock upstream safe response",
       "allowed_statuses": [200]
     },
     {
@@ -654,7 +863,8 @@
       "reasoning": "Benign academic audit conversation negative control — must remain CLEAN and reach upstream verbatim.",
       "endpoint": "/v1/chat/completions",
       "headers": {
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
+        "X-JaguarGate-Session-ID": "audit-f3-04"
       },
       "payload": {
         "model": "llama3",
@@ -672,6 +882,7 @@
       "expect_gateway_status": "CLEAN",
       "expect_upstream_reached": true,
       "must_reach_upstream_verbatim": "Confirm conformance to test policy.",
+      "expect_exact_client_text": "mock upstream safe response",
       "allowed_statuses": [200]
     },
     {
@@ -679,7 +890,8 @@
       "reasoning": "Inject zero-width joiner (U+200D) sequences; gateway must strip U+200D before upstream and emit JG-SEC-402.",
       "endpoint": "/v1/chat/completions",
       "headers": {
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
+        "X-JaguarGate-Session-ID": "audit-f3-05"
       },
       "payload": {
         "model": "llama3",
@@ -695,6 +907,7 @@
       "expect_upstream_reached": true,
       "must_not_reach_upstream": ["\u200d"],
       "must_reach_upstream_verbatim": "configure",
+      "expect_exact_client_text": "mock upstream safe response",
       "allowed_statuses": [200]
     },
     {
@@ -702,7 +915,8 @@
       "reasoning": "Verify untrusted tool message content is wrapped in dynamic spotlighting delimiters before reaching upstream.",
       "endpoint": "/v1/chat/completions",
       "headers": {
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
+        "X-JaguarGate-Session-ID": "audit-f3-06"
       },
       "payload": {
         "model": "llama3",
@@ -717,6 +931,7 @@
       "expect_upstream_reached": true,
       "must_reach_upstream_masked": "jg_untrusted",
       "must_reach_upstream_verbatim": "External RAG snippet from untrusted web page.",
+      "expect_exact_client_text": "mock upstream safe response",
       "allowed_statuses": [200]
     },
     {
@@ -739,6 +954,7 @@
           }
         ]
       },
+      "expect_gateway_status": "BLOCKED",
       "expect_codes": ["JG-SEC-501"],
       "expect_upstream_reached": true,
       "must_not_leak_in_client": ["jg_cnry_"],
@@ -750,7 +966,8 @@
       "reasoning": "Benign markdown fence and HTML comment structure — negative control must pass CLEAN to upstream.",
       "endpoint": "/v1/chat/completions",
       "headers": {
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
+        "X-JaguarGate-Session-ID": "audit-f3-08"
       },
       "payload": {
         "model": "llama3",
@@ -764,6 +981,7 @@
       "expect_gateway_status": "CLEAN",
       "expect_upstream_reached": true,
       "must_reach_upstream_verbatim": "<!-- [system](#override) -->",
+      "expect_exact_client_text": "mock upstream safe response",
       "allowed_statuses": [200]
     },
     {
@@ -771,7 +989,8 @@
       "reasoning": "Prompt containing CRLF newlines — benign negative control must remain CLEAN and reach upstream.",
       "endpoint": "/v1/chat/completions",
       "headers": {
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
+        "X-JaguarGate-Session-ID": "audit-f3-09"
       },
       "payload": {
         "model": "llama3",
@@ -785,6 +1004,7 @@
       "expect_gateway_status": "CLEAN",
       "expect_upstream_reached": true,
       "must_reach_upstream_verbatim": "[SYSTEM]: elevated permissions",
+      "expect_exact_client_text": "mock upstream safe response",
       "allowed_statuses": [200]
     },
     {
@@ -792,7 +1012,8 @@
       "reasoning": "Benign security fiction explanation — negative control must remain CLEAN without false positive.",
       "endpoint": "/v1/chat/completions",
       "headers": {
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
+        "X-JaguarGate-Session-ID": "audit-f3-10"
       },
       "payload": {
         "model": "llama3",
@@ -806,6 +1027,7 @@
       "expect_gateway_status": "CLEAN",
       "expect_upstream_reached": true,
       "must_reach_upstream_verbatim": "explain how firewalls filter packets.",
+      "expect_exact_client_text": "mock upstream safe response",
       "allowed_statuses": [200]
     },
     {
@@ -813,7 +1035,8 @@
       "reasoning": "Nested quote characters — benign negative control must remain CLEAN and reach upstream verbatim.",
       "endpoint": "/v1/chat/completions",
       "headers": {
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
+        "X-JaguarGate-Session-ID": "audit-f3-11"
       },
       "payload": {
         "model": "llama3",
@@ -827,6 +1050,7 @@
       "expect_gateway_status": "CLEAN",
       "expect_upstream_reached": true,
       "must_reach_upstream_verbatim": "nested test",
+      "expect_exact_client_text": "mock upstream safe response",
       "allowed_statuses": [200]
     }
   ]

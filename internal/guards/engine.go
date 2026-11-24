@@ -6,28 +6,12 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"regexp"
 	"slices"
 	"strings"
 
 	"github.com/andrewbraga1/jaguargate/internal/config"
 	"github.com/andrewbraga1/jaguargate/internal/multimodal"
 	"github.com/andrewbraga1/jaguargate/internal/telemetry"
-)
-
-// Pre-compiled linear-time RE2 rules for Direct & Indirect Prompt Injection (EN + PT-BR).
-var rePromptInjection = regexp.MustCompile(
-	`(?i)(?:` +
-		`ignore\s+(?:all\s+)?(?:previous|prior|above|system)\s+(?:instructions|prompts|rules|directions)|` +
-		`disregard\s+(?:all\s+)?(?:previous|prior|system)\s+(?:instructions|prompts|rules)|` +
-		`ignore\s+(?:todas\s+as\s+)?(?:instru[çc][õo]es|regras|diretrizes)\s+(?:anteriores|acima|do\s+sistema)|` +
-		`esque[çc]a\s+(?:todas\s+as\s+)?(?:instru[çc][õo]es|regras)\s+anteriores|` +
-		`system\s*override\s*:|` +
-		`you\s+are\s+now\s+DAN\b|` +
-		`voc[êe]\s+agora\s+[ée]\s+DAN\b|` +
-		`reveal\s+your\s+(?:secret\s+)?system\s+prompt|` +
-		`mostre\s+(?:o\s+)?seu\s+system\s+prompt` +
-		`)`,
 )
 
 // InspectionResult summarizes all OWASP & Whitelist actions taken on an incoming request.
@@ -159,8 +143,9 @@ func (e *Engine) InspectJSONPayloadWithSession(body []byte, sessionID string, cf
 	modified := false
 	isShadow := cfg.Core.Mode == "shadow"
 
-	// 1. Selective Tool Whitelist on top-level "tools" definition array if present
+	// 1. Selective Tool Whitelist AND PII/Secret/Injection Inspection on top-level "tools" definitions
 	if rawTools, ok := payload["tools"].([]any); ok {
+		activeTools := rawTools
 		if cfg.Whitelist.EnforceToolWhitelist {
 			keptTools, toolCodes, prunedNames := SanitizeToolCallsSliceDetailed(rawTools, cfg.Whitelist, isShadow)
 			pruned := len(prunedNames)
@@ -175,18 +160,80 @@ func (e *Engine) InspectJSONPayloadWithSession(body []byte, sessionID string, cf
 			}
 			if !isShadow && (pruned > 0 || len(toolCodes) > 0) {
 				modified = true
-				if len(keptTools) > 0 {
-					payload["tools"] = keptTools
-				} else {
-					delete(payload, "tools")
+				activeTools = keptTools
+			}
+		}
+
+		// Inspect allowed tool descriptions and JSON parameter schemas for PII, secrets, and injections
+		if len(activeTools) > 0 {
+			if e.inspectToolDefinitionsSlice(activeTools, sessionID, cfg, &res) {
+				modified = true
+			}
+		}
+		if modified && !isShadow {
+			if len(activeTools) > 0 {
+				payload["tools"] = activeTools
+			} else {
+				delete(payload, "tools")
+			}
+		}
+	}
+
+	// 1b. Support Anthropic top-level "system" prompt (string or array of content blocks)
+	topLevelSystemFound := false
+	if rawSys, hasSys := payload["system"]; hasSys {
+		topLevelSystemFound = true
+		switch sysVal := rawSys.(type) {
+		case string:
+			cleaned, codes, intruded, masked := e.inspectTextSegment(sessionID, sysVal, "system", cfg, &res.CanaryToken)
+			res.MaskedCount += masked
+			for _, c := range codes {
+				res.addCode(c, intruded)
+			}
+			if !isShadow && cleaned != sysVal {
+				payload["system"] = cleaned
+				modified = true
+			}
+		case []any:
+			for si, sItem := range sysVal {
+				sMap, ok := sItem.(map[string]any)
+				if !ok {
+					continue
 				}
+				if sTxt, ok := sMap["text"].(string); ok {
+					cleaned, codes, intruded, masked := e.inspectTextSegment(sessionID, sTxt, "system", cfg, &res.CanaryToken)
+					res.MaskedCount += masked
+					for _, c := range codes {
+						res.addCode(c, intruded)
+					}
+					if !isShadow && cleaned != sTxt {
+						sMap["text"] = cleaned
+						sysVal[si] = sMap
+						modified = true
+					}
+				}
+				for sk, sv := range sMap {
+					if sk == "type" || sk == "text" {
+						continue
+					}
+					if sm, ok := sv.(map[string]any); ok {
+						if e.inspectArbitraryJSONMap(sm, sessionID, cfg, &res, 1) {
+							sMap[sk] = sm
+							sysVal[si] = sMap
+							modified = true
+						}
+					}
+				}
+			}
+			if modified && !isShadow {
+				payload["system"] = sysVal
 			}
 		}
 	}
 
 	// 2. Inspect standard "messages" array (OpenAI / Ollama / Anthropic / LiteLLM format)
 	if rawMsgs, ok := payload["messages"].([]any); ok {
-		systemFound := false
+		systemFound := topLevelSystemFound
 		for i, item := range rawMsgs {
 			msgMap, ok := item.(map[string]any)
 			if !ok {
@@ -331,71 +378,16 @@ func (e *Engine) InspectJSONPayloadWithSession(body []byte, sessionID string, cf
 					}
 
 					// Inspect any extra nested fields inside multimodal/content part objects
-					for pk, pv := range partMap {
-						if pk == "type" || pk == "text" || pk == "input" || pk == "content" || pk == "image_url" {
-							continue
-						}
-						switch pval := pv.(type) {
-						case string:
-							cleaned, codes, intruded, masked := e.inspectTextSegment(sessionID, pval, "user", cfg, &res.CanaryToken)
-							res.MaskedCount += masked
-							for _, c := range codes {
-								res.addCode(c, intruded)
-							}
-							if !isShadow && cleaned != pval {
-								partMap[pk] = cleaned
-								modified = true
-							}
-						case map[string]any:
-							if e.inspectArbitraryJSONMap(pval, sessionID, cfg, &res, 1) {
-								partMap[pk] = pval
-								modified = true
-							}
-						case []any:
-							if e.inspectArbitraryJSONSlice(pval, sessionID, cfg, &res, 1) {
-								partMap[pk] = pval
-								modified = true
-							}
-						}
+					if e.inspectMapFieldsExcluding(partMap, []string{"type", "text", "input", "content", "image_url"}, sessionID, cfg, &res, 1) {
+						modified = true
 					}
 				}
 			}
 
 			// Inspect any arbitrary or deeply nested sibling fields inside each message object
 			// (e.g. messages[].metadata.l1.l2.l3.l4, messages[].name, custom agent envelopes)
-			for mk, mv := range msgMap {
-				if mk == "role" || mk == "content" || mk == "tool_calls" {
-					continue
-				}
-				switch mval := mv.(type) {
-				case string:
-					cleaned, codes, intruded, masked := e.inspectTextSegment(sessionID, mval, "user", cfg, &res.CanaryToken)
-					res.MaskedCount += masked
-					for _, c := range codes {
-						res.addCode(c, intruded)
-					}
-					if len(cfg.Whitelist.AllowedDomains) > 0 {
-						domCleaned, domViolated := sanitizeDomainsInText(cleaned, cfg.Whitelist.AllowedDomains, isShadow)
-						if domViolated {
-							res.addCode("JG-CFG-103", false)
-							cleaned = domCleaned
-						}
-					}
-					if !isShadow && cleaned != mval {
-						msgMap[mk] = cleaned
-						modified = true
-					}
-				case map[string]any:
-					if e.inspectArbitraryJSONMap(mval, sessionID, cfg, &res, 1) {
-						msgMap[mk] = mval
-						modified = true
-					}
-				case []any:
-					if e.inspectArbitraryJSONSlice(mval, sessionID, cfg, &res, 1) {
-						msgMap[mk] = mval
-						modified = true
-					}
-				}
+			if e.inspectMapFieldsExcluding(msgMap, []string{"role", "content", "tool_calls"}, sessionID, cfg, &res, 1) {
+				modified = true
 			}
 			rawMsgs[i] = msgMap
 		}
@@ -426,8 +418,138 @@ func (e *Engine) InspectJSONPayloadWithSession(body []byte, sessionID string, cf
 	}
 
 	// 4. Inspect any arbitrary or sibling structured JSON fields (e.g., MCP params.arguments or custom agent payloads)
-	for k, v := range payload {
-		if k == "tools" || k == "messages" || k == "prompt" {
+	if e.inspectMapFieldsExcluding(payload, []string{"tools", "messages", "prompt", "system"}, sessionID, cfg, &res, 1) {
+		modified = true
+	}
+
+	res.finalizeMode(cfg.Core.Mode)
+
+	if modified && !isShadow && !res.Blocked {
+		if updatedBytes, err := marshalJSONUnescaped(payload); err == nil {
+			res.ModifiedBody = updatedBytes
+		}
+	}
+
+	return res
+}
+
+const (
+	maxJSONInspectionDepth   = 8
+	maxSchemaInspectionDepth = 16
+)
+
+// inspectToolDefinitionsSlice inspects allowed OpenAI/Anthropic tool definitions (descriptions,
+// parameter JSON Schemas, defaults, examples) for PII, secrets, and prompt injections while
+// preserving contract identifiers (tool name, type).
+func (e *Engine) inspectToolDefinitionsSlice(tools []any, sessionID string, cfg *config.Config, res *InspectionResult) bool {
+	isShadow := cfg.Core.Mode == "shadow"
+	modified := false
+
+	for i, item := range tools {
+		toolMap, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		itemMod := false
+
+		// Top-level tool fields (Anthropic uses top-level description & input_schema; OpenAI nests under "function")
+		for tk, tv := range toolMap {
+			if tk == "type" || tk == "name" {
+				continue
+			}
+			if tk == "function" {
+				fnMap, ok := tv.(map[string]any)
+				if !ok {
+					continue
+				}
+				fnMod := false
+				for fk, fv := range fnMap {
+					if fk == "name" {
+						continue
+					}
+					switch fval := fv.(type) {
+					case string:
+						cleaned, codes, intruded, masked := e.inspectTextSegment(sessionID, fval, "user", cfg, &res.CanaryToken)
+						res.MaskedCount += masked
+						for _, c := range codes {
+							res.addCode(c, intruded)
+						}
+						if !isShadow && cleaned != fval {
+							fnMap[fk] = cleaned
+							fnMod = true
+						}
+					case map[string]any:
+						if e.inspectSchemaMap(fval, sessionID, cfg, res, 1) {
+							fnMap[fk] = fval
+							fnMod = true
+						}
+					case []any:
+						if e.inspectSchemaSlice(fval, sessionID, cfg, res, 1) {
+							fnMap[fk] = fval
+							fnMod = true
+						}
+					}
+				}
+				if fnMod && !isShadow {
+					toolMap["function"] = fnMap
+					itemMod = true
+				}
+				continue
+			}
+
+			switch tval := tv.(type) {
+			case string:
+				cleaned, codes, intruded, masked := e.inspectTextSegment(sessionID, tval, "user", cfg, &res.CanaryToken)
+				res.MaskedCount += masked
+				for _, c := range codes {
+					res.addCode(c, intruded)
+				}
+				if !isShadow && cleaned != tval {
+					toolMap[tk] = cleaned
+					itemMod = true
+				}
+			case map[string]any:
+				if e.inspectSchemaMap(tval, sessionID, cfg, res, 1) {
+					toolMap[tk] = tval
+					itemMod = true
+				}
+			case []any:
+				if e.inspectSchemaSlice(tval, sessionID, cfg, res, 1) {
+					toolMap[tk] = tval
+					itemMod = true
+				}
+			}
+		}
+
+		if itemMod && !isShadow {
+			tools[i] = toolMap
+			modified = true
+		}
+	}
+	return modified
+}
+
+func (e *Engine) inspectSchemaMap(m map[string]any, sessionID string, cfg *config.Config, res *InspectionResult, depth int) bool {
+	isShadow := cfg.Core.Mode == "shadow"
+	if depth > maxSchemaInspectionDepth {
+		res.addCode("JG-CFG-203", false)
+		if cfg.Core.Mode == "hard_block" {
+			res.Severity = "INTRUSION_ALERT"
+			return false
+		}
+		if !isShadow {
+			for k := range m {
+				m[k] = "[JG-DEPTH-EXCEEDED-REDACTED]"
+			}
+			return true
+		}
+		return false
+	}
+
+	modified := false
+	for k, v := range m {
+		// Preserve JSON Schema structural keywords
+		if k == "$schema" || k == "type" || k == "required" {
 			continue
 		}
 		switch val := v.(type) {
@@ -445,36 +567,74 @@ func (e *Engine) InspectJSONPayloadWithSession(body []byte, sessionID string, cf
 				}
 			}
 			if !isShadow && cleaned != val {
-				payload[k] = cleaned
+				m[k] = cleaned
 				modified = true
 			}
 		case map[string]any:
-			if e.inspectArbitraryJSONMap(val, sessionID, cfg, &res, 1) {
-				payload[k] = val
+			if e.inspectSchemaMap(val, sessionID, cfg, res, depth+1) {
+				m[k] = val
 				modified = true
 			}
 		case []any:
-			if e.inspectArbitraryJSONSlice(val, sessionID, cfg, &res, 1) {
-				payload[k] = val
+			if e.inspectSchemaSlice(val, sessionID, cfg, res, depth+1) {
+				m[k] = val
 				modified = true
 			}
 		}
 	}
-
-	res.finalizeMode(cfg.Core.Mode)
-
-	if modified && !isShadow && !res.Blocked {
-		if updatedBytes, err := marshalJSONUnescaped(payload); err == nil {
-			res.ModifiedBody = updatedBytes
-		}
-	}
-
-	return res
+	return modified
 }
 
-const maxJSONInspectionDepth = 8
+func (e *Engine) inspectSchemaSlice(s []any, sessionID string, cfg *config.Config, res *InspectionResult, depth int) bool {
+	isShadow := cfg.Core.Mode == "shadow"
+	if depth > maxSchemaInspectionDepth {
+		res.addCode("JG-CFG-203", false)
+		if cfg.Core.Mode == "hard_block" {
+			res.Severity = "INTRUSION_ALERT"
+			return false
+		}
+		if !isShadow {
+			for i := range s {
+				s[i] = "[JG-DEPTH-EXCEEDED-REDACTED]"
+			}
+			return true
+		}
+		return false
+	}
+
+	modified := false
+	for i, item := range s {
+		switch val := item.(type) {
+		case string:
+			cleaned, codes, intruded, masked := e.inspectTextSegment(sessionID, val, "user", cfg, &res.CanaryToken)
+			res.MaskedCount += masked
+			for _, c := range codes {
+				res.addCode(c, intruded)
+			}
+			if !isShadow && cleaned != val {
+				s[i] = cleaned
+				modified = true
+			}
+		case map[string]any:
+			if e.inspectSchemaMap(val, sessionID, cfg, res, depth+1) {
+				s[i] = val
+				modified = true
+			}
+		case []any:
+			if e.inspectSchemaSlice(val, sessionID, cfg, res, depth+1) {
+				s[i] = val
+				modified = true
+			}
+		}
+	}
+	return modified
+}
 
 func (e *Engine) inspectArbitraryJSONMap(m map[string]any, sessionID string, cfg *config.Config, res *InspectionResult, depth int) bool {
+	return e.inspectMapFieldsExcluding(m, nil, sessionID, cfg, res, depth)
+}
+
+func (e *Engine) inspectMapFieldsExcluding(m map[string]any, skipKeys []string, sessionID string, cfg *config.Config, res *InspectionResult, depth int) bool {
 	isShadow := cfg.Core.Mode == "shadow"
 	if depth > maxJSONInspectionDepth {
 		res.addCode("JG-CFG-203", false)
@@ -483,9 +643,10 @@ func (e *Engine) inspectArbitraryJSONMap(m map[string]any, sessionID string, cfg
 			return false
 		}
 		if !isShadow {
-			// In balanced / sanitize_and_warn: redact uninspected deep subtree so unmasked PII/secrets never leak
 			for k := range m {
-				m[k] = "[JG-DEPTH-EXCEEDED-REDACTED]"
+				if !slices.Contains(skipKeys, k) {
+					m[k] = "[JG-DEPTH-EXCEEDED-REDACTED]"
+				}
 			}
 			return true
 		}
@@ -494,6 +655,9 @@ func (e *Engine) inspectArbitraryJSONMap(m map[string]any, sessionID string, cfg
 	modified := false
 
 	for k, v := range m {
+		if slices.Contains(skipKeys, k) {
+			continue
+		}
 		switch val := v.(type) {
 		case string:
 			cleaned, codes, intruded, masked := e.inspectTextSegment(sessionID, val, "user", cfg, &res.CanaryToken)

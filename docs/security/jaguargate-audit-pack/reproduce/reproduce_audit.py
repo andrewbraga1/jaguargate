@@ -1,34 +1,58 @@
 #!/usr/bin/env python3
 """
-JaguarGate Gate 5 — 4-Stage Bilateral Audit Verifier
-=====================================================
-Enforces the Kaizen Bidirectional 4-Stage Invariant on every single vector:
-  Stage 1 (Ingress):          Exact synthetic payload sent into JaguarGate.
-  Stage 2 (Gateway Decision): HTTP status, X-JaguarGate-Status, X-JaguarGate-Codes
-                              (and SSE warning events), veto/pruning telemetry.
-  Stage 3 (Upstream Capture): Exact bytes received by mock_upstream, asserting
-                              masked tokens arrived, raw PII/secrets NEVER leaked,
-                              and upstream_reached == False when pre-blocked.
-  Stage 4 (Egress Delivery):  Exact upstream response (including individual SSE
-                              fragments proving true mid-token splitting) vs.
-                              reconstructed client output (restoration / withholding /
-                              JG-SEC-503 active output DLP / JG-SEC-501 halt).
-  Control (Q4 Positive):      Direct-to-upstream bypass probe proving mock_upstream
-                              genuinely captures raw PII when JaguarGate is bypassed.
-
-Usage:
-    python3 reproduce_audit.py <GATEWAY_URL> <MOCK_UPSTREAM_URL>
+JaguarGate Gate 5 — Strict 4-Stage Bilateral Audit Verifier (with Provenance & Mutation Check)
+==============================================================================================
+Enforces the Kaizen Bidirectional 4-Stage Invariant on every vector:
+  Stage 1 (Ingress):          Full synthetic payload sent into JaguarGate.
+  Stage 2 (Gateway Decision): HTTP status + structured telemetry ONLY (X-JaguarGate-* headers
+                              and structured SSE jaguargate.warning events — never body substrings).
+  Stage 3 (Upstream Capture): Full bytes received by mock_upstream, asserting masked tokens
+                              arrived, raw PII/secrets NEVER leaked, and upstream_reached == False
+                              when pre-blocked.
+  Stage 4 (Egress Delivery):  Full upstream response + individual SSE fragments (proving BOTH
+                              absence of complete token in any single fragment AND presence of
+                              complete token in joined fragments) vs. exact client reconstruction.
+  Controls:
+    - Q4 Positive Control:    Direct-to-upstream bypass probe proving mock captures raw PII.
+    - Q5 Mutation Self-Test:  Deliberately unsafe synthetic mutations injected into the oracle
+                              proving the verifier deterministically fails on regressions.
 """
+import hashlib
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 import urllib.error
 import urllib.request
 
 RE_JG_TOKEN = re.compile(r"<JG_PII_[A-Z0-9_]+_[0-9a-f]{8,32}>")
-RE_AWS_KEY = re.compile(r"AKIA[0-9A-Z]{16}")
+RE_AWS_KEY = re.compile(r"(?:AKIA|ASIA)[0-9A-Z]{16}")
+RE_PEM_FULL = re.compile(
+    r"-----BEGIN(?: [A-Z0-9]+)* PRIVATE KEY-----.*?-----END(?: [A-Z0-9]+)* PRIVATE KEY-----",
+    re.DOTALL | re.IGNORECASE,
+)
+
+
+def sha256_file(path: str) -> str:
+    if not path or not os.path.isfile(path):
+        return ""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def get_git_commit(repo_dir: str) -> str:
+    try:
+        out = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=repo_dir, stderr=subprocess.DEVNULL
+        )
+        return out.decode("utf-8").strip()
+    except Exception:
+        return "unknown"
 
 
 def http_json(method: str, url: str, payload=None):
@@ -44,8 +68,9 @@ def http_json(method: str, url: str, payload=None):
 
 
 def parse_sse_client_stream(raw_text: str):
-    """Parse SSE response into reconstructed delta text, event count, and warning codes."""
+    """Parse SSE response into reconstructed content, reconstructed tool args, event count, and structured warning codes."""
     reconstructed = []
+    tool_args_parts = []
     data_events = 0
     sse_codes = []
     sse_status = ""
@@ -79,12 +104,251 @@ def parse_sse_client_stream(raw_text: str):
         if isinstance(obj, dict) and isinstance(obj.get("choices"), list):
             data_events += 1
             for ch in obj["choices"]:
-                if isinstance(ch, dict):
-                    delta = ch.get("delta") or {}
-                    if isinstance(delta, dict) and isinstance(delta.get("content"), str):
-                        reconstructed.append(delta["content"])
+                if not isinstance(ch, dict):
+                    continue
+                delta = ch.get("delta") or {}
+                if not isinstance(delta, dict):
+                    continue
+                if isinstance(delta.get("content"), str):
+                    reconstructed.append(delta["content"])
+                if isinstance(delta.get("tool_calls"), list):
+                    for tc in delta["tool_calls"]:
+                        if isinstance(tc, dict) and isinstance(tc.get("function"), dict):
+                            arg_part = tc["function"].get("arguments")
+                            if isinstance(arg_part, str):
+                                tool_args_parts.append(arg_part)
 
-    return "".join(reconstructed), data_events, sse_codes, sse_status
+    return "".join(reconstructed), "".join(tool_args_parts), data_events, sse_codes, sse_status
+
+
+def extract_json_assistant_outputs(client_body: str):
+    """Extract assistant content string and tool_calls arguments string from JSON response."""
+    try:
+        obj = json.loads(client_body)
+    except Exception:
+        return "", ""
+    if not isinstance(obj, dict):
+        return "", ""
+    choices = obj.get("choices")
+    if isinstance(choices, list) and choices:
+        msg = (choices[0] or {}).get("message") or {}
+        if isinstance(msg, dict):
+            content = msg.get("content") if isinstance(msg.get("content"), str) else ""
+            tcs = msg.get("tool_calls")
+            if isinstance(tcs, list) and tcs:
+                fn = (tcs[0] or {}).get("function") or {}
+                args_str = fn.get("arguments") if isinstance(fn.get("arguments"), str) else ""
+                return content, args_str
+            return content, ""
+    return "", ""
+
+
+def validate_vector_schema(vec: dict, front: str, idx: int):
+    """Enforce mandatory expectations on every vector definition."""
+    required = ["technique", "allowed_statuses", "expect_gateway_status", "expect_upstream_reached"]
+    missing = [k for k in required if k not in vec]
+    if missing:
+        raise ValueError(f"{front}[{idx}] ({vec.get('technique')}) missing mandatory fields: {missing}")
+    if vec["expect_gateway_status"] in ("SANITIZED", "BLOCKED") and not vec.get("expect_codes"):
+        raise ValueError(
+            f"{front}[{idx}] ({vec['technique']}) has status {vec['expect_gateway_status']} but no expect_codes"
+        )
+
+
+def evaluate_vector_assertions(
+    vec: dict,
+    status: int,
+    effective_status: str,
+    structured_codes: list,
+    upstream_reached: bool,
+    upstream_body: str,
+    upstream_sse_fragments: list,
+    client_body: str,
+    assistant_text: str,
+    tool_args_text: str,
+) -> list:
+    """Pure, deterministic 4-stage assertion oracle."""
+    failures = []
+
+    # --- STAGE 2: HTTP Status & Structured Telemetry ONLY ---
+    allowed_statuses = vec["allowed_statuses"]
+    if status not in allowed_statuses:
+        failures.append(f"Stage2 HTTP {status} not in allowed {allowed_statuses}")
+
+    expected_gw_status = vec["expect_gateway_status"]
+    if effective_status != expected_gw_status:
+        failures.append(f"Stage2 status={effective_status!r}, expected {expected_gw_status!r}")
+
+    for req_code in vec.get("expect_codes", []):
+        if req_code not in structured_codes:
+            failures.append(
+                f"Stage2 missing required structured telemetry code {req_code!r} (got {structured_codes})"
+            )
+
+    # --- STAGE 3: Upstream Capture & Pre-Provider Block Invariant ---
+    want_reached = bool(vec["expect_upstream_reached"])
+    if upstream_reached != want_reached:
+        failures.append(f"Stage3 upstream_reached={upstream_reached}, expected {want_reached}")
+
+    for secret_str in vec.get("must_not_reach_upstream", []):
+        if upstream_reached and secret_str in upstream_body:
+            failures.append(f"Stage3 UPSTREAM LEAK: {secret_str!r} reached provider unmasked!")
+
+    expected_mask = vec.get("must_reach_upstream_masked")
+    if expected_mask:
+        if not upstream_reached:
+            failures.append(f"Stage3 expected masked token {expected_mask!r}, but upstream was not reached")
+        elif expected_mask not in upstream_body:
+            failures.append(f"Stage3 DETECTOR MISSED: expected {expected_mask!r} in upstream body")
+
+    expected_verbatim = vec.get("must_reach_upstream_verbatim")
+    if expected_verbatim:
+        if not upstream_reached or expected_verbatim not in upstream_body:
+            failures.append(f"Stage3 FALSE POSITIVE: benign string {expected_verbatim!r} altered/blocked")
+
+    # --- STAGE 4: True Mid-Token SSE Split + Exact Reconstructed Client Output ---
+    if vec.get("require_mid_token_sse_split"):
+        if len(upstream_sse_fragments) < 3:
+            failures.append(f"Stage4 SSE fragmentation too coarse: {len(upstream_sse_fragments)} fragments")
+        else:
+            joined_frags = "".join(upstream_sse_fragments)
+            has_complete_in_joined = bool(
+                RE_JG_TOKEN.search(joined_frags)
+                or RE_AWS_KEY.search(joined_frags)
+                or RE_PEM_FULL.search(joined_frags)
+            )
+            if not has_complete_in_joined:
+                failures.append(
+                    "Stage4 INVALID SSE TEST: joined upstream fragments did not contain a complete token/secret/PEM"
+                )
+            for frag in upstream_sse_fragments:
+                if RE_JG_TOKEN.search(frag):
+                    failures.append(f"Stage4 FAKE SSE SPLIT: intact <JG_PII_...> token in single chunk {frag!r}")
+                if RE_AWS_KEY.search(frag):
+                    failures.append(f"Stage4 FAKE SSE SPLIT: intact AWS key in single chunk {frag!r}")
+                if RE_PEM_FULL.search(frag):
+                    failures.append("Stage4 FAKE SSE SPLIT: intact PEM block in single chunk")
+
+    if "expect_exact_client_text" in vec:
+        want_exact = vec["expect_exact_client_text"]
+        if assistant_text != want_exact:
+            failures.append(
+                f"Stage4 EXACT TEXT MISMATCH: got {assistant_text!r}, expected {want_exact!r}"
+            )
+
+    if "expect_exact_tool_args" in vec:
+        want_args = vec["expect_exact_tool_args"]
+        try:
+            parsed_args = json.loads(tool_args_text)
+            if parsed_args != want_args:
+                failures.append(
+                    f"Stage4 EXACT TOOL ARGS MISMATCH: got {parsed_args!r}, expected {want_args!r}"
+                )
+        except Exception as e:
+            failures.append(f"Stage4 INVALID TOOL ARGS JSON ({e}): {tool_args_text!r}")
+
+    expected_restore = vec.get("must_restore_in_client")
+    if expected_restore and expected_restore not in assistant_text and expected_restore not in client_body:
+        failures.append(f"Stage4 RESTORE FAILED: expected {expected_restore!r} in client delivery")
+
+    for forbidden_client in vec.get("must_not_leak_in_client", []):
+        if (
+            forbidden_client in client_body
+            or forbidden_client in assistant_text
+            or forbidden_client in tool_args_text
+        ):
+            failures.append(f"Stage4 CLIENT LEAK: forbidden {forbidden_client!r} delivered to client!")
+
+    expected_client_marker = vec.get("must_contain_in_client")
+    if expected_client_marker:
+        if expected_client_marker not in client_body and expected_client_marker not in assistant_text:
+            failures.append(f"Stage4 missing expected marker {expected_client_marker!r} in client response")
+
+    return failures
+
+
+def run_mutation_self_test() -> bool:
+    """Q5 Mutation Self-Test: Prove the assertion oracle deterministically rejects unsafe mutations."""
+    print("\n--- [Q5 MUTATION SELF-TEST] Deliberate Unsafe Regression Oracle Check ---")
+    base_vec = {
+        "technique": "mutation_probe",
+        "allowed_statuses": [200],
+        "expect_gateway_status": "SANITIZED",
+        "expect_codes": ["JG-PII-301"],
+        "expect_upstream_reached": True,
+        "require_mid_token_sse_split": True,
+        "must_not_reach_upstream": ["123.456.789-09"],
+        "must_reach_upstream_masked": "<JG_PII_CPF_",
+        "must_not_leak_in_client": ["AKIAIOSFODNN7EXAMPLE"],
+        "expect_exact_client_text": "Upstream received tokens: 123.456.789-09.",
+    }
+
+    mutations = [
+        (
+            "raw_cpf_leaked_to_upstream",
+            dict(
+                status=200,
+                effective_status="SANITIZED",
+                structured_codes=["JG-PII-301"],
+                upstream_reached=True,
+                upstream_body='{"content":"CPF 123.456.789-09 <JG_PII_CPF_0123456789abcdef>"}',
+                upstream_sse_fragments=["<JG_PII_CP", "F_0123456789ab", "cdef>"],
+                client_body="",
+                assistant_text="Upstream received tokens: 123.456.789-09.",
+                tool_args_text="",
+            ),
+        ),
+        (
+            "code_only_in_body_not_structured_telemetry",
+            dict(
+                status=200,
+                effective_status="SANITIZED",
+                structured_codes=[],
+                upstream_reached=True,
+                upstream_body='{"content":"<JG_PII_CPF_0123456789abcdef>"}',
+                upstream_sse_fragments=["<JG_PII_CP", "F_0123456789ab", "cdef>"],
+                client_body="JG-PII-301",
+                assistant_text="Upstream received tokens: 123.456.789-09.",
+                tool_args_text="",
+            ),
+        ),
+        (
+            "unsplit_token_in_single_sse_fragment",
+            dict(
+                status=200,
+                effective_status="SANITIZED",
+                structured_codes=["JG-PII-301"],
+                upstream_reached=True,
+                upstream_body='{"content":"<JG_PII_CPF_0123456789abcdef>"}',
+                upstream_sse_fragments=["Prefix ", "<JG_PII_CPF_0123456789abcdef>", "."],
+                client_body="",
+                assistant_text="Upstream received tokens: 123.456.789-09.",
+                tool_args_text="",
+            ),
+        ),
+        (
+            "truncated_or_duplicated_restoration",
+            dict(
+                status=200,
+                effective_status="SANITIZED",
+                structured_codes=["JG-PII-301"],
+                upstream_reached=True,
+                upstream_body='{"content":"<JG_PII_CPF_0123456789abcdef>"}',
+                upstream_sse_fragments=["<JG_PII_CP", "F_0123456789ab", "cdef>"],
+                client_body="",
+                assistant_text="Upstream received tokens: 123.456.789-09 123.456.789-09",
+                tool_args_text="",
+            ),
+        ),
+    ]
+
+    for m_name, kwargs in mutations:
+        errs = evaluate_vector_assertions(base_vec, **kwargs)
+        if not errs:
+            print(f"  [ABORT] Mutation self-test FAILED to reject unsafe mutation: {m_name}")
+            return False
+    print(f"  [OK] Mutation self-test PASSED: all {len(mutations)} unsafe regressions deterministically rejected.")
+    return True
 
 
 def run_positive_control(mock_url: str) -> bool:
@@ -108,23 +372,56 @@ def run_positive_control(mock_url: str) -> bool:
     return True
 
 
+def compact_synthetic_padding(s: str) -> str:
+    if len(s) > 4096 and "PPPPPPPPPPPPPPPPPPPP" in s:
+        return re.sub(r"P{256,}", lambda m: f"<SYNTHETIC_PADDING_{len(m.group(0))}_BYTES>", s)
+    return s
+
+
 def main():
     gateway_url = sys.argv[1].rstrip("/") if len(sys.argv) > 1 else "http://127.0.0.1:4010"
     mock_url = sys.argv[2].rstrip("/") if len(sys.argv) > 2 else "http://127.0.0.1:4020"
-
     script_dir = os.path.dirname(os.path.abspath(__file__))
+    repo_root = os.path.abspath(os.path.join(script_dir, "..", "..", "..", ".."))
+    binary_path = sys.argv[3] if len(sys.argv) > 3 else os.path.join(repo_root, "jgate")
+    fixture_path = sys.argv[4] if len(sys.argv) > 4 else os.path.join(script_dir, "jaguargate.audit.yaml")
+
     vectors_path = os.path.join(script_dir, "test_vectors.json")
+    mock_script_path = os.path.join(script_dir, "mock_upstream.py")
     report_path = os.path.join(script_dir, "..", "findings", "full_campaign_report.json")
 
     with open(vectors_path, "r", encoding="utf-8") as f:
         vectors = json.load(f)
 
-    print("=" * 88)
-    print("  JAGUARGATE GATE 5 — 4-STAGE BILATERAL AUDIT VERIFIER")
+    for front_name, rounds in vectors.items():
+        for idx, vec in enumerate(rounds, 1):
+            validate_vector_schema(vec, front_name, idx)
+
+    fixture_text = ""
+    if os.path.isfile(fixture_path):
+        with open(fixture_path, "r", encoding="utf-8") as ff:
+            fixture_text = ff.read()
+
+    provenance = {
+        "git_commit": get_git_commit(repo_root),
+        "jgate_binary_sha256": sha256_file(binary_path),
+        "reproduce_audit_sha256": sha256_file(os.path.abspath(__file__)),
+        "mock_upstream_sha256": sha256_file(mock_script_path),
+        "test_vectors_sha256": sha256_file(vectors_path),
+        "config_fixture_sha256": sha256_file(fixture_path),
+        "effective_config_yaml": fixture_text,
+    }
+
+    print("=" * 90)
+    print("  JAGUARGATE GATE 5 — STRICT 4-STAGE BILATERAL AUDIT VERIFIER")
     print(f"  Gateway Target:  {gateway_url}")
     print(f"  Upstream Mock:   {mock_url}")
-    print("=" * 88)
+    print(f"  Git Commit:      {provenance['git_commit'][:12]}")
+    print(f"  Binary SHA-256:  {provenance['jgate_binary_sha256'][:16]}...")
+    print("=" * 90)
 
+    if not run_mutation_self_test():
+        sys.exit(2)
     if not run_positive_control(mock_url):
         sys.exit(2)
 
@@ -134,14 +431,13 @@ def main():
     evidence_log = []
 
     for front_name, rounds in vectors.items():
-        print(f"\n--- [{front_name}] Executing {len(rounds)} 4-stage bilateral vectors ---")
+        print(f"\n--- [{front_name}] Executing {len(rounds)} strict 4-stage bilateral vectors ---")
         for i, vec in enumerate(rounds, 1):
             total_probes += 1
             tech = vec["technique"]
             endpoint = vec.get("endpoint", "/v1/chat/completions")
             headers = dict(vec.get("headers", {"Content-Type": "application/json"}))
 
-            # Reset mock capture before each probe so Stage 3 is 100% isolated
             http_json("POST", f"{mock_url}/_mock/reset")
 
             if "raw_body" in vec:
@@ -175,12 +471,10 @@ def main():
                 status = e.code
                 resp_headers = {k.lower(): v for k, v in e.headers.items()}
             except Exception as e:
-                elapsed_ms = (time.perf_counter() - t0) * 1000
                 findings.append({"front": front_name, "round": i, "technique": tech, "error": str(e)})
-                print(f"  [FAIL] r{i:02d} {tech:<44} -> transport error: {e}")
+                print(f"  [FAIL] r{i:02d} {tech:<46} -> transport error: {e}")
                 continue
 
-            # Stage 3 & Stage 4a: Inspect what actually reached mock_upstream and what it sent back
             _, cap = http_json("GET", f"{mock_url}/_mock/last_request")
             last_req = cap.get("last_request")
             upstream_reached = last_req is not None
@@ -189,85 +483,34 @@ def main():
             upstream_resp_sent = last_req.get("response_content_sent", "") if last_req else ""
             upstream_sse_fragments = last_req.get("sse_fragments_sent", []) if last_req else []
 
-            # Parse Stage 2 & Stage 4b telemetry (headers + SSE reconstructed text/warnings)
             is_sse_client = "text/event-stream" in resp_headers.get("content-type", "").lower()
-            reconstructed_text = ""
-            client_sse_events = 0
-            sse_codes = []
-            sse_status = ""
             if is_sse_client:
-                reconstructed_text, client_sse_events, sse_codes, sse_status = parse_sse_client_stream(client_body)
+                assistant_text, tool_args_text, client_sse_events, sse_codes, sse_status = parse_sse_client_stream(
+                    client_body
+                )
+            else:
+                assistant_text, tool_args_text = extract_json_assistant_outputs(client_body)
+                client_sse_events = 0
+                sse_codes = []
+                sse_status = ""
 
             hdr_status = resp_headers.get("x-jaguargate-status", "")
             effective_status = sse_status or hdr_status
             hdr_codes = [c.strip() for c in resp_headers.get("x-jaguargate-codes", "").split(",") if c.strip()]
-            all_codes = list(dict.fromkeys(hdr_codes + sse_codes))
-            effective_client_text = reconstructed_text if is_sse_client else client_body
+            structured_codes = list(dict.fromkeys(hdr_codes + sse_codes))
 
-            failures = []
-
-            # --- STAGE 2 ASSERTIONS (Gateway Decision & Telemetry) ---
-            allowed_statuses = vec.get("allowed_statuses", [200])
-            if status not in allowed_statuses:
-                failures.append(f"Stage2 HTTP {status} not in allowed {allowed_statuses}")
-
-            expected_gw_status = vec.get("expect_gateway_status")
-            if expected_gw_status and effective_status != expected_gw_status:
-                failures.append(f"Stage2 status={effective_status!r}, expected {expected_gw_status!r}")
-
-            for req_code in vec.get("expect_codes", []):
-                if req_code not in all_codes and req_code not in client_body:
-                    failures.append(f"Stage2 missing required code {req_code!r} (got codes={all_codes})")
-
-            # --- STAGE 3 ASSERTIONS (Upstream Arrival / Pre-Upstream Block) ---
-            if "expect_upstream_reached" in vec:
-                want_reached = bool(vec["expect_upstream_reached"])
-                if upstream_reached != want_reached:
-                    failures.append(f"Stage3 upstream_reached={upstream_reached}, expected {want_reached}")
-
-            for secret_str in vec.get("must_not_reach_upstream", []):
-                if upstream_reached and secret_str in upstream_body:
-                    failures.append(f"Stage3 UPSTREAM LEAK: {secret_str!r} reached provider unmasked!")
-
-            expected_mask = vec.get("must_reach_upstream_masked")
-            if expected_mask:
-                if not upstream_reached:
-                    failures.append(f"Stage3 expected masked token {expected_mask!r}, but upstream was not reached")
-                elif expected_mask not in upstream_body:
-                    failures.append(f"Stage3 DETECTOR MISSED: expected {expected_mask!r} in upstream body")
-
-            expected_verbatim = vec.get("must_reach_upstream_verbatim")
-            if expected_verbatim:
-                if not upstream_reached or expected_verbatim not in upstream_body:
-                    failures.append(f"Stage3 FALSE POSITIVE: benign string {expected_verbatim!r} altered/blocked")
-
-            # --- STAGE 4 ASSERTIONS (Upstream Egress / True SSE Fragmentation -> Client Delivery) ---
-            if vec.get("require_mid_token_sse_split"):
-                if len(upstream_sse_fragments) < 3:
-                    failures.append(
-                        f"Stage4 SSE fragmentation too coarse: only {len(upstream_sse_fragments)} fragments sent"
-                    )
-                else:
-                    for frag in upstream_sse_fragments:
-                        if RE_JG_TOKEN.search(frag):
-                            failures.append(f"Stage4 FAKE SSE SPLIT: full <JG_PII_...> token found intact in one chunk {frag!r}")
-                        if RE_AWS_KEY.search(frag):
-                            failures.append(f"Stage4 FAKE SSE SPLIT: full AWS key found intact in one chunk {frag!r}")
-
-            expected_restore = vec.get("must_restore_in_client")
-            if expected_restore and expected_restore not in effective_client_text:
-                failures.append(
-                    f"Stage4 RESTORE FAILED: expected {expected_restore!r} in client delivery ({effective_client_text[:160]!r})"
-                )
-
-            for forbidden_client in vec.get("must_not_leak_in_client", []):
-                if forbidden_client in client_body or forbidden_client in effective_client_text:
-                    failures.append(f"Stage4 CLIENT LEAK: forbidden {forbidden_client!r} delivered to client!")
-
-            expected_client_marker = vec.get("must_contain_in_client")
-            if expected_client_marker:
-                if expected_client_marker not in client_body and expected_client_marker not in effective_client_text:
-                    failures.append(f"Stage4 missing expected marker {expected_client_marker!r} in client response")
+            failures = evaluate_vector_assertions(
+                vec=vec,
+                status=status,
+                effective_status=effective_status,
+                structured_codes=structured_codes,
+                upstream_reached=upstream_reached,
+                upstream_body=upstream_body,
+                upstream_sse_fragments=upstream_sse_fragments,
+                client_body=client_body,
+                assistant_text=assistant_text,
+                tool_args_text=tool_args_text,
+            )
 
             entry = {
                 "front": front_name,
@@ -278,26 +521,27 @@ def main():
                     "endpoint": endpoint,
                     "session_id": headers.get("X-JaguarGate-Session-ID", "default_session"),
                     "body_bytes": len(data),
-                    "body_preview": ingress_text[:280],
+                    "body": compact_synthetic_padding(ingress_text),
                 },
                 "stage2_gateway_decision": {
                     "http_status": status,
                     "x_jaguargate_status": effective_status,
                     "x_jaguargate_severity": resp_headers.get("x-jaguargate-severity", ""),
-                    "x_jaguargate_codes": all_codes,
+                    "x_jaguargate_codes": structured_codes,
                     "x_jaguargate_veto": resp_headers.get("x-jaguargate-veto", ""),
                 },
                 "stage3_upstream_capture": {
                     "upstream_reached": upstream_reached,
-                    "body_preview": upstream_body[:320],
+                    "body": compact_synthetic_padding(upstream_body),
                 },
                 "stage4_egress_delivery": {
                     "response_mode": upstream_resp_mode,
-                    "upstream_response_sent": upstream_resp_sent[:240],
+                    "upstream_response_sent": upstream_resp_sent,
                     "upstream_sse_fragments": upstream_sse_fragments,
                     "client_sse_events_count": client_sse_events,
-                    "reconstructed_client_text": reconstructed_text[:240] if is_sse_client else "",
-                    "client_body_preview": client_body[:320],
+                    "reconstructed_assistant_text": assistant_text,
+                    "reconstructed_tool_arguments": tool_args_text,
+                    "client_body": client_body,
                 },
                 "passed": len(failures) == 0,
                 "failures": failures,
@@ -306,20 +550,22 @@ def main():
 
             if failures:
                 findings.append(entry)
-                print(f"  [FAIL] r{i:02d} {tech:<44} -> HTTP {status} | {'; '.join(failures)}")
+                print(f"  [FAIL] r{i:02d} {tech:<46} -> HTTP {status} | {'; '.join(failures)}")
             else:
                 passed_probes += 1
                 print(
-                    f"  [PASS] r{i:02d} {tech:<44} -> HTTP {status} [{effective_status or 'N/A'} {','.join(all_codes) or '-'}] ({elapsed_ms:.1f}ms)"
+                    f"  [PASS] r{i:02d} {tech:<46} -> HTTP {status} [{effective_status} {','.join(structured_codes) or '-'}] ({elapsed_ms:.1f}ms)"
                 )
 
     os.makedirs(os.path.dirname(report_path), exist_ok=True)
     with open(report_path, "w", encoding="utf-8") as f:
         json.dump(
             {
-                "suite": "JaguarGate Gate 5 — 4-Stage Bilateral Audit",
+                "suite": "JaguarGate Gate 5 — Strict 4-Stage Bilateral Audit",
+                "provenance": provenance,
                 "gateway_url": gateway_url,
                 "mock_upstream_url": mock_url,
+                "mutation_self_test_passed": True,
                 "positive_control_passed": True,
                 "total_probes": total_probes,
                 "passed_probes": passed_probes,
@@ -331,15 +577,17 @@ def main():
             ensure_ascii=False,
         )
 
-    print("\n" + "=" * 88)
+    print("\n" + "=" * 90)
     print(f" RESULTS: Executed {total_probes} | Passed {passed_probes} | Findings: {len(findings)}")
     print(f" Evidence saved to: {os.path.abspath(report_path)}")
-    print("=" * 88)
+    print("=" * 90)
     if findings:
         print(" [FAIL] Bilateral Gate 5 verification detected failures.")
         sys.exit(1)
     else:
-        print(f" [PASS] All {passed_probes}/{total_probes} 4-stage bilateral vectors passed under tested configuration.")
+        print(
+            f" [PASS] All {passed_probes}/{total_probes} strict 4-stage bilateral vectors passed with provenance."
+        )
         sys.exit(0)
 
 

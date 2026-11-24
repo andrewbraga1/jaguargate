@@ -1,10 +1,10 @@
-# 🛡️ JaguarGate Gate 5 Cognitive Red-Team Evaluation Matrix
+# 🛡️ [HISTORICAL ARCHIVE] JaguarGate Gate 5 Evaluation Matrix (`6d2057e`)
 
-> **Target Version:** JaguarGate `6d2057e` (Zero-Nosec, SAST Clean)  
-> **Evaluation Engine:** Maestro Software Foundry Cognitive Red-Team Engine v2  
-> **Auditor Role:** `@red-team-hacker` (COBIT SoD Layer 5)  
-> **Verdict:** **CERTIFIED (`gate_5_approved: true`)**  
-> **Date:** 2026-11-17  
+> [!WARNING]
+> **Historical Record Notice:** This document preserves the legacy 30-round baseline recorded on **2026-11-17** against commit `6d2057e` (prior to the 4-Stage Bilateral Invariant Protocol). It does **not** represent the current verification standard or active findings. For the current 40-vector 4-Stage Bilateral Verification Report, provenance hashes, and reproducible upstream/client captures, refer to [`../CERTIFICATE_GATE5.md`](../CERTIFICATE_GATE5.md) and [`./full_campaign_report.json`](./full_campaign_report.json).
+
+> **Archived Target Version:** JaguarGate `6d2057e`  
+> **Historical Date:** 2026-11-17  
 
 ---
 

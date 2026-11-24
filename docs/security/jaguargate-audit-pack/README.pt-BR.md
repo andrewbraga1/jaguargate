@@ -1,12 +1,12 @@
 # 🛡️ JaguarGate Gate 5 — Pacote de Verificação Bilateral 4 Quadrantes
 
-[![Bilateral Suite](https://img.shields.io/badge/Su%C3%ADte%20Bilateral-34%2F34%20Verificados-blue.svg)](#)
+[![Bilateral Suite](https://img.shields.io/badge/Su%C3%ADte%20Bilateral-40%2F40%20Verificados-blue.svg)](#)
 [![GoSec SAST](https://img.shields.io/badge/GoSec%20SAST-0%20Issues%20%7C%200%20Nosec-success.svg)](#)
 [![Govulncheck](https://img.shields.io/badge/Govulncheck-0%20CVEs%20Alcan%C3%A7%C3%A1veis-success.svg)](#)
 
-Este diretório contém o pacote reproduzível da **Suíte Automatizada de Verificação Bilateral em 4 Estágios** do **JaguarGate**.
+Este diretório contém o pacote reproduzível da **Suíte Automatizada Estrita de Verificação Bilateral em 4 Estágios** do **JaguarGate** (executada automaticamente no `.github/workflows/ci.yml`).
 
-> **Nota de Escopo:** Esta é uma bateria automatizada interna que registra e compara os 4 estágios em todos os vetores: Ingresso (Estágio 1), Decisão/Códigos do Gateway (Estágio 2), Captura Efetiva no Upstream ou prova `upstream_reached: false` em bloqueio pré-provedor (Estágio 3) e Fragmentos SSE/Resposta do Upstream vs. Entrega Reconstruída ao Cliente (Estágio 4), além do controle positivo direto sem gateway (Q4). Os resultados são delimitados exatamente aos 34 vetores sintéticos e à configuração testada, não substituindo pentest externo independente.
+> **Nota de Escopo:** Esta é uma bateria automatizada interna que registra payloads integrais, hashes SHA-256 de proveniência e compara os 4 estágios em todos os vetores: Ingresso (Estágio 1), Decisão/Códigos Estruturados do Gateway (Estágio 2), Captura Efetiva no Upstream ou prova `upstream_reached: false` em bloqueio pré-provedor (Estágio 3) e Fragmentos SSE/Resposta do Upstream vs. Reconstrução Exata no Cliente (Estágio 4), além do controle positivo direto (Q4) e do auto-teste de mutação insegura do oráculo (Q5). Os resultados são delimitados exatamente aos 40 vetores sintéticos e à fixture versionada `jaguargate.audit.yaml`, não substituindo pentest externo independente.
 
 ---
 

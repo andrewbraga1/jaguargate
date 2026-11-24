@@ -185,6 +185,18 @@ func TestPIIVaultTableDrivenAllEntitiesAndCNPJFormats(t *testing.T) {
 			shouldMask:   true,
 		},
 		{
+			name:         "Phone_BR_Landline_Raw_Unformatted_JG_R6",
+			rawSecret:    "1132345678",
+			expectedCode: "JG-PII-301",
+			shouldMask:   true,
+		},
+		{
+			name:         "Phone_BR_Landline_CountryRaw",
+			rawSecret:    "+551132345678",
+			expectedCode: "JG-PII-301",
+			shouldMask:   true,
+		},
+		{
 			name:         "Email_Corporate",
 			rawSecret:    "seguranca@jaguargate.io",
 			expectedCode: "JG-PII-301",
@@ -239,6 +251,18 @@ func TestPIIVaultTableDrivenAllEntitiesAndCNPJFormats(t *testing.T) {
 		{
 			name:         "FalsePositive_11DigitOrderID_InvalidMod11_NonPhone",
 			rawSecret:    "11122233344",
+			expectedCode: "",
+			shouldMask:   false,
+		},
+		{
+			name:         "FalsePositive_InvalidDDDZero_10Digits",
+			rawSecret:    "1032345678",
+			expectedCode: "",
+			shouldMask:   false,
+		},
+		{
+			name:         "FalsePositive_UnixTimestamp_10Digits",
+			rawSecret:    "1700000000",
 			expectedCode: "",
 			shouldMask:   false,
 		},
@@ -847,6 +871,172 @@ func TestMessageNestedMetadataAndBatchArrayPIIMasking(t *testing.T) {
 	}
 	if !strings.Contains(batchStr, "<JG_PII_CPF_") || batchRes.PrunedTools != 1 {
 		t.Errorf("expected masked CPF and 1 pruned tool in batch array, got pruned=%d body=%s", batchRes.PrunedTools, batchStr)
+	}
+}
+
+func TestToolDefinitionsSchemasPIIAndAnthropicSystem(t *testing.T) {
+	vault := NewPIIVault()
+	engine := NewEngine(vault)
+	cfg := config.DefaultConfig()
+	cfg.ApplyPreset()
+	cfg.Whitelist.EnforceToolWhitelist = true
+	cfg.Whitelist.AllowedTools = []string{"lookup_customer"}
+
+	// Allowed tool containing synthetic CPF in description and parameter schema default/description
+	// PLUS Anthropic top-level system array
+	payload := []byte(`{
+		"model": "claude-sonnet-4-5",
+		"system": [
+			{"type": "text", "text": "Operador responsável CPF 52998224725."}
+		],
+		"tools": [
+			{
+				"type": "function",
+				"function": {
+					"name": "lookup_customer",
+					"description": "Busca cliente exemplo CPF 123.456.789-09 ou fixo 1132345678",
+					"parameters": {
+						"type": "object",
+						"properties": {
+							"doc": {
+								"type": "string",
+								"description": "Exemplo padrao 52998224725",
+								"default": "123.456.789-09"
+							}
+						},
+						"required": ["doc"]
+					}
+				}
+			}
+		],
+		"messages": [
+			{"role": "user", "content": "Execute busca"}
+		]
+	}`)
+
+	res := engine.InspectJSONPayloadWithSession(payload, "sess-tool-schema", &cfg)
+	mod := string(res.ModifiedBody)
+
+	for _, rawLeak := range []string{"123.456.789-09", "52998224725", "1132345678"} {
+		if strings.Contains(mod, rawLeak) {
+			t.Fatalf("SECURITY FAILURE (JG-R1 tools/system): raw PII %q survived in upstream request:\n%s", rawLeak, mod)
+		}
+	}
+	// Tool contract name and schema structural keywords must remain intact
+	if !strings.Contains(mod, `"name":"lookup_customer"`) || !strings.Contains(mod, `"type":"object"`) || !strings.Contains(mod, `"required":["doc"]`) {
+		t.Fatalf("tool schema structure was corrupted:\n%s", mod)
+	}
+	// Anthropic messages[] must NOT have invalid {"role":"system"} prepended when top-level system exists
+	if strings.Contains(mod, `"role":"system"`) {
+		t.Fatalf("Anthropic messages[] corrupted by prepended role:system when top-level system was present:\n%s", mod)
+	}
+	if !strings.Contains(mod, "[JG-CANARY:") {
+		t.Errorf("expected Canary token injected into top-level Anthropic system block:\n%s", mod)
+	}
+}
+
+func TestOutputToolCallArgumentsActiveDLPAndFullPEM(t *testing.T) {
+	vault := NewPIIVault()
+	engine := NewEngine(vault)
+	cfg := config.DefaultConfig()
+	cfg.ApplyPreset()
+
+	// Mask CPF on ingress so we also verify PII restoration inside tool arguments alongside JG-SEC-503 secret redaction
+	maskedIn, _, _ := vault.MaskTextWithSession("sess-out-tools", "CPF 52998224725", cfg.Guards.PIIVault, false)
+	tokIdx := strings.Index(maskedIn, "<JG_PII_CPF_")
+	piiToken := maskedIn[tokIdx:]
+
+	pemHeader := "-----" + "BEGIN RSA PRIVATE KEY" + "-----"
+	pemFooter := "-----" + "END RSA PRIVATE KEY" + "-----"
+	pemBody := "MIIETESTSYNTHETICKEYMATERIAL0000111122223333444455556666777788889999AAAABBBBCCCCDDDDEEEEFFFF"
+
+	// 1. OpenAI non-streaming tool_calls with spontaneous AWS secret + full PEM block + echoed PII token
+	openAIResp := fmt.Appendf(nil, `{
+		"choices": [{
+			"index": 0,
+			"message": {
+				"role": "assistant",
+				"content": null,
+				"tool_calls": [{
+					"id": "call_1",
+					"type": "function",
+					"function": {
+						"name": "send_audit",
+						"arguments": "{\"cpf\":%q,\"aws\":\"AKIAZ9X8W7V6U5T4S3R2\",\"pem\":\"%s\\n%s\\n%s\"}"
+					}
+				}]
+			}
+		}]
+	}`, piiToken, pemHeader, pemBody, pemFooter)
+
+	outOA := engine.SanitizeOutputJSON(openAIResp, InspectionResult{SessionID: "sess-out-tools"}, &cfg)
+	outOAStr := string(outOA.ModifiedBody)
+	if strings.Contains(outOAStr, "AKIAZ9X8W7V6U5T4S3R2") || strings.Contains(outOAStr, pemBody) || strings.Contains(outOAStr, pemFooter) {
+		t.Fatalf("SECURITY FAILURE (JG-R2/JG-R3): secret or PEM body survived in OpenAI tool_calls arguments:\n%s", outOAStr)
+	}
+	if !strings.Contains(outOAStr, "52998224725") {
+		t.Errorf("expected authorized CPF restored inside OpenAI tool_calls arguments:\n%s", outOAStr)
+	}
+	if !slices.Contains(outOA.Codes, "JG-SEC-503") {
+		t.Errorf("expected JG-SEC-503 for spontaneous secret in OpenAI tool arguments, got %v", outOA.Codes)
+	}
+
+	// 2. Anthropic non-streaming tool_use.input with spontaneous secret & PEM
+	anthResp := fmt.Appendf(nil, `{
+		"id": "msg_1",
+		"type": "message",
+		"role": "assistant",
+		"content": [{
+			"type": "tool_use",
+			"id": "toolu_1",
+			"name": "send_audit",
+			"input": {
+				"cpf": %q,
+				"secret": "sk-proj-99887766554433221100aabbccddeeff",
+				"pem_truncated": "%s\n%s"
+			}
+		}]
+	}`, piiToken, pemHeader, pemBody)
+
+	outAnth := engine.SanitizeOutputJSON(anthResp, InspectionResult{SessionID: "sess-out-tools"}, &cfg)
+	outAnthStr := string(outAnth.ModifiedBody)
+	if strings.Contains(outAnthStr, "sk-proj-99887766554433221100") || strings.Contains(outAnthStr, pemBody) {
+		t.Fatalf("SECURITY FAILURE (JG-R2/JG-R3): secret or truncated PEM body survived in Anthropic tool_use.input:\n%s", outAnthStr)
+	}
+	if !strings.Contains(outAnthStr, "52998224725") {
+		t.Errorf("expected CPF restored in Anthropic tool_use.input:\n%s", outAnthStr)
+	}
+
+	// 3. Ingress full PEM masking check (PROACTIVE-02)
+	inPEM := fmt.Sprintf("Chave privada enviada: %s\n%s\n%s fim.", pemHeader, pemBody, pemFooter)
+	maskedPEM, pemCodes, _ := vault.MaskTextWithSession("sess-in-pem", inPEM, cfg.Guards.PIIVault, false)
+	if strings.Contains(maskedPEM, pemBody) || strings.Contains(maskedPEM, pemHeader) || strings.Contains(maskedPEM, pemFooter) {
+		t.Fatalf("SECURITY FAILURE: PEM key material leaked on ingress: %s", maskedPEM)
+	}
+	if !strings.Contains(maskedPEM, "<JG_PII_PRIVKEY_") || !slices.Contains(pemCodes, "JG-PII-302") {
+		t.Errorf("expected <JG_PII_PRIVKEY_ token and JG-PII-302, got %s (%v)", maskedPEM, pemCodes)
+	}
+	// Must NOT restore PRIVKEY when echoed on output
+	if strings.Contains(vault.RestoreTextWithSession("sess-in-pem", maskedPEM), pemBody) {
+		t.Fatalf("SECURITY FAILURE: vaulted PRIVKEY was restored on output!")
+	}
+}
+
+func TestLegacyL2CustomSecretFailClosed(t *testing.T) {
+	legacyL2 := &mockExternalKV{
+		data: map[string]string{
+			// Legacy format ("sessionID\x00rawValue") without JSON envelope for a custom secret pattern
+			"<JG_PII_INTERNAL_CORP_KEY_0123456789abcdef0123456789abcdef>": "sess-legacy\x00SUPER_SECRET_CORP_TOKEN_999",
+		},
+	}
+	// Cold L1 vault backed by L2 containing pre-upgrade legacy record
+	vault := NewPIIVault()
+	vault.SetExternalStore(legacyL2)
+
+	echoed := "Token retornado: <JG_PII_INTERNAL_CORP_KEY_0123456789abcdef0123456789abcdef>"
+	restored := vault.RestoreTextWithSession("sess-legacy", echoed)
+	if strings.Contains(restored, "SUPER_SECRET_CORP_TOKEN_999") {
+		t.Fatalf("SECURITY FAILURE (JG-R4): legacy custom secret token without JSON classification was restored by default: %s", restored)
 	}
 }
 

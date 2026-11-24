@@ -45,3 +45,6 @@ jobs:
 
       - name: Execute built-in OWASP & MCP Red-Teaming Suite (jgate pounce)
         run: ./jgate pounce
+
+      - name: Execute Gate 5 Self-Contained 4-Stage Bilateral Audit Suite
+        run: bash docs/security/jaguargate-audit-pack/reproduce/run_reproduce.sh 4010 4020

@@ -14,20 +14,6 @@ import (
 	"github.com/andrewbraga1/jaguargate/internal/config"
 )
 
-var (
-	reVaultCPF        = regexp.MustCompile(`\b\d{3}\.\d{3}\.\d{3}-\d{2}\b`)
-	reVaultCPFRaw     = regexp.MustCompile(`\b\d{11}\b`)
-	reVaultCNPJ       = regexp.MustCompile(`\b(?:[A-Za-z0-9]{2}\.[A-Za-z0-9]{3}\.[A-Za-z0-9]{3}/[A-Za-z0-9]{4}-\d{2}|[A-Za-z0-9]{8}/[A-Za-z0-9]{4}-\d{2}|\d{14})\b`)
-	reVaultCreditCard = regexp.MustCompile(`\b\d(?:[ -]?\d){12,18}\b`)
-	reVaultPhone      = regexp.MustCompile(`(?:\+?55[\s-]?)?(?:\([1-9][0-9]\)|\b[1-9][0-9])[\s-]?9\d{4}[\s-]?\d{4}\b|(?:\+?55[\s-]?)?\([1-9][0-9]\)[\s-]?[2-5]\d{3}[\s-]?\d{4}\b`)
-	reVaultEmail      = regexp.MustCompile(`\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b`)
-	reVaultAWSKey     = regexp.MustCompile(`\bAKIA[0-9A-Z]{16}\b`)
-	reVaultAPISecret  = regexp.MustCompile(`\b(?:sk-[A-Za-z0-9_-]{16,}|ghp_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{10,})\b`)
-	reVaultJWT        = regexp.MustCompile(`\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b`)
-	reVaultPrivateKey = regexp.MustCompile(`(?i)-----BEGIN(?: [A-Z0-9]+)? PRIVATE KEY-----`)
-	reVaultToken      = regexp.MustCompile(`\x3cJG_PII_[A-Z0-9_]+_[0-9a-f]{8,32}\x3e`)
-)
-
 var customRegexCache sync.Map
 
 func getOrCompileRegex(pattern string) (*regexp.Regexp, error) {
@@ -164,47 +150,21 @@ func (v *PIIVault) MaskTextWithSession(sessionID, input string, cfg config.PIIVa
 		})
 	}
 
-	cpfRe := resolvePattern(cfg.PatternOverrides.CPF, reVaultCPF)
-	cnpjRe := resolvePattern(cfg.PatternOverrides.CNPJ, reVaultCNPJ)
-	cardOverride := strings.TrimSpace(cfg.PatternOverrides.CreditCard)
-	cardRe := resolvePattern(cardOverride, reVaultCreditCard)
-	phoneRe := resolvePattern(cfg.PatternOverrides.Phone, reVaultPhone)
-	emailRe := resolvePattern(cfg.PatternOverrides.Email, reVaultEmail)
-	awsRe := resolvePattern(cfg.PatternOverrides.AWSKeys, reVaultAWSKey)
-	secretRe := resolvePattern(cfg.PatternOverrides.APISecrets, reVaultAPISecret)
-	jwtRe := resolvePattern(cfg.PatternOverrides.JWTTokens, reVaultJWT)
-
-	if cfg.Entities.CPF {
-		replaceEntity(cpfRe, "CPF", false, nil)
-		// Also detect unformatted 11-digit CPF validated via Brazilian Mod 11 checksum
-		if strings.TrimSpace(cfg.PatternOverrides.CPF) == "" {
-			replaceEntity(reVaultCPFRaw, "CPF", false, isValidCPFMod11)
+	// Evaluate declarative built-in detector catalog in priority order (Secrets -> Numeric/Text PII)
+	for _, spec := range builtinEntityDetectors {
+		if !spec.Enabled(cfg.Entities) {
+			continue
 		}
-	}
-	if cfg.Entities.CNPJ {
-		replaceEntity(cnpjRe, "CNPJ", false, nil)
-	}
-	if cfg.Entities.CreditCard {
-		var cardValidator func(string) bool
-		if cardOverride == "" {
-			cardValidator = isValidLuhn
+		overrideStr := strings.TrimSpace(spec.Override(cfg.PatternOverrides))
+		if spec.SkipOnOverride && overrideStr != "" {
+			continue
 		}
-		replaceEntity(cardRe, "CARD", false, cardValidator)
-	}
-	if cfg.Entities.Phone {
-		replaceEntity(phoneRe, "PHONE", false, nil)
-	}
-	if cfg.Entities.Email {
-		replaceEntity(emailRe, "EMAIL", false, nil)
-	}
-	if cfg.Entities.AWSKeys {
-		replaceEntity(awsRe, "AWSKEY", true, nil)
-	}
-	if cfg.Entities.APISecrets {
-		replaceEntity(secretRe, "SECRET", true, nil)
-	}
-	if cfg.Entities.JWTTokens {
-		replaceEntity(jwtRe, "JWT", true, nil)
+		re := resolvePattern(overrideStr, spec.DefaultRegex)
+		var validator func(string) bool
+		if overrideStr == "" {
+			validator = spec.Validator
+		}
+		replaceEntity(re, spec.Label, spec.IsSecret, validator)
 	}
 
 	for _, cp := range cfg.CustomPatterns {
@@ -246,11 +206,30 @@ func (v *PIIVault) RestoreTextWithSession(sessionID, output string) string {
 // RestoreTextWithOptions replaces active tokens belonging to sessionID, respecting the restoreSecrets policy.
 // When restoreSecrets is false (the secure default), entries marked isSecret=true remain masked even if echoed by the LLM.
 func (v *PIIVault) RestoreTextWithOptions(sessionID, output string, restoreSecrets bool) string {
+	return v.restoreInternal(sessionID, output, restoreSecrets, false)
+}
+
+// RestoreTextJSONSafeWithOptions restores active tokens inside a raw JSON string stream (e.g. SSE tool arguments),
+// JSON-escaping only the substituted PII value so surrounding JSON structure remains valid.
+func (v *PIIVault) RestoreTextJSONSafeWithOptions(sessionID, output string, restoreSecrets bool) string {
+	return v.restoreInternal(sessionID, output, restoreSecrets, true)
+}
+
+func (v *PIIVault) restoreInternal(sessionID, output string, restoreSecrets, jsonEscapeVal bool) string {
 	if output == "" {
 		return ""
 	}
 	if sessionID == "" {
 		sessionID = "default_session"
+	}
+	formatVal := func(val string) string {
+		if !jsonEscapeVal {
+			return val
+		}
+		if b, err := json.Marshal(val); err == nil && len(b) >= 2 {
+			return string(b[1 : len(b)-1])
+		}
+		return val
 	}
 	now := time.Now()
 	return reVaultToken.ReplaceAllStringFunc(output, func(token string) string {
@@ -266,7 +245,7 @@ func (v *PIIVault) RestoreTextWithOptions(sessionID, output string, restoreSecre
 			if entry.isSecret && !restoreSecrets {
 				return token
 			}
-			return entry.originalValue
+			return formatVal(entry.originalValue)
 		}
 
 		if ext != nil {
@@ -278,7 +257,7 @@ func (v *PIIVault) RestoreTextWithOptions(sessionID, output string, restoreSecre
 					if env.IsSecret && !restoreSecrets {
 						return token
 					}
-					return env.OriginalValue
+					return formatVal(env.OriginalValue)
 				}
 			}
 		}
@@ -354,18 +333,18 @@ func decodeVaultEnvelope(token, stored string) (vaultEnvelope, bool) {
 			return env, true
 		}
 	}
-	// Legacy fallback: "sessionID\x00rawValue" — fail-closed on known secret token prefixes
+	// Legacy fallback ("sessionID\x00rawValue") lacks reliable IsSecret metadata:
+	// fail-closed (IsSecret=true) for ALL legacy records so unclassified or custom secret
+	// tokens persisted before upgrade are never restored by default.
 	ownerSess, rawVal, ok := splitSessionBoundValue(stored)
 	if !ok {
 		return vaultEnvelope{}, false
 	}
-	inferredSecret := strings.HasPrefix(token, "\x3cJG_PII_AWSKEY_") ||
-		strings.HasPrefix(token, "\x3cJG_PII_SECRET_") ||
-		strings.HasPrefix(token, "\x3cJG_PII_JWT_")
+	_ = token
 	return vaultEnvelope{
 		SessionID:     ownerSess,
 		OriginalValue: rawVal,
-		IsSecret:      inferredSecret,
+		IsSecret:      true,
 	}, true
 }
 
@@ -481,16 +460,13 @@ func RedactSecretsInText(text string, cfg config.PIIVaultConfig, replacement str
 		}
 	}
 
-	if cfg.Entities.AWSKeys {
-		apply(resolvePattern(cfg.PatternOverrides.AWSKeys, reVaultAWSKey))
+	// Apply all active secret detectors from the unified declarative catalog
+	for _, spec := range builtinEntityDetectors {
+		if !spec.IsSecret || !spec.Enabled(cfg.Entities) {
+			continue
+		}
+		apply(resolvePattern(spec.Override(cfg.PatternOverrides), spec.DefaultRegex))
 	}
-	if cfg.Entities.APISecrets {
-		apply(resolvePattern(cfg.PatternOverrides.APISecrets, reVaultAPISecret))
-	}
-	if cfg.Entities.JWTTokens {
-		apply(resolvePattern(cfg.PatternOverrides.JWTTokens, reVaultJWT))
-	}
-	apply(reVaultPrivateKey)
 
 	for _, cp := range cfg.CustomPatterns {
 		if !cp.IsEnabled() || !cp.IsSecret || strings.TrimSpace(cp.Regex) == "" {
@@ -502,4 +478,108 @@ func RedactSecretsInText(text string, cfg config.PIIVaultConfig, replacement str
 	}
 
 	return out, found
+}
+
+// PEMStreamState maintains stateful PEM block suppression across arbitrarily many SSE/NDJSON chunks,
+// including split "-----END ... PRIVATE KEY-----" footers and unclosed EOF streams.
+type PEMStreamState struct {
+	Active bool
+	Tail   string
+}
+
+// StripStreamingPEM enforces stateful PEM private-key suppression across arbitrarily many
+// streaming SSE/NDJSON chunks (independent of sliding window size, including unclosed EOF keys).
+// When inJSONString is true, an unescaped '"' closes the JSON string field without swallowing
+// the surrounding JSON delimiter structure.
+func StripStreamingPEM(text string, state *PEMStreamState, replacement string, inJSONString bool) (string, bool) {
+	if state == nil || (text == "" && state.Tail == "") {
+		return text, false
+	}
+
+	var b strings.Builder
+	rem := state.Tail + text
+	state.Tail = ""
+	triggered := false
+
+	for len(rem) > 0 {
+		if state.Active {
+			triggered = true
+			endLoc := reVaultPrivateKeyEnd.FindStringIndex(rem)
+			if inJSONString {
+				quoteIdx := findUnescapedJSONQuote(rem)
+				if quoteIdx != -1 && (endLoc == nil || quoteIdx < endLoc[1]) {
+					state.Active = false
+					rem = rem[quoteIdx:]
+					continue
+				}
+			}
+			if endLoc == nil {
+				if replacement == "" {
+					b.WriteString(rem)
+				} else {
+					state.Tail = extractPotentialPEMFooterSuffix(rem)
+				}
+				rem = ""
+				break
+			}
+			if replacement == "" {
+				b.WriteString(rem[:endLoc[1]])
+			}
+			state.Active = false
+			rem = rem[endLoc[1]:]
+			continue
+		}
+
+		beginLoc := reVaultPrivateKeyBegin.FindStringIndex(rem)
+		if beginLoc == nil {
+			b.WriteString(rem)
+			break
+		}
+
+		triggered = true
+		b.WriteString(rem[:beginLoc[0]])
+		if replacement == "" {
+			b.WriteString(rem[beginLoc[0]:beginLoc[1]])
+		} else {
+			b.WriteString(replacement)
+		}
+		state.Active = true
+		rem = rem[beginLoc[1]:]
+	}
+
+	return b.String(), triggered
+}
+
+func extractPotentialPEMFooterSuffix(s string) string {
+	// Keep at most the last 48 bytes after any line break if they begin a partial "-" / "-----END..." footer
+	start := 0
+	if len(s) > 48 {
+		start = len(s) - 48
+	}
+	tail := s[start:]
+	if lastNL := strings.LastIndexAny(tail, "\r\n\""); lastNL != -1 {
+		tail = tail[lastNL+1:]
+	}
+	if idx := strings.IndexByte(tail, '-'); idx != -1 {
+		return tail[idx:]
+	}
+	return ""
+}
+
+func findUnescapedJSONQuote(s string) int {
+	escaped := false
+	for i := 0; i < len(s); i++ {
+		if escaped {
+			escaped = false
+			continue
+		}
+		if s[i] == '\\' {
+			escaped = true
+			continue
+		}
+		if s[i] == '"' {
+			return i
+		}
+	}
+	return -1
 }

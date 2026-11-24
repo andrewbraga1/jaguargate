@@ -18,22 +18,25 @@
 
   4-STAGE BILATERAL VERIFICATION SUMMARY:
   ---------------------------------------
+  Q5 Mutation Self-Test (Oracle)      : PASSED (4/4 unsafe regressions rejected)
   Q4 Positive Control (Direct Bypass) : PASSED (mock captured raw CPF 52998224725)
-  Total Bilateral Vectors Executed    : 34 (Front-1: 12, Front-2: 11, Front-3: 11)
-  Vectors Meeting All 4-Stage Checks  : 34 / 34 (100.0% within tested suite)
-  Stage 3 Unmasked Upstream Leaks     : 0 (including nested messages[].metadata & batch arrays)
+  Total Bilateral Vectors Executed    : 40 (Front-1: 14, Front-2: 15, Front-3: 11)
+  Vectors Meeting All 4-Stage Checks  : 40 / 40 (100.0% within tested suite)
+  Stage 3 Unmasked Upstream Leaks     : 0 (messages[].metadata, tools[] schemas, system, batch)
   Stage 3 Pre-Upstream Block Proof    : PASSED (upstream_reached=false on JG-CFG-202 HTTP 429)
-  Stage 4 Mid-Token SSE Split Proof   : PASSED (tokens/secrets sliced across 3-4 SSE chunks)
-  Stage 4 Secret Echo Restorations    : 0 (restore_secrets=false enforced)
-  Stage 4 Spontaneous Secret DLP      : PASSED (JG-SEC-503 JSON + cross-chunk SSE redaction)
+  Stage 4 Mid-Token SSE Split Proof   : PASSED (tokens, secrets, tool args & PEM sliced across 3-4 chunks)
+  Stage 4 Output Tool Arguments DLP   : PASSED (OpenAI & Anthropic JSON + SSE valid JSON preserved)
+  Stage 4 Full PEM Block Suppression  : PASSED (header + Base64 body + split END / EOF suppressed)
+  Stage 4 Secret Echo Restorations    : 0 (restore_secrets=false & L2 legacy fail-closed)
   Stage 4 Canary Leak Stream Halt     : PASSED (JG-SEC-501 stream halted, zero canary leaked)
-  Stage 3 Negative-Control FP         : 0 (benign prompts & Luhn-invalid serial preserved)
+  Stage 3 Negative-Control FP         : 0 (benign prompts, timestamps & Luhn-invalid serial preserved)
   Unit + Race Suite (go test -race)   : 10 / 10 packages PASS
   SAST (gosec) & Supply-Chain         : 0 Issues, 0 Nosec, 0 Reachable CVEs
+  GitHub Actions CI Enforcement       : Automated (run_reproduce.sh executed on every push/PR)
 
   VERDICT (SCOPED TO TESTED SUITE & CONFIGURATION):
   -------------------------------------------------
-  [X] PASSED — 34/34 Automated 4-Stage Bilateral Vectors Verified (Scoped Internal Suite)
+  [X] PASSED — 40/40 Automated Strict 4-Stage Bilateral Vectors Verified (Scoped Internal Suite)
   [ ] PARTIAL PASS
   [ ] FAILED
 ========================================================================================

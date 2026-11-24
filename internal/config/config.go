@@ -155,14 +155,15 @@ func (c CustomPatternConfig) IsEnabled() bool {
 }
 
 type PIIPatternOverrides struct {
-	CPF        string `yaml:"cpf,omitempty" json:"cpf,omitempty"`
-	CNPJ       string `yaml:"cnpj,omitempty" json:"cnpj,omitempty"`
-	CreditCard string `yaml:"credit_card,omitempty" json:"credit_card,omitempty"`
-	Phone      string `yaml:"phone,omitempty" json:"phone,omitempty"`
-	Email      string `yaml:"email,omitempty" json:"email,omitempty"`
-	AWSKeys    string `yaml:"aws_keys,omitempty" json:"aws_keys,omitempty"`
-	APISecrets string `yaml:"api_secrets,omitempty" json:"api_secrets,omitempty"`
-	JWTTokens  string `yaml:"jwt_tokens,omitempty" json:"jwt_tokens,omitempty"`
+	CPF         string `yaml:"cpf,omitempty" json:"cpf,omitempty"`
+	CNPJ        string `yaml:"cnpj,omitempty" json:"cnpj,omitempty"`
+	CreditCard  string `yaml:"credit_card,omitempty" json:"credit_card,omitempty"`
+	Phone       string `yaml:"phone,omitempty" json:"phone,omitempty"`
+	Email       string `yaml:"email,omitempty" json:"email,omitempty"`
+	AWSKeys     string `yaml:"aws_keys,omitempty" json:"aws_keys,omitempty"`
+	APISecrets  string `yaml:"api_secrets,omitempty" json:"api_secrets,omitempty"`
+	JWTTokens   string `yaml:"jwt_tokens,omitempty" json:"jwt_tokens,omitempty"`
+	PrivateKeys string `yaml:"private_keys,omitempty" json:"private_keys,omitempty"`
 }
 
 type PIIEntitiesConfig struct {

@@ -707,6 +707,152 @@ func TestSSEActiveSecretDLPAndVetoTrailers(t *testing.T) {
 	}
 }
 
+func TestSSEToolCallArgumentsDLPAndStatefulMultiChunkPEM(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.ApplyPreset()
+	vault := guards.NewPIIVault()
+
+	pemHeader := "-----" + "BEGIN RSA PRIVATE KEY" + "-----"
+	pemFooter := "-----" + "END RSA PRIVATE KEY" + "-----"
+	longBase64ChunkA := strings.Repeat("MIIETESTSYNTHETICKEYBODYCHUNK1", 5) // 150 chars (> 64-rune window!)
+	longBase64ChunkB := strings.Repeat("99887766554433221100SYNTHETIC2", 5) // 150 chars
+
+	// 1. OpenAI SSE: tool_calls arguments containing split AWS key across chunks + valid JSON reconstruction
+	openAIToolSSE := strings.Join([]string{
+		`data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_dlp","type":"function","function":{"name":"audit_log","arguments":"{\"aws\":\"AKIAZ9X8"}}]}}]}`,
+		"",
+		`data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"W7V6U5T4S3R2\",\"ok\":true}"}}]}}]}`,
+		"",
+		`data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
+		"",
+		`data: [DONE]`,
+		"",
+	}, "\n")
+
+	inspOA := NewSSEInspector(
+		io.NopCloser(strings.NewReader(openAIToolSSE)),
+		&cfg,
+		vault,
+		guards.InspectionResult{Status: "CLEAN", SessionID: "sess-oa-tool-sse"},
+		nil,
+	)
+	outOA, err := io.ReadAll(inspOA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(outOA), "AKIAZ9X8W7V6U5T4S3R2") || strings.Contains(string(outOA), "AKIAZ9X8") {
+		t.Fatalf("SECURITY FAILURE (JG-R2 OpenAI SSE): split secret leaked in tool_calls arguments:\n%s", string(outOA))
+	}
+	if !slices.Contains(inspOA.codes, "JG-SEC-503") {
+		t.Errorf("expected JG-SEC-503 on OpenAI SSE tool arguments, got %v", inspOA.codes)
+	}
+	// Reconstruct emitted OpenAI tool arguments and verify valid JSON!
+	var oaArgs strings.Builder
+	for _, ln := range strings.Split(string(outOA), "\n") {
+		if after, ok := strings.CutPrefix(strings.TrimSpace(ln), "data:"); ok {
+			p := strings.TrimSpace(after)
+			if p == "[DONE]" {
+				continue
+			}
+			var obj map[string]any
+			if json.Unmarshal([]byte(p), &obj) == nil {
+				if chs, ok := obj["choices"].([]any); ok && len(chs) > 0 {
+					if cm, ok := chs[0].(map[string]any); ok {
+						if dm, ok := cm["delta"].(map[string]any); ok {
+							if tcs, ok := dm["tool_calls"].([]any); ok && len(tcs) > 0 {
+								if tm, ok := tcs[0].(map[string]any); ok {
+									if fm, ok := tm["function"].(map[string]any); ok {
+										if a, ok := fm["arguments"].(string); ok {
+											oaArgs.WriteString(a)
+										}
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	var parsedOA map[string]any
+	if err := json.Unmarshal([]byte(oaArgs.String()), &parsedOA); err != nil {
+		t.Fatalf("reconstructed OpenAI tool arguments is invalid JSON (%v): %q", err, oaArgs.String())
+	}
+
+	// 2. Anthropic SSE: input_json_delta containing split sk-... secret + valid JSON reconstruction
+	anthToolSSE := "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_dlp\",\"name\":\"audit_log\"}}\n\n" +
+		"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"key\\\":\\\"sk-proj-123456\"}}\n\n" +
+		"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"7890abcdefghijklmnop\\\"}\"}}\n\n" +
+		"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n" +
+		"data: [DONE]\n\n"
+
+	inspAnth := NewSSEInspector(
+		io.NopCloser(strings.NewReader(anthToolSSE)),
+		&cfg,
+		vault,
+		guards.InspectionResult{Status: "CLEAN", SessionID: "sess-anth-tool-sse"},
+		nil,
+	)
+	outAnth, err := io.ReadAll(inspAnth)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(outAnth), "sk-proj-123456") || strings.Contains(string(outAnth), "7890abcdefghijklmnop") {
+		t.Fatalf("SECURITY FAILURE (JG-R2 Anthropic SSE): split secret leaked in input_json_delta:\n%s", string(outAnth))
+	}
+
+	// 3. Multi-chunk 300+ char PEM block with split END footer + Second stream with truncated EOF PEM (JG-R3)
+	pemSSE := strings.Join([]string{
+		fmt.Sprintf(`data: {"choices":[{"index":0,"delta":{"content":"Prefixo %s"}}]}`, pemHeader[:14]),
+		"",
+		fmt.Sprintf(`data: {"choices":[{"index":0,"delta":{"content":"%s\n%s"}}]}`, pemHeader[14:], longBase64ChunkA),
+		"",
+		fmt.Sprintf(`data: {"choices":[{"index":0,"delta":{"content":"%s\n%s"}}]}`, longBase64ChunkB, pemFooter[:12]),
+		"",
+		fmt.Sprintf(`data: {"choices":[{"index":0,"delta":{"content":"%s Sufixo seguro."}}]}`, pemFooter[12:]),
+		"",
+		`data: [DONE]`,
+		"",
+	}, "\n")
+
+	inspPEM := NewSSEInspector(
+		io.NopCloser(strings.NewReader(pemSSE)),
+		&cfg,
+		vault,
+		guards.InspectionResult{Status: "CLEAN", SessionID: "sess-pem-sse"},
+		nil,
+	)
+	outPEMBytes, err := io.ReadAll(inspPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	outPEM := string(outPEMBytes)
+	if strings.Contains(outPEM, "MIIETEST") || strings.Contains(outPEM, "SYNTHETIC2") || strings.Contains(outPEM, "PRIVATE KEY") {
+		t.Fatalf("SECURITY FAILURE (JG-R3 SSE): multi-chunk PEM key body or footer leaked:\n%s", outPEM)
+	}
+	if !strings.Contains(outPEM, "Sufixo seguro.") {
+		t.Errorf("post-PEM safe text was erroneously swallowed:\n%s", outPEM)
+	}
+
+	// 3b. Truncated EOF PEM without END marker
+	truncPEMSSE := fmt.Sprintf("data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Leak: %s\\n%s\"}}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"%s\"}}]}\n\n",
+		pemHeader, longBase64ChunkA, longBase64ChunkB)
+	inspTrunc := NewSSEInspector(
+		io.NopCloser(strings.NewReader(truncPEMSSE)),
+		&cfg,
+		vault,
+		guards.InspectionResult{Status: "CLEAN", SessionID: "sess-pem-trunc"},
+		nil,
+	)
+	outTruncBytes, err := io.ReadAll(inspTrunc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(outTruncBytes), "MIIETEST") || strings.Contains(string(outTruncBytes), "SYNTHETIC2") {
+		t.Fatalf("SECURITY FAILURE (JG-R3 EOF): unclosed PEM body leaked on EOF:\n%s", string(outTruncBytes))
+	}
+}
+
 func BenchmarkSSERuneSlidingWindow(b *testing.B) {
 	cfg := config.DefaultConfig()
 	cfg.ApplyPreset()

@@ -1,0 +1,13 @@
+.git
+.gitignore
+.github
+/jgate
+sec_audit_logs/
+GRINGO_*
+Gringo_*
+jaguargate-reanalise-*
+jaguargate-reavaliacao-*
+pydantic-vs-jaguargate-*
+*.log
+.env
+.env.*

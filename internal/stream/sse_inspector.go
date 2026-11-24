@@ -28,10 +28,13 @@ const (
 )
 
 type streamToolCallTracker struct {
-	toolName   string
-	isPruned   bool
-	rawArgs    strings.Builder
-	domainFail bool
+	toolName    string
+	isPruned    bool
+	rawArgs     strings.Builder
+	argHoldback string
+	argUTF8Rem  []byte
+	pemState    guards.PEMStreamState
+	domainFail  bool
 }
 
 // SSEInspector wraps an upstream HTTP response body (io.ReadCloser) to inspect Server-Sent Events
@@ -45,11 +48,12 @@ type SSEInspector struct {
 	trailers    http.Header
 	onComplete  StreamCompleteFunc
 
-	rawBuf       bytes.Buffer
-	outBuf       bytes.Buffer
-	holdback     string // Rune-safe holdback buffer for cross-chunk tokens
-	utf8Rem      []byte // Holds incomplete multi-byte UTF-8 sequences split across TCP reads
-	codes        []string
+	rawBuf          bytes.Buffer
+	outBuf          bytes.Buffer
+	holdback        string // Rune-safe holdback buffer for cross-chunk tokens
+	utf8Rem         []byte // Holds incomplete multi-byte UTF-8 sequences split across TCP reads
+	pemState        guards.PEMStreamState
+	codes           []string
 	status          string
 	severity        string
 	prunedTools     int
@@ -189,18 +193,10 @@ func (s *SSEInspector) handleSSELine(line string) {
 
 	// Check for stream completion marker: data: [DONE]
 	if payloadStr == "[DONE]" {
-		if s.holdback != "" && !s.halted {
-			cleaned, codes, leaked := guards.SanitizeOutputTextWithSession(s.sessionID, s.holdback, s.canaryToken, s.cfg, s.vault)
-			s.holdback = ""
-			for _, c := range codes {
-				s.recordCode(c)
-			}
-			if leaked {
-				s.haltOnCanaryLeak()
+		if !s.halted {
+			s.flushPendingHoldbacks()
+			if s.halted {
 				return
-			}
-			if !isShadow && cleaned != "" {
-				s.emitSyntheticDeltaChunk(cleaned)
 			}
 		}
 
@@ -328,31 +324,37 @@ func (s *SSEInspector) handleSSELine(line string) {
 							continue
 						}
 
-						// Check domain rules on complete accumulated arguments string
-						if len(s.cfg.Whitelist.AllowedDomains) > 0 && fnMap != nil {
-							accumulated := tracker.rawArgs.String()
-							_, violated := guards.SanitizeDomainsInText(accumulated, s.cfg.Whitelist.AllowedDomains, isShadow)
-							if violated || tracker.domainFail {
-								if !tracker.domainFail {
-									tracker.domainFail = true
-									s.recordCode("JG-CFG-103")
-								}
-								if !isShadow {
-									if argsChunk, ok := fnMap["arguments"].(string); ok && argsChunk != "" {
-										cleanedChunk, vChunk := guards.SanitizeDomainsInText(argsChunk, s.cfg.Whitelist.AllowedDomains, isShadow)
-										if vChunk {
-											fnMap["arguments"] = cleanedChunk
-											toolMap["function"] = fnMap
-											toolsMutated = true
-										} else if tracker.domainFail {
-											tailOnly := stripDomainTail(argsChunk)
-											if tailOnly != argsChunk {
-												fnMap["arguments"] = tailOnly
-												toolMap["function"] = fnMap
-												toolsMutated = true
+						// Check domain rules AND Active Secret DLP / PII restoration on tool arguments
+						if fnMap != nil {
+							if argsChunk, ok := fnMap["arguments"].(string); ok && argsChunk != "" {
+								workingChunk := argsChunk
+								if len(s.cfg.Whitelist.AllowedDomains) > 0 {
+									accumulated := tracker.rawArgs.String()
+									_, violated := guards.SanitizeDomainsInText(accumulated, s.cfg.Whitelist.AllowedDomains, isShadow)
+									if violated || tracker.domainFail {
+										if !tracker.domainFail {
+											tracker.domainFail = true
+											s.recordCode("JG-CFG-103")
+										}
+										if !isShadow {
+											cleanedChunk, vChunk := guards.SanitizeDomainsInText(workingChunk, s.cfg.Whitelist.AllowedDomains, isShadow)
+											if vChunk {
+												workingChunk = cleanedChunk
+											} else if tracker.domainFail {
+												workingChunk = stripDomainTail(workingChunk)
 											}
 										}
 									}
+								}
+
+								safeArgs, _ := s.inspectToolArgStreamFragment(tracker, workingChunk)
+								if s.halted {
+									return
+								}
+								if !isShadow && safeArgs != argsChunk {
+									fnMap["arguments"] = safeArgs
+									toolMap["function"] = fnMap
+									toolsMutated = true
 								}
 							}
 						}
@@ -370,6 +372,13 @@ func (s *SSEInspector) handleSSELine(line string) {
 					}
 				}
 				chMap["delta"] = deltaMap
+			}
+			// Flush any held-back tool argument tails before emitting finish_reason chunk
+			if fr, hasFR := chMap["finish_reason"].(string); hasFR && fr != "" && !s.halted {
+				s.flushOpenAIToolTrackers()
+				if s.halted {
+					return
+				}
 			}
 			choices[i] = chMap
 		}
@@ -444,6 +453,11 @@ func (s *SSEInspector) handleSSELine(line string) {
 					return
 				}
 				if partialJSON, ok := deltaMap["partial_json"].(string); ok && partialJSON != "" {
+					if !exists {
+						tracker = &streamToolCallTracker{}
+						s.toolTrackers[idx] = tracker
+						exists = true
+					}
 					if exists {
 						if tracker.rawArgs.Len()+len(partialJSON) > maxToolArgsBytes {
 							s.recordCode("JG-CFG-202")
@@ -456,6 +470,7 @@ func (s *SSEInspector) handleSSELine(line string) {
 							tracker.rawArgs.WriteString(partialJSON)
 						}
 
+						workingJSON := partialJSON
 						if len(s.cfg.Whitelist.AllowedDomains) > 0 {
 							accumulated := tracker.rawArgs.String()
 							_, violated := guards.SanitizeDomainsInText(accumulated, s.cfg.Whitelist.AllowedDomains, isShadow)
@@ -465,21 +480,24 @@ func (s *SSEInspector) handleSSELine(line string) {
 									s.recordCode("JG-CFG-103")
 								}
 								if !isShadow {
-									cleanedChunk, vChunk := guards.SanitizeDomainsInText(partialJSON, s.cfg.Whitelist.AllowedDomains, isShadow)
+									cleanedChunk, vChunk := guards.SanitizeDomainsInText(workingJSON, s.cfg.Whitelist.AllowedDomains, isShadow)
 									if vChunk {
-										deltaMap["partial_json"] = cleanedChunk
-										eventObj["delta"] = deltaMap
-										modified = true
+										workingJSON = cleanedChunk
 									} else if tracker.domainFail {
-										tailOnly := stripDomainTail(partialJSON)
-										if tailOnly != partialJSON {
-											deltaMap["partial_json"] = tailOnly
-											eventObj["delta"] = deltaMap
-											modified = true
-										}
+										workingJSON = stripDomainTail(workingJSON)
 									}
 								}
 							}
+						}
+
+						safeJSON, _ := s.inspectToolArgStreamFragment(tracker, workingJSON)
+						if s.halted {
+							return
+						}
+						if !isShadow && safeJSON != partialJSON {
+							deltaMap["partial_json"] = safeJSON
+							eventObj["delta"] = deltaMap
+							modified = true
 						}
 					}
 				}
@@ -497,6 +515,12 @@ func (s *SSEInspector) handleSSELine(line string) {
 		if (exists && tracker.isPruned) || (!exists && len(s.toolTrackers) >= maxTrackersPerStream) {
 			if !isShadow {
 				s.pendingEventLine = ""
+				return
+			}
+		}
+		if exists && !tracker.isPruned && !s.halted {
+			s.flushAnthropicToolTracker(idx, tracker)
+			if s.halted {
 				return
 			}
 		}
@@ -526,6 +550,49 @@ func (s *SSEInspector) handleSSELine(line string) {
 			}
 		}
 		if rawTools, ok := msgMap["tool_calls"].([]any); ok && len(rawTools) > 0 {
+			activeTools := rawTools
+			if s.cfg.Whitelist.EnforceToolWhitelist {
+				keptTools, toolCodes, prunedNames := guards.SanitizeToolCallsSliceDetailed(rawTools, s.cfg.Whitelist, isShadow)
+				pruned := len(prunedNames)
+				s.prunedTools += pruned
+				for _, name := range prunedNames {
+					s.recordPrunedToolName(name)
+				}
+				for _, c := range toolCodes {
+					s.recordCode(c)
+				}
+				if !isShadow && (pruned > 0 || len(toolCodes) > 0) {
+					modified = true
+					activeTools = keptTools
+				}
+			}
+			if len(activeTools) > 0 {
+				sanTools, dlpCodes, leaked, dlpMut := guards.SanitizeOutputToolCallsSlice(activeTools, s.sessionID, s.canaryToken, s.cfg, s.vault)
+				for _, c := range dlpCodes {
+					s.recordCode(c)
+				}
+				if leaked {
+					s.haltOnCanaryLeak()
+					return
+				}
+				if dlpMut && !isShadow {
+					activeTools = sanTools
+					modified = true
+				}
+			}
+			if modified && !isShadow {
+				if len(activeTools) > 0 {
+					msgMap["tool_calls"] = activeTools
+				} else {
+					delete(msgMap, "tool_calls")
+				}
+				eventObj["message"] = msgMap
+			}
+		}
+	}
+	if rawTools, ok := eventObj["tool_calls"].([]any); ok && len(rawTools) > 0 {
+		activeTools := rawTools
+		if s.cfg.Whitelist.EnforceToolWhitelist {
 			keptTools, toolCodes, prunedNames := guards.SanitizeToolCallsSliceDetailed(rawTools, s.cfg.Whitelist, isShadow)
 			pruned := len(prunedNames)
 			s.prunedTools += pruned
@@ -537,29 +604,26 @@ func (s *SSEInspector) handleSSELine(line string) {
 			}
 			if !isShadow && (pruned > 0 || len(toolCodes) > 0) {
 				modified = true
-				if len(keptTools) > 0 {
-					msgMap["tool_calls"] = keptTools
-				} else {
-					delete(msgMap, "tool_calls")
-				}
-				eventObj["message"] = msgMap
+				activeTools = keptTools
 			}
 		}
-	}
-	if rawTools, ok := eventObj["tool_calls"].([]any); ok && len(rawTools) > 0 {
-		keptTools, toolCodes, prunedNames := guards.SanitizeToolCallsSliceDetailed(rawTools, s.cfg.Whitelist, isShadow)
-		pruned := len(prunedNames)
-		s.prunedTools += pruned
-		for _, name := range prunedNames {
-			s.recordPrunedToolName(name)
+		if len(activeTools) > 0 {
+			sanTools, dlpCodes, leaked, dlpMut := guards.SanitizeOutputToolCallsSlice(activeTools, s.sessionID, s.canaryToken, s.cfg, s.vault)
+			for _, c := range dlpCodes {
+				s.recordCode(c)
+			}
+			if leaked {
+				s.haltOnCanaryLeak()
+				return
+			}
+			if dlpMut && !isShadow {
+				activeTools = sanTools
+				modified = true
+			}
 		}
-		for _, c := range toolCodes {
-			s.recordCode(c)
-		}
-		if !isShadow && (pruned > 0 || len(toolCodes) > 0) {
-			modified = true
-			if len(keptTools) > 0 {
-				eventObj["tool_calls"] = keptTools
+		if modified && !isShadow {
+			if len(activeTools) > 0 {
+				eventObj["tool_calls"] = activeTools
 			} else {
 				delete(eventObj, "tool_calls")
 			}
@@ -632,7 +696,7 @@ func (s *SSEInspector) handleSSELine(line string) {
 }
 
 // inspectStreamFragment combines the incoming token with the Rune-Aware Holdback Window
-// so split tokens (PII Vault tokens, Canary markers, Markdown image trackers) across chunk boundaries are caught.
+// so split tokens (PII Vault tokens, Canary markers, Markdown image trackers, PEM blocks) across chunk boundaries are caught.
 func (s *SSEInspector) inspectStreamFragment(fragment string) (string, bool) {
 	rawBytes := append(s.utf8Rem, []byte(fragment)...)
 	validBytes, remBytes := splitCompleteUTF8(rawBytes)
@@ -643,6 +707,24 @@ func (s *SSEInspector) inspectStreamFragment(fragment string) (string, bool) {
 
 	combined := s.holdback + string(validBytes)
 	s.holdback = ""
+
+	isShadow := s.cfg != nil && s.cfg.Core.Mode == "shadow"
+	if s.cfg != nil && s.cfg.Guards.PIIVault.Enabled && !s.cfg.Guards.PIIVault.RestoreSecrets {
+		pemRepl := config.T(s.cfg.Core.Language, config.MsgRestrictedSecret)
+		if isShadow {
+			pemRepl = ""
+		}
+		cleanedPEM, pemHit := guards.StripStreamingPEM(combined, &s.pemState, pemRepl, false)
+		if pemHit {
+			s.recordCode("JG-SEC-503")
+			if !isShadow {
+				combined = cleanedPEM
+			}
+		}
+		if s.pemState.Active && !isShadow {
+			return combined, true
+		}
+	}
 
 	cleaned, codes, leaked := guards.SanitizeOutputTextWithSession(s.sessionID, combined, s.canaryToken, s.cfg, s.vault)
 	for _, c := range codes {
@@ -664,6 +746,42 @@ func (s *SSEInspector) inspectStreamFragment(fragment string) (string, bool) {
 	return safeEmit, true
 }
 
+func (s *SSEInspector) inspectToolArgStreamFragment(tracker *streamToolCallTracker, fragment string) (string, bool) {
+	rawBytes := append(tracker.argUTF8Rem, []byte(fragment)...)
+	validBytes, remBytes := splitCompleteUTF8(rawBytes)
+	tracker.argUTF8Rem = nil
+	if len(remBytes) > 0 {
+		tracker.argUTF8Rem = bytes.Clone(remBytes)
+	}
+
+	combined := tracker.argHoldback + string(validBytes)
+	tracker.argHoldback = ""
+
+	cleaned, codes, leaked := guards.SanitizeOutputToolArgChunk(s.sessionID, combined, s.canaryToken, s.cfg, s.vault, &tracker.pemState)
+	for _, c := range codes {
+		s.recordCode(c)
+	}
+	if leaked {
+		s.haltOnCanaryLeak()
+		return "", false
+	}
+
+	isShadow := s.cfg != nil && s.cfg.Core.Mode == "shadow"
+	if tracker.pemState.Active && !isShadow {
+		return cleaned, true
+	}
+
+	maxWindowRunes := s.cfg.Guards.OutputSanitizer.SlidingWindowRunes
+	if maxWindowRunes <= 0 {
+		maxWindowRunes = 64
+	}
+
+	safeEmit, hold := splitHoldbackSuffix(cleaned, s.canaryToken, maxWindowRunes)
+	tracker.argHoldback = hold
+
+	return safeEmit, true
+}
+
 func (s *SSEInspector) haltOnCanaryLeak() {
 	s.halted = true
 	s.status = "BLOCKED"
@@ -671,13 +789,9 @@ func (s *SSEInspector) haltOnCanaryLeak() {
 
 	lang := ""
 	if s.cfg != nil {
-		lang = strings.TrimSpace(s.cfg.Core.Language)
+		lang = s.cfg.Core.Language
 	}
-	if strings.EqualFold(lang, "pt-BR") || strings.EqualFold(lang, "pt") {
-		s.emitSyntheticDeltaChunk("[CONTEÚDO RESTRITO: Vazamento de System Prompt Interrompido (JG-SEC-501)]")
-	} else {
-		s.emitSyntheticDeltaChunk("[RESTRICTED CONTENT: System Prompt Leak Halted (JG-SEC-501)]")
-	}
+	s.emitSyntheticDeltaChunk(config.T(lang, config.MsgCanaryHalted))
 
 	s.emitWarningEventIfNeeded()
 	if s.isAnthropic {
@@ -791,10 +905,27 @@ func (s *SSEInspector) emitWarningEventIfNeeded() {
 	}
 }
 
-func (s *SSEInspector) finalizeStream() {
-	if s.holdback != "" && !s.halted {
-		cleaned, codes, leaked := guards.SanitizeOutputTextWithSession(s.sessionID, s.holdback, s.canaryToken, s.cfg, s.vault)
-		s.holdback = ""
+func (s *SSEInspector) flushOpenAIToolTrackers() {
+	isShadow := s.cfg != nil && s.cfg.Core.Mode == "shadow"
+	var indices []int
+	for idx := range s.toolTrackers {
+		indices = append(indices, idx)
+	}
+	slices.Sort(indices)
+
+	for _, idx := range indices {
+		tracker := s.toolTrackers[idx]
+		if tracker == nil || tracker.isPruned || (tracker.argHoldback == "" && !tracker.pemState.Active) {
+			continue
+		}
+		if tracker.pemState.Active && !isShadow {
+			tracker.argHoldback = ""
+			tracker.pemState = guards.PEMStreamState{}
+			continue
+		}
+		hold := tracker.argHoldback
+		tracker.argHoldback = ""
+		cleaned, codes, leaked := guards.SanitizeOutputToolArgChunk(s.sessionID, hold, s.canaryToken, s.cfg, s.vault, &tracker.pemState)
 		for _, c := range codes {
 			s.recordCode(c)
 		}
@@ -802,8 +933,118 @@ func (s *SSEInspector) finalizeStream() {
 			s.haltOnCanaryLeak()
 			return
 		}
-		if cleaned != "" {
+		if !isShadow && cleaned != "" {
+			chunk := map[string]any{
+				"choices": []any{
+					map[string]any{
+						"index": 0,
+						"delta": map[string]any{
+							"tool_calls": []any{
+								map[string]any{
+									"index":    idx,
+									"function": map[string]any{"arguments": cleaned},
+								},
+							},
+						},
+					},
+				},
+			}
+			if b, err := json.Marshal(chunk); err == nil {
+				s.outBuf.WriteString("data: ")
+				s.outBuf.Write(b)
+				s.outBuf.WriteString("\n\n")
+			}
+		}
+	}
+}
+
+func (s *SSEInspector) flushAnthropicToolTracker(idx int, tracker *streamToolCallTracker) {
+	if tracker == nil || tracker.isPruned || (tracker.argHoldback == "" && !tracker.pemState.Active) {
+		return
+	}
+	isShadow := s.cfg != nil && s.cfg.Core.Mode == "shadow"
+	if tracker.pemState.Active && !isShadow {
+		tracker.argHoldback = ""
+		tracker.pemState = guards.PEMStreamState{}
+		return
+	}
+	hold := tracker.argHoldback
+	tracker.argHoldback = ""
+	cleaned, codes, leaked := guards.SanitizeOutputToolArgChunk(s.sessionID, hold, s.canaryToken, s.cfg, s.vault, &tracker.pemState)
+	for _, c := range codes {
+		s.recordCode(c)
+	}
+	if leaked {
+		s.haltOnCanaryLeak()
+		return
+	}
+	if !isShadow && cleaned != "" {
+		chunk := map[string]any{
+			"type":  "content_block_delta",
+			"index": idx,
+			"delta": map[string]any{
+				"type":         "input_json_delta",
+				"partial_json": cleaned,
+			},
+		}
+		if b, err := json.Marshal(chunk); err == nil {
+			s.outBuf.WriteString("event: content_block_delta\ndata: ")
+			s.outBuf.Write(b)
+			s.outBuf.WriteString("\n\n")
+		}
+	}
+}
+
+func (s *SSEInspector) flushPendingHoldbacks() {
+	isShadow := s.cfg != nil && s.cfg.Core.Mode == "shadow"
+	if s.isAnthropic {
+		var indices []int
+		for idx := range s.toolTrackers {
+			indices = append(indices, idx)
+		}
+		slices.Sort(indices)
+		for _, idx := range indices {
+			s.flushAnthropicToolTracker(idx, s.toolTrackers[idx])
+			if s.halted {
+				return
+			}
+		}
+	} else if !s.isNDJSON {
+		s.flushOpenAIToolTrackers()
+		if s.halted {
+			return
+		}
+	}
+
+	if s.pemState.Active && !isShadow {
+		// Truncated/unclosed PEM stream at EOF: drop trailing key body completely
+		s.holdback = ""
+		s.pemState = guards.PEMStreamState{}
+		return
+	}
+
+	if s.holdback != "" && !s.halted {
+		hold := s.holdback
+		s.holdback = ""
+		cleaned, codes, leaked := guards.SanitizeOutputTextWithSession(s.sessionID, hold, s.canaryToken, s.cfg, s.vault)
+		for _, c := range codes {
+			s.recordCode(c)
+		}
+		if leaked {
+			s.haltOnCanaryLeak()
+			return
+		}
+		if !isShadow && cleaned != "" {
 			s.emitSyntheticDeltaChunk(cleaned)
+		}
+	}
+}
+
+func (s *SSEInspector) finalizeStream() {
+	if !s.halted {
+		s.flushPendingHoldbacks()
+		if s.halted {
+			return
 		}
 	}
 	s.populateTrailers()
@@ -924,8 +1165,8 @@ func splitHoldbackSuffix(text, canary string, maxRunes int) (string, string) {
 		}
 	}
 
-	// Hold back in-progress spontaneous secrets split across SSE chunks (until whitespace/delimiter closes the token)
-	secretOpens := []string{"AKIA", "sk-", "ghp_", "xoxb-", "xoxp-", "xoxa-", "eyJ", "-----BEGIN"}
+	// Hold back in-progress spontaneous secrets split across SSE chunks (derived from unified detector registry)
+	secretOpens := guards.SecretStreamHoldbackPrefixes()
 	for _, secOpen := range secretOpens {
 		lastOpen := strings.LastIndex(tail, secOpen)
 		if lastOpen != -1 {
@@ -942,7 +1183,7 @@ func splitHoldbackSuffix(text, canary string, maxRunes int) (string, string) {
 						earliestHoldIdx = lastOpen
 					}
 				}
-			} else if !strings.ContainsAny(afterOpen, " \t\r\n\"',;)}]") {
+			} else if !strings.ContainsAny(afterOpen, " \t\r\n\\\"',;)}]") {
 				if earliestHoldIdx == -1 || lastOpen < earliestHoldIdx {
 					earliestHoldIdx = lastOpen
 				}
@@ -951,7 +1192,7 @@ func splitHoldbackSuffix(text, canary string, maxRunes int) (string, string) {
 	}
 
 	// Also hold back any partial prefix of open markers (even 1-2 chars like "!" of "![" or "[" of "[JG-CANARY:")
-	partialPrefixes := []string{piiOpenPrefix, "[JG-CANARY:", "![", "AKIA", "-----BEGIN"}
+	partialPrefixes := append([]string{piiOpenPrefix, "[JG-CANARY:", "!["}, secretOpens...)
 	for _, pref := range partialPrefixes {
 		maxP := min(len(pref)-1, len(tail))
 		for k := maxP; k >= 1; k-- {
